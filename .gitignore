@@ -1,0 +1,9 @@
+.build/
+.build-app/
+.tools/
+.DS_Store
+.swiftpm/
+android/.gradle/
+android/local.properties
+android/**/build/
+*.log
