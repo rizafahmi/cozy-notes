@@ -7,12 +7,11 @@ let package = Package(
     products: [
         .executable(name: "CozyNotes", targets: ["CozyNotes"])
     ],
-    dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.99.2")
-    ],
     targets: [
         .target(name: "CozyCore"),
-        .executableTarget(name: "CozyNotes", dependencies: ["CozyCore", "SwiftTerm"]),
-        .testTarget(name: "CozyCoreTests", dependencies: ["CozyCore"])
+        .target(name: "CozySearch", dependencies: ["CozyCore"]),
+        .executableTarget(name: "CozyNotes", dependencies: ["CozyCore", "CozySearch"]),
+        .testTarget(name: "CozyCoreTests", dependencies: ["CozyCore"]),
+        .testTarget(name: "CozySearchTests", dependencies: ["CozySearch", "CozyCore"])
     ]
 )

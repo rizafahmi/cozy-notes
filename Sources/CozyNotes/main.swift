@@ -30,7 +30,6 @@ import CozyCore
         let nextWorkspace = WorkspaceController(vault: vault)
         let nextQuick = QuickCaptureController(vault: vault)
         nextWorkspace.onChooseFolder = { [weak self] in self?.chooseFolder() }
-        nextWorkspace.onQuickCapture = { [weak self] in self?.quickCapture?.summon() }
         nextQuick.onCapture = { [weak nextWorkspace] in nextWorkspace?.refresh() }
         workspace?.shutdown()
         workspace?.window?.orderOut(nil)
@@ -58,7 +57,8 @@ import CozyCore
         if NSApp.keyWindow === quickCapture?.window { quickCapture?.save() }
         else { workspace?.saveCapture() }
     }
-    @objc private func terminal() { workspace?.toggleTerminal() }
+    @objc private func search() { workspace?.focusSearch() }
+    @objc private func makeSearchable() { workspace?.makeSearchable() }
     @objc private func recovery() { workspace?.showRecovery() }
     @objc private func showWorkspace() { workspace?.showAndFocus() }
 
@@ -93,6 +93,7 @@ import CozyCore
         file.addItem(.separator())
         add("Choose Notes Folder…", action: #selector(chooseFolder), key: "o", modifiers: [.command, .shift], to: file)
         add("Recovery…", action: #selector(recovery), key: "", to: file)
+        add("Make Searchable", action: #selector(makeSearchable), key: "", to: file)
         let editItem = NSMenuItem()
         editItem.title = "Edit"
         let edit = NSMenu(title: "Edit")
@@ -111,7 +112,7 @@ import CozyCore
         let view = NSMenu(title: "View")
         viewItem.submenu = view
         bar.addItem(viewItem)
-        add("Toggle Agent Terminal", action: #selector(terminal), key: "j", to: view)
+        add("Search Captures", action: #selector(search), key: "f", to: view)
         add("Show Workspace", action: #selector(showWorkspace), key: "1", to: view)
         NSApp.mainMenu = bar
     }

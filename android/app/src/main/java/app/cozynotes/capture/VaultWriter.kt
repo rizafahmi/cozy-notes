@@ -28,7 +28,6 @@ internal class VaultWriter(private val context: Context) {
         val created = mutableListOf<Uri>()
         var committed = false
         try {
-            ensureInstructions(root)
             val inbox = directory(root, "Inbox")
             val links = mutableListOf<String>()
             val names = mutableListOf<String>()
@@ -143,26 +142,6 @@ internal class VaultWriter(private val context: Context) {
         }
     }
 
-    private fun ensureInstructions(root: Uri) {
-        if (children(root).any { it.name == "AGENTS.md" }) return
-        val uri = create(root, "text/markdown", "AGENTS.md")
-        try {
-            writeUtf8(uri, """
-                # Cozy Notes vault
-
-                This is a local Markdown vault synced externally with Syncthing. Perform housekeeping only when the user requests it. You may rename, group, link, merge, and rewrite related notes to improve their usefulness, preserving their meaning, details, and original attachments.
-
-                - Keep original attachment files and their bytes intact. Update relative Markdown links when moving notes.
-                - Create Markdown companion descriptions or transcriptions for images where useful; be honest about uncertain or unreadable content. No OCR service is configured.
-                - Never overwrite or discard Syncthing conflict files. Surface conflicts for the user to resolve.
-                - Include affected vault-relative paths in responses.
-                - Cloud CLI agents may send note contents and attachments to their providers. Ask the user before exposing private material; follow the selected provider's privacy and retention terms.
-            """.trimIndent() + "\n")
-        } catch (error: Exception) {
-            try { DocumentsContract.deleteDocument(resolver, uri) } catch (cleanup: Exception) { error.addSuppressed(cleanup) }
-            throw error
-        }
-    }
 
     private fun displayName(uri: Uri): String? = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
         if (it.moveToFirst() && !it.isNull(0)) it.getString(0) else null

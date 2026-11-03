@@ -32,7 +32,8 @@ public enum VaultError: LocalizedError {
 }
 
 /// Plain Markdown storage. History deliberately lives outside the synced vault.
-public final class Vault {
+// Configuration is immutable; every instance operation is protected by lock.
+public final class Vault: @unchecked Sendable {
     public let root: URL
     private let historyRoot: URL
     private let fm = FileManager.default
@@ -58,16 +59,6 @@ public final class Vault {
             throw VaultError.unsafePath(self.historyRoot.path)
         }
         try fm.createDirectory(at: self.root, withIntermediateDirectories: true)
-        let instructions = self.root.appendingPathComponent("AGENTS.md")
-        // O_EXCL means an existing instruction file (even a dangling symlink) is never replaced.
-        let descriptor = Darwin.open(instructions.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644)
-        if descriptor >= 0 {
-            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-            do { try handle.write(contentsOf: Data(Self.agentInstructions.utf8)); try handle.close() }
-            catch { try? handle.close(); throw error }
-        } else if errno != EEXIST {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
     }
 
     public func capture(text: String, attachments: [URL] = []) throws -> NoteRecord {
@@ -123,8 +114,9 @@ public final class Vault {
 
     public func notes() throws -> [NoteRecord] {
         try synchronized {
-            try files(under: root).filter { $0.pathExtension.lowercased() == "md" && $0.lastPathComponent != "AGENTS.md" }
-                .map(record).sorted {
+            try files(under: root).filter {
+                ["md", "markdown"].contains($0.pathExtension.lowercased()) && $0.lastPathComponent != "AGENTS.md" && !Self.isExtractedCompanion($0, root: root)
+            }.map(record).sorted {
                     $0.modifiedAt == $1.modifiedAt ? $0.url.path < $1.url.path : $0.modifiedAt > $1.modifiedAt
                 }
         }
@@ -141,6 +133,63 @@ public final class Vault {
         try synchronized {
             try validateNote(url)
             try atomicWrite(Data(text.utf8), to: url, expectedContent: expectedContent)
+        }
+    }
+
+    /// Safe original enumeration shared by local indexing and capture.
+    public func sourceFiles() throws -> [URL] {
+        try synchronized { try files(under: root).filter { $0.lastPathComponent != "AGENTS.md" } }
+    }
+
+    public func validateSource(_ url: URL) throws {
+        try synchronized {
+            try validate(url, beneath: root)
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw VaultError.unsafePath(url.path)
+            }
+        }
+    }
+
+    public static func isExtractedCompanion(_ url: URL, root: URL) -> Bool {
+        guard url.isFileURL,
+              url.deletingLastPathComponent().path == root.appendingPathComponent("Extracted Text").path,
+              url.pathExtension == "md",
+              url.resolvingSymlinksInPath().path == url.path else { return false }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { return false }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = Darwin.stat()
+        guard Darwin.fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return false }
+        var data = Data()
+        do {
+            while data.firstIndex(of: 10) == nil {
+                guard let chunk = try handle.read(upToCount: 4096), !chunk.isEmpty else { return false }
+                data.append(chunk)
+                if data.count >= 28, !data.starts(with: Data("<!-- cozy-extracted-text:v1 ".utf8)) { return false }
+            }
+        } catch { return false }
+        guard let end = data.firstIndex(of: 10),
+              let first = String(data: data[..<end], encoding: .utf8),
+              first.hasPrefix("<!-- cozy-extracted-text:v1 "), first.hasSuffix(" -->"),
+              let payload = Data(base64Encoded: String(first.dropFirst(28).dropLast(4))),
+              let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              object["source"] is String, object["fingerprint"] is String,
+              object["bodyHash"] is String else { return false }
+        return true
+    }
+
+    /// Creates without replacement, or updates only the exact previously read contents.
+    /// Cancellation is checked at the final commit boundary.
+    public func writeExtractedCompanion(_ text: String, to url: URL, expectedContent: String?,
+                                        cancelled: () -> Bool) throws {
+        try synchronized {
+            guard url.deletingLastPathComponent().path == root.appendingPathComponent("Extracted Text").path,
+                  url.pathExtension == "md" else { throw VaultError.unsafePath(url.path) }
+            try safeDirectory(url.deletingLastPathComponent())
+            try atomicWrite(Data(text.utf8), to: url, expectedContent: expectedContent,
+                            exclusive: expectedContent == nil, cancelled: cancelled)
         }
     }
 
@@ -267,7 +316,7 @@ public final class Vault {
     }
 
     private func validateNote(_ url: URL) throws {
-        guard url.pathExtension.lowercased() == "md" else { throw VaultError.unsafePath(url.path) }
+        guard ["md", "markdown"].contains(url.pathExtension.lowercased()) else { throw VaultError.unsafePath(url.path) }
         try validate(url, beneath: root)
     }
 
@@ -304,7 +353,8 @@ public final class Vault {
         try validate(url, beneath: root)
     }
 
-    private func atomicWrite(_ data: Data, to url: URL, expectedContent: String? = nil) throws {
+    private func atomicWrite(_ data: Data, to url: URL, expectedContent: String? = nil,
+                             exclusive: Bool = false, cancelled: () -> Bool = { false }) throws {
         try validate(url, beneath: root)
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".cozy-\(UUID().uuidString).tmp")
         defer { try? fm.removeItem(at: temporary) }
@@ -314,6 +364,14 @@ public final class Vault {
             guard let current = try? String(contentsOf: url, encoding: .utf8), current == expectedContent else {
                 throw VaultError.conflict(url.path)
             }
+        }
+        if cancelled() { throw CocoaError(.userCancelled) }
+        if exclusive {
+            guard Darwin.link(temporary.path, url.path) == 0 else {
+                if errno == EEXIST { throw VaultError.conflict(url.path) }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            return
         }
         guard Darwin.rename(temporary.path, url.path) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -336,7 +394,7 @@ public final class Vault {
         }
     }
 
-    private static func title(from line: String) -> String {
+    public static func title(from line: String) -> String {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = trimmed.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
         return title.isEmpty ? "Untitled capture" : title
@@ -364,17 +422,4 @@ public final class Vault {
 
     private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "svg", "avif", "ico"]
 
-    private static let agentInstructions = """
-    # Cozy Notes vault
-
-    This folder is the source of truth: plain UTF-8 Markdown notes and original attachments, synced externally (for example by Syncthing). There is no database or built-in cloud sync.
-
-    When explicitly asked to do housekeeping, review Inbox and existing notes. You may rename, group, link, merge, and rewrite related notes to improve their usefulness without losing the user's meaning or details. Read notes before modifying them. Do not invent facts or claim an attachment was inspected when it was not.
-
-    For images and other attachments, create or update Markdown companion descriptions, searchable observations, and transcriptions when the actual agent tools can inspect the content. State uncertainty and limitations. Preserve the original attachment bytes and files; keep Markdown links valid when moving notes. Do not delete original attachments as part of housekeeping.
-
-    Never overwrite or delete sync-conflict copies: report their paths and ask the user to resolve ambiguous changes. Report the paths of notes and companions you create or change. Skip hidden folders and local history. Do not follow symlinks outside this vault.
-
-    Agent sessions have recovery checkpoints, not per-command backups. Request a checkpoint before destructive changes. Cloud-hosted agents may send note and attachment content to their provider under that provider's privacy policy; use a local harness/model when that is not acceptable. No OCR or transcription service is configured automatically.
-    """ + "\n"
 }

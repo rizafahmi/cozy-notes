@@ -8,9 +8,7 @@ import CozyCore
     private let heading = Theme.label("A little room to think.", size: 22, color: Theme.ink)
     private let count = Theme.label("YOUR NOTES", size: 11)
     private let saveButton = NSButton()
-    private let terminalButton = NSButton()
-    private let terminalHost = NSView()
-    private var agentPanel: AgentPanel?
+    private let searchPanel: SearchPanel
     private var records: [NoteRecord] = []
     private var selectedURL: URL?
     private var baseline = ""
@@ -20,10 +18,10 @@ import CozyCore
     private var autosave: Timer?
     private var watcher: VaultWatcher?
     var onChooseFolder: (() -> Void)?
-    var onQuickCapture: (() -> Void)?
 
     init(vault: Vault) {
         self.vault = vault
+        self.searchPanel = SearchPanel(vault: vault)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Cozy Notes"
@@ -36,6 +34,7 @@ import CozyCore
         window.delegate = self
         buildUI()
         editor.onChange = { [weak self] in self?.editorChanged() }
+        searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         watcher = VaultWatcher(root: vault.root) { [weak self] in self?.refresh() }
         refresh()
     }
@@ -84,26 +83,20 @@ import CozyCore
         saveButton.bezelStyle = .rounded
         saveButton.contentTintColor = Theme.accent
         saveButton.toolTip = "Save this capture (⌘Return)"
-        terminalButton.title = "Agent"
-        terminalButton.target = self
-        terminalButton.action = #selector(toggleTerminal)
-        terminalButton.bezelStyle = .rounded
-        terminalButton.toolTip = "Show or hide the agent terminal (⌘J)"
         let history = Theme.button("Recovery…", target: self, action: #selector(showRecovery))
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         heading.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         heading.lineBreakMode = .byTruncatingTail
-        let toolbar = Theme.stack([heading, spacer, history, terminalButton, saveButton], spacing: 10)
+        let toolbar = Theme.stack([heading, spacer, history, saveButton], spacing: 10)
         toolbar.edgeInsets = NSEdgeInsets(top: 20, left: 30, bottom: 10, right: 24)
-        let hint = Theme.label("Capture first. Make sense of it later.", size: 13)
+        let hint = Theme.label("Save it here. Find it by the words you remember.", size: 13)
         let hintRow = Theme.stack([hint])
         hintRow.edgeInsets = NSEdgeInsets(top: 0, left: 32, bottom: 0, right: 24)
-        terminalHost.isHidden = true
-        terminalHost.heightAnchor.constraint(equalToConstant: 290).isActive = true
-        let main = Theme.stack([toolbar, hintRow, editor, terminalHost], orientation: .vertical, spacing: 6)
+        searchPanel.heightAnchor.constraint(equalToConstant: 300).isActive = true
+        let main = Theme.stack([toolbar, hintRow, searchPanel, editor], orientation: .vertical, spacing: 6)
         main.alignment = .leading
-        for view in [toolbar, hintRow, editor, terminalHost] {
+        for view in [toolbar, hintRow, searchPanel, editor] {
             view.widthAnchor.constraint(equalTo: main.widthAnchor).isActive = true
         }
         let layout = Theme.stack([sidebar, main], spacing: 0)
@@ -121,6 +114,7 @@ import CozyCore
         editor.focus()
     }
     func refresh() {
+        searchPanel.refresh()
         do {
             records = try vault.notes()
             changingSelection = true
@@ -215,31 +209,41 @@ import CozyCore
         updateSaveButton()
         editor.focus()
     }
-    @objc func toggleTerminal() {
-        if terminalHost.isHidden {
-            guard persistCurrent() else { return }
-            if agentPanel == nil {
-                let panel = AgentPanel(vault: vault)
-                panel.onFilesChanged = { [weak self] in self?.refresh() }
-                Theme.fill(panel, in: terminalHost)
-                agentPanel = panel
-            }
-            terminalHost.isHidden = false
-            terminalButton.title = "Hide agent"
-            agentPanel?.focusTerminal()
-        } else {
-            terminalHost.isHidden = true
-            terminalButton.title = "Agent"
+    @objc func focusSearch() { searchPanel.focusSearch() }
+    @objc func makeSearchable() {
+        guard persistCurrent() else { return }
+        searchPanel.makeSearchable()
+    }
+    private func openNote(_ url: URL) {
+        guard url != selectedURL else { editor.focus(); return }
+        guard persistCurrent() else { refresh(); return }
+        do {
+            let text = try vault.read(url)
+            selectedURL = url
+            baseline = text
+            dirty = false
+            conflicted = false
+            editor.reset()
+            editor.allowsAttachments = false
+            editor.text = text
+            editor.status.stringValue = url.path.replacingOccurrences(of: vault.root.path + "/", with: "")
+            heading.stringValue = records.first(where: { $0.url == url })?.title ?? url.deletingPathExtension().lastPathComponent
+            updateSaveButton()
+            changingSelection = true
+            if let index = records.firstIndex(where: { $0.url == url }) {
+                table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            } else { table.deselectAll(nil) }
+            changingSelection = false
             editor.focus()
-        }
+        } catch { showError(error, in: window) }
     }
     @objc private func revealFolder() { NSWorkspace.shared.open(vault.root) }
     @objc private func chooseFolder() { onChooseFolder?() }
     @objc func showRecovery() {
         guard persistCurrent() else { return }
-        guard agentPanel?.isSessionRunning != true else {
+        guard !searchPanel.isProcessing else {
             showError(NSError(domain: "CozyNotes", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Exit or stop the terminal session before restoring a checkpoint."
+                NSLocalizedDescriptionKey: "Wait for extraction to finish or cancel it before recovering files."
             ]), in: window)
             return
         }
@@ -247,7 +251,7 @@ import CozyCore
             let snapshots = try vault.snapshots()
             let alert = NSAlert()
             alert.messageText = "Recover an earlier version"
-            alert.informativeText = "Restore notes and attachments from a checkpoint. New files created since then are kept. A fresh checkpoint is made before recovery. Stop the agent first so it cannot keep changing restored files."
+            alert.informativeText = "Restore notes and attachments from a checkpoint. New files created since then are kept. A fresh checkpoint is made before recovery. You can also create a checkpoint of the current collection."
             let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 430, height: 26))
             let formatter = DateFormatter()
             formatter.dateStyle = .medium
@@ -256,16 +260,23 @@ import CozyCore
             alert.accessoryView = picker
             alert.addButton(withTitle: snapshots.isEmpty ? "No checkpoints yet" : "Restore checkpoint")
             alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Create checkpoint")
             alert.buttons.first?.isEnabled = !snapshots.isEmpty
             guard let window else { return }
             alert.beginSheetModal(for: window) { [weak self] response in
-                guard let self, response == .alertFirstButtonReturn, snapshots.indices.contains(picker.indexOfSelectedItem) else { return }
+                guard let self, response == .alertFirstButtonReturn || response == .alertThirdButtonReturn else { return }
                 do {
-                    guard self.agentPanel?.isSessionRunning != true else {
+                    guard !self.searchPanel.isProcessing else {
                         throw NSError(domain: "CozyNotes", code: 1, userInfo: [
-                            NSLocalizedDescriptionKey: "The terminal is running. Stop it before restoring."
+                            NSLocalizedDescriptionKey: "Wait for extraction to finish before recovering files."
                         ])
                     }
+                    if response == .alertThirdButtonReturn {
+                        _ = try self.vault.snapshot(label: "Manual checkpoint")
+                        self.editor.status.stringValue = "Recovery checkpoint saved."
+                        return
+                    }
+                    guard snapshots.indices.contains(picker.indexOfSelectedItem) else { return }
                     try self.vault.restore(snapshotID: snapshots[picker.indexOfSelectedItem].id)
                     self.selectedURL = nil
                     self.baseline = ""
@@ -277,7 +288,7 @@ import CozyCore
             }
         } catch { showError(error, in: window) }
     }
-    func shutdown() { autosave?.invalidate(); agentPanel?.shutdown() }
+    func shutdown() { autosave?.invalidate(); searchPanel.shutdown() }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard persistCurrent() else { return false }
         sender.orderOut(nil)
@@ -300,29 +311,6 @@ import CozyCore
     }
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !changingSelection, records.indices.contains(table.selectedRow) else { return }
-        let requested = records[table.selectedRow]
-        guard requested.url != selectedURL else { return }
-        guard persistCurrent() else {
-            changingSelection = true
-            if let selectedURL, let index = records.firstIndex(where: { $0.url == selectedURL }) {
-                table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            } else { table.deselectAll(nil) }
-            changingSelection = false
-            return
-        }
-        do {
-            let text = try vault.read(requested.url)
-            selectedURL = requested.url
-            baseline = text
-            dirty = false
-            conflicted = false
-            editor.reset()
-            editor.allowsAttachments = false
-            editor.text = text
-            editor.status.stringValue = requested.url.path.replacingOccurrences(of: vault.root.path + "/", with: "")
-            heading.stringValue = requested.title
-            updateSaveButton()
-            editor.focus()
-        } catch { showError(error, in: window) }
+        openNote(records[table.selectedRow].url)
     }
 }
