@@ -1,19 +1,20 @@
 import AppKit
 import UniformTypeIdentifiers
+import ImageIO
 
 @MainActor final class MarkdownTextView: NSTextView {
     private let editorUndoManager = UndoManager()
     override var undoManager: UndoManager? { editorUndoManager }
     var onFiles: (([URL]) -> Void)?
     var onClipboardImage: ((Data) -> Void)?
-    var placeholder = "A thought, a link, a little thing to keep…" { didSet { needsDisplay = true } }
+    var placeholder = "What's on your mind?" { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard string.isEmpty else { return }
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font ?? NSFont.systemFont(ofSize: 18),
-            .foregroundColor: Theme.muted.withAlphaComponent(0.65)
+            .foregroundColor: Theme.muted
         ]
         (placeholder as NSString).draw(in: NSRect(x: textContainerInset.width + 5, y: textContainerInset.height,
                                                 width: max(0, bounds.width - 2 * textContainerInset.width - 10), height: 70),
@@ -48,7 +49,7 @@ import UniformTypeIdentifiers
 
 @MainActor final class CaptureEditor: NSView, NSTextViewDelegate {
     let textView = MarkdownTextView()
-    let status = Theme.label("Markdown · files stay yours", size: 12)
+    let status = Theme.label("Just capture. Organize later.", size: 11)
     var onChange: (() -> Void)?
     var attachments: [URL] = [] { didSet { updateAttachments() } }
     var allowsAttachments = true {
@@ -56,6 +57,8 @@ import UniformTypeIdentifiers
     }
     private var attachmentButton: NSButton?
     private let chips = NSStackView()
+    private let attachmentScroll = NSScrollView()
+    private var previews: [URL: NSImage] = [:]
     private var temporaryFiles: [URL] = []
     private let heading = try! NSRegularExpression(pattern: "(?m)^#{1,6} .+$")
     private let link = try! NSRegularExpression(pattern: "!?\\[[^\\]\\n]*\\]\\([^\\n]+?\\)")
@@ -63,8 +66,7 @@ import UniformTypeIdentifiers
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = Theme.canvas.cgColor
+        textView.setAccessibilityLabel("Note text")
         let scroll = NSScrollView()
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
@@ -80,7 +82,7 @@ import UniformTypeIdentifiers
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainerInset = NSSize(width: 30, height: 30)
+        textView.textContainerInset = NSSize(width: 24, height: 24)
         textView.drawsBackground = false
         textView.insertionPointColor = Theme.accent
         textView.delegate = self
@@ -89,21 +91,33 @@ import UniformTypeIdentifiers
         textView.onClipboardImage = { [weak self] in self?.addClipboardImage($0) }
         scroll.documentView = textView
         let add = Theme.button("Attach…", target: self, action: #selector(chooseAttachments))
+        add.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: nil)
+        add.imagePosition = .imageLeading
         add.toolTip = "Attach files or screenshots. You can also paste an image or drop files into the editor."
         add.setContentHuggingPriority(.required, for: .horizontal)
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         status.lineBreakMode = .byTruncatingMiddle
-        chips.orientation = .vertical
-        chips.alignment = .leading
-        chips.spacing = 4
+        chips.orientation = .horizontal
+        chips.alignment = .centerY
+        chips.spacing = 8
+        chips.edgeInsets = NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
+        attachmentScroll.documentView = chips
+        attachmentScroll.drawsBackground = false
+        attachmentScroll.hasHorizontalScroller = true
+        attachmentScroll.autohidesScrollers = true
+        attachmentScroll.scrollerStyle = .overlay
+        attachmentScroll.isHidden = true
+        attachmentScroll.setAccessibilityLabel("Captured attachments")
         let footer = Theme.stack([add, status])
-        let container = Theme.stack([scroll, chips, footer], orientation: .vertical, spacing: 12)
+        let container = Theme.stack([scroll, attachmentScroll, footer], orientation: .vertical, spacing: 8)
         attachmentButton = add
-        container.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 14, right: 14)
+        container.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 12, right: 14)
         container.alignment = .leading
         Theme.fill(container, in: self)
-        scroll.widthAnchor.constraint(equalTo: container.widthAnchor, constant: -24).isActive = true
+        scroll.widthAnchor.constraint(equalTo: container.widthAnchor, constant: -28).isActive = true
+        attachmentScroll.widthAnchor.constraint(equalTo: scroll.widthAnchor).isActive = true
+        attachmentScroll.heightAnchor.constraint(equalToConstant: 80).isActive = true
         footer.widthAnchor.constraint(equalTo: scroll.widthAnchor).isActive = true
         formatMarkdown()
     }
@@ -125,7 +139,7 @@ import UniformTypeIdentifiers
         attachments = []
         for url in temporaryFiles { try? FileManager.default.removeItem(at: url) }
         temporaryFiles.removeAll()
-        status.stringValue = "Markdown · files stay yours"
+        status.stringValue = "Just capture. Organize later."
     }
     func textDidChange(_ notification: Notification) {
         formatMarkdown()
@@ -172,15 +186,50 @@ import UniformTypeIdentifiers
     }
     private func updateAttachments() {
         for view in chips.arrangedSubviews { chips.removeArrangedSubview(view); view.removeFromSuperview() }
+        previews = previews.filter { attachments.contains($0.key) }
         for (index, url) in attachments.enumerated() {
+            let preview = NSImageView()
+            preview.imageScaling = .scaleProportionallyUpOrDown
+            preview.image = thumbnail(for: url) ?? NSWorkspace.shared.icon(forFile: url.path)
+            preview.setAccessibilityElement(false)
+            preview.widthAnchor.constraint(equalToConstant: 48).isActive = true
+            preview.heightAnchor.constraint(equalToConstant: 48).isActive = true
             let name = Theme.label(url.lastPathComponent, size: 12, color: Theme.ink)
+            name.font = .systemFont(ofSize: 12, weight: .medium)
             name.lineBreakMode = .byTruncatingMiddle
+            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let kind = Theme.label(url.pathExtension.isEmpty ? "FILE" : url.pathExtension.uppercased(), size: 10)
+            let description = Theme.stack([name, kind], orientation: .vertical, spacing: 4)
+            name.widthAnchor.constraint(lessThanOrEqualToConstant: 128).isActive = true
             let remove = Theme.button("Remove", target: self, action: #selector(removeAttachment(_:)))
+            remove.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: nil)
+            remove.imagePosition = .imageOnly
+            remove.bezelStyle = .inline
+            remove.setAccessibilityLabel("Remove \(url.lastPathComponent)")
+            remove.toolTip = "Remove \(url.lastPathComponent) from this capture"
             remove.tag = index
-            let row = Theme.stack([name, remove], spacing: 8)
-            chips.addArrangedSubview(row)
+            let row = Theme.stack([preview, description, remove], spacing: 8)
+            let card = PaperSurface(cornerRadius: 10, color: Theme.canvas, bordered: false)
+            Theme.fill(row, in: card, inset: 8)
+            card.widthAnchor.constraint(equalToConstant: 236).isActive = true
+            card.heightAnchor.constraint(equalToConstant: 68).isActive = true
+            chips.addArrangedSubview(card)
         }
-        chips.isHidden = attachments.isEmpty
+        chips.setFrameSize(chips.fittingSize)
+        attachmentScroll.isHidden = attachments.isEmpty
+    }
+    private func thumbnail(for url: URL) -> NSImage? {
+        if let cached = previews[url] { return cached }
+        guard UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true,
+              let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 120
+              ] as CFDictionary) else { return nil }
+        let thumbnail = NSImage(cgImage: image, size: .zero)
+        previews[url] = thumbnail
+        return thumbnail
     }
     @objc private func removeAttachment(_ sender: NSButton) {
         guard attachments.indices.contains(sender.tag) else { return }
@@ -196,7 +245,10 @@ import UniformTypeIdentifiers
         storage.beginEditing()
         storage.setAttributes([.font: font, .foregroundColor: Theme.ink, .paragraphStyle: paragraph], range: range)
         for match in heading.matches(in: text, range: range) {
-            storage.addAttributes([.font: NSFont.systemFont(ofSize: 23, weight: .semibold), .foregroundColor: Theme.accent], range: match.range)
+            storage.addAttributes([.font: Theme.displayFont(25), .foregroundColor: Theme.ink], range: match.range)
+            let separator = (text as NSString).range(of: " ", range: match.range)
+            storage.addAttributes([.font: font, .foregroundColor: Theme.muted],
+                                  range: NSRange(location: match.range.location, length: separator.location - match.range.location))
         }
         for match in link.matches(in: text, range: range) { storage.addAttribute(.foregroundColor, value: Theme.accent, range: match.range) }
         for match in code.matches(in: text, range: range) { storage.addAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: 15, weight: .regular), range: match.range) }

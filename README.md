@@ -27,11 +27,13 @@ open '.build-app/Cozy Notes.app' --args --vault '/path/to/notes'
 
 The workspace starts in **Capture**: a writing area, attachments, and **Keep capture**, without search or maintenance controls. **Find** replaces that screen with search and results; a blank query shows the most recently modified sources first.
 
+The native notebook treatment follows the system's light/dark appearance: warm paper surfaces, serif headings, a coral primary action, and clearly outlined result selection. Capture shows bounded screenshot thumbnails and removable file cards in a horizontally scrollable tray; image previews are downsampled, not decoded at full resolution. Find uses source-type icons without loading image previews for every search result. Custom surfaces are opaque and mode changes are immediate, without added motion or transparency.
+
 - **Command–1 / Command–2:** switch to Capture / Find. Switching preserves the unsaved capture's text, attachments, and undo history; it does not save or clear the draft.
 - **Command–F:** open Find's results and focus search. Find retains its query, selection, and scroll position when returning from a note.
 - **Command–Return:** keep the capture, or save changes while explicitly editing a note.
 - **Command–N:** keep the current capture draft and pending note edits, then start a fresh capture.
-- Paste an image, drop files, or use **Attach…** in Capture.
+- Paste an image, drop files, or use **Attach…** in Capture. Attachment cards preview images and show filenames; removing a card detaches it from the draft without deleting the source file.
 - Opening a Markdown result shows a read-only note. **Edit note** enables editing; **Done editing** saves and returns to reading. **← Results** returns to the same search.
 - Existing `.md` and `.markdown` notes autosave after editing. Detected external edits are never silently replaced: **Keep as new note** preserves local edits separately, without touching the Capture draft.
 - Incoming and reorganized files are discovered through filesystem events. Existing-note editing is text-only; capture new attachments as new notes.
@@ -124,6 +126,8 @@ Restoring a checkpoint first saves the current on-disk state, restores changed/d
 Temporary executable smoke runs exercised actual Vision OCR on English/Indonesian images; selectable/mixed/scanned/corrupt PDF handling; original-byte preservation; portable reconstruction; Unicode highlights; stale/deleted originals; companion edits; symlinks; and cancellation. Native AppKit smoke runs exercised search typing, manual processing, visible highlights/page references, opening originals and notes, autosave/reindexing, quick capture, checkpoint/recovery, and compact layout. Android API 35 capture was exercised through the real folder picker and sharing UI after the cutover.
 
 Focused-mode native smoke runs additionally exercised deferred Find loading, recent-source ordering, capture text/attachment/undo preservation across modes, read-only note opening and explicit editing, query/scroll restoration, external-edit conflict copies, unavailable/restored originals, background extraction while capturing, checkpoint recovery with an unsaved draft, lifecycle saves without duplicate captures, and both screens at the actual 760-point minimum width.
+
+Notebook-redesign smoke runs exercised light/dark Capture, Find, note reading, and quick capture; real OCR/PDF/text matches; attachment previews/removal/overflow scrolling; draft/undo preservation; autosave; and actual 760×540 workspace layouts. The accented action retained the native accessible button role and press action, committed one capture through that action, and preserved Command–Return activation in quick capture. This was not a full VoiceOver audit.
 
 A separate smoke process denied all network access and still performed actual Indonesian screenshot OCR, selectable-PDF extraction, and search with the correct PDF page reference.
 

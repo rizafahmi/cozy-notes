@@ -13,8 +13,7 @@ import CozyCore
                             styleMask: [.titled, .closable, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.title = "Keep a little something"
         panel.titlebarAppearsTransparent = true
-        panel.backgroundColor = Theme.canvas
-        panel.appearance = NSAppearance(named: .aqua)
+        panel.backgroundColor = Theme.paper
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isFloatingPanel = true
@@ -22,7 +21,10 @@ import CozyCore
         panel.minSize = NSSize(width: 440, height: 280)
         super.init(window: panel)
         panel.delegate = self
-        let keep = Theme.button("Keep capture", target: self, action: #selector(save))
+        let keep = PrimaryButton()
+        keep.title = "Keep capture"
+        keep.target = self
+        keep.action = #selector(save)
         keep.keyEquivalent = "\r"
         keep.keyEquivalentModifierMask = .command
         let cancel = Theme.button("Close", target: self, action: #selector(hide))

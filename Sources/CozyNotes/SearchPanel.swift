@@ -20,6 +20,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private let empty = Theme.label("Loading local sources…")
     private let progress = NSProgressIndicator()
     private let processingRow = NSStackView()
+    private let processingNotice = PaperSurface(cornerRadius: 12, color: Theme.accentSoft, bordered: false)
     private let processingLabel = Theme.label("", size: 12)
     private let recentLabel = Theme.label("RECENT CAPTURES", size: 11)
     private var renderedQuery: String?
@@ -41,22 +42,27 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         self.vault = vault
         engine = CaptureSearch(vault: vault)
         super.init(frame: .zero)
-        wantsLayer = true
-        layer?.backgroundColor = Theme.canvas.cgColor
-        field.placeholderString = "Search notes, screenshots and PDFs"
+        field.placeholderString = "Words, filenames, a half-remembered thought…"
         field.delegate = self
         field.target = self
         field.action = #selector(openSelected)
         field.sendsWholeSearchString = true
         field.sendsSearchStringImmediately = false
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.controlSize = .large
+        field.font = .systemFont(ofSize: 14)
+        field.setAccessibilityLabel("Search captures")
         makeButton = Theme.button("Make searchable", target: self, action: #selector(makeSearchable))
         makeButton.toolTip = "Extract selectable PDF text and recognize screenshot text locally. Originals are preserved."
         cancelButton = Theme.button("Cancel", target: self, action: #selector(cancelExtraction))
         cancelButton.isHidden = true
         openButton = Theme.button("Open original", target: self, action: #selector(openSelected))
         openButton.isEnabled = false
-        let toolbar = Theme.stack([field, openButton], spacing: 8)
+        let toolbar = Theme.stack([field, openButton], spacing: 10)
+        let heading = Theme.label("Find a little something.", size: 29, color: Theme.ink)
+        heading.font = Theme.displayFont(29)
+        let hint = Theme.label("Search your notes and files, in their original words.", size: 12)
+        hint.lineBreakMode = .byTruncatingTail
         processingLabel.lineBreakMode = .byTruncatingTail
         processingLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let processingSpacer = NSView()
@@ -66,10 +72,14 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         processingRow.distribution = .fill
         processingRow.spacing = 8
         for view in [processingLabel, processingSpacer, makeButton!, cancelButton!] { processingRow.addArrangedSubview(view) }
-        processingRow.isHidden = true
-        let top = Theme.stack([toolbar, processingRow, recentLabel], orientation: .vertical, spacing: 12)
+        Theme.fill(processingRow, in: processingNotice, inset: 10)
+        processingNotice.isHidden = true
+        recentLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        let top = Theme.stack([heading, hint, toolbar, processingNotice, recentLabel], orientation: .vertical, spacing: 10)
         toolbar.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
-        processingRow.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
+        hint.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
+        processingNotice.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
+        field.heightAnchor.constraint(equalToConstant: 36).isActive = true
         progress.style = .bar
         progress.isIndeterminate = true
         progress.isHidden = true
@@ -81,8 +91,8 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("source"))
         table.addTableColumn(column)
         table.headerView = nil
-        table.rowHeight = 90
-        table.intercellSpacing = NSSize(width: 0, height: 4)
+        table.rowHeight = 120
+        table.intercellSpacing = NSSize(width: 0, height: 8)
         table.backgroundColor = Theme.canvas
         table.selectionHighlightStyle = .regular
         table.allowsEmptySelection = true
@@ -113,7 +123,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         NSLayoutConstraint.activate([
             top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
             top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
-            top.topAnchor.constraint(equalTo: topAnchor, constant: 20),
+            top.topAnchor.constraint(equalTo: topAnchor, constant: 22),
             field.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
             results.leadingAnchor.constraint(equalTo: top.leadingAnchor),
             results.trailingAnchor.constraint(equalTo: top.trailingAnchor),
@@ -126,6 +136,11 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     }
 
     required init?(coder: NSCoder) { fatalError("Use init(vault:)") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.canvas.setFill()
+        bounds.fill()
+    }
 
     func focusSearch() {
         guard !closed else { return }
@@ -298,7 +313,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         let retryable = snapshot?.sources.contains {
             ($0.kind == .image || $0.kind == .pdf) && $0.state == .unreadable
         } ?? false
-        processingRow.isHidden = !extracting && pending == 0 && issues == 0
+        processingNotice.isHidden = !extracting && pending == 0 && issues == 0
         makeButton.isHidden = extracting || (pending == 0 && !retryable)
         makeButton.title = pending > 0 ? "Make searchable" : "Retry extraction"
         if extracting { processingLabel.stringValue = "Processing on this Mac. Originals stay unchanged." }
@@ -313,6 +328,10 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { hits.count }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        SearchHitRow()
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard hits.indices.contains(row) else { return nil }
@@ -395,6 +414,31 @@ private struct SearchFileStamp: Equatable {
 }
 
 @MainActor
+private final class SearchHitRow: NSTableRowView {
+    override func drawBackground(in dirtyRect: NSRect) {
+        drawCard(selected: false)
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        drawCard(selected: true)
+    }
+
+    private func drawCard(selected: Bool) {
+        let rect = bounds.insetBy(dx: 1, dy: 4)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 14, yRadius: 14)
+        (selected ? Theme.accentSoft : Theme.paper).setFill()
+        path.fill()
+        (selected ? Theme.accent : Theme.border).setStroke()
+        path.lineWidth = selected ? 2 : 1
+        path.stroke()
+        if selected {
+            Theme.accent.setFill()
+            NSBezierPath(roundedRect: NSRect(x: rect.minX + 5, y: rect.minY + 17, width: 3, height: max(0, rect.height - 34)), xRadius: 1.5, yRadius: 1.5).fill()
+        }
+    }
+}
+
+@MainActor
 private final class SearchResultsTable: NSTableView {
     var onReturn: (() -> Void)?
     override func keyDown(with event: NSEvent) {
@@ -405,34 +449,50 @@ private final class SearchResultsTable: NSTableView {
 
 @MainActor
 private final class SearchHitCell: NSTableCellView {
-    private let title = Theme.label("", size: 13, color: Theme.ink)
+    private let title = Theme.label("", size: 14, color: Theme.ink)
     private let snippet = Theme.label("", size: 12, color: Theme.ink)
-    private let detail = Theme.label("", size: 10)
+    private let path = Theme.label("", size: 10)
+    private let metadata = Theme.label("", size: 10)
+    private let icon = NSImageView()
+    private let tile = PaperSurface(cornerRadius: 10, color: Theme.accentSoft, bordered: false)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
         title.lineBreakMode = .byTruncatingMiddle
         title.maximumNumberOfLines = 1
         snippet.lineBreakMode = .byTruncatingTail
         snippet.maximumNumberOfLines = 2
-        detail.lineBreakMode = .byTruncatingMiddle
-        detail.maximumNumberOfLines = 2
-        for label in [title, snippet, detail] {
-            label.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(label)
+        path.lineBreakMode = .byTruncatingMiddle
+        metadata.lineBreakMode = .byTruncatingTail
+        metadata.font = .systemFont(ofSize: 10, weight: .medium)
+        icon.contentTintColor = Theme.accent
+        icon.imageScaling = .scaleProportionallyDown
+        icon.setAccessibilityElement(false)
+        Theme.fill(icon, in: tile, inset: 10)
+        for view in [tile, title, snippet, path, metadata] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
         }
         NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 5),
+            tile.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            tile.topAnchor.constraint(equalTo: topAnchor, constant: 15),
+            tile.widthAnchor.constraint(equalToConstant: 40),
+            tile.heightAnchor.constraint(equalToConstant: 40),
+            title.leadingAnchor.constraint(equalTo: tile.trailingAnchor, constant: 12),
+            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 13),
             snippet.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             snippet.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            snippet.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 4),
-            detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            detail.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            detail.topAnchor.constraint(equalTo: snippet.bottomAnchor, constant: 4),
-            detail.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -4)
+            snippet.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
+            snippet.heightAnchor.constraint(equalToConstant: 32),
+            path.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            path.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            path.topAnchor.constraint(equalTo: snippet.bottomAnchor, constant: 5),
+            metadata.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            metadata.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            metadata.topAnchor.constraint(equalTo: path.bottomAnchor, constant: 3),
+            metadata.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -10)
         ])
     }
 
@@ -440,17 +500,31 @@ private final class SearchHitCell: NSTableCellView {
 
     func show(_ hit: SearchHit) {
         let source = hit.source
-        let page = hit.page.map { " · Page \($0)" } ?? ""
-        title.stringValue = "\(source.kind.rawValue.uppercased()) · \(source.title)\(page)"
+        let kind: String
+        let symbol: String
+        switch source.kind {
+        case .note: kind = "Note"; symbol = "note.text"
+        case .text: kind = "Text"; symbol = "doc.text"
+        case .pdf: kind = "PDF"; symbol = "doc.richtext"
+        case .image: kind = "Image"; symbol = "photo"
+        case .unsupported: kind = "File"; symbol = "doc"
+        }
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 19, weight: .regular))
+        title.stringValue = source.title
         let text = NSMutableAttributedString(string: hit.snippet, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.ink])
         let utf16 = hit.snippet as NSString
         for range in hit.highlights where range.location != NSNotFound && range.location >= 0 && range.length > 0 && NSMaxRange(range) <= utf16.length {
             let safeRange = utf16.rangeOfComposedCharacterSequences(for: range)
-            text.addAttributes([.backgroundColor: Theme.sidebar, .font: NSFont.systemFont(ofSize: 12, weight: .bold)], range: safeRange)
+            text.addAttributes([.backgroundColor: Theme.accentSoft, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)], range: safeRange)
         }
         snippet.attributedStringValue = text
-        detail.stringValue = "\(source.relativePath) · \(source.state.rawValue.capitalized)\(source.detail.isEmpty ? "" : " — \(source.detail)")"
-        toolTip = "\(title.stringValue)\n\(detail.stringValue)\n\(hit.snippet)"
+        path.stringValue = source.relativePath
+        let page = hit.page.map { " · Page \($0)" } ?? ""
+        metadata.stringValue = "\(kind)\(page) · \(source.state.rawValue.capitalized)\(source.detail.isEmpty ? "" : " — \(source.detail)")"
+        path.toolTip = source.relativePath
+        metadata.toolTip = metadata.stringValue
+        toolTip = "\(title.stringValue)\n\(path.stringValue)\n\(metadata.stringValue)\n\(hit.snippet)"
         setAccessibilityLabel(toolTip)
     }
 }

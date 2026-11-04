@@ -11,12 +11,13 @@ import CozyCore
     private let captureView = NSView()
     private let findView = NSView()
     private let detailView = NSView()
-    private let saveButton = NSButton()
+    private let saveButton = PrimaryButton()
+    private let captureContext = Theme.label("", size: 11)
     private let searchPanel: SearchPanel
     private let noteEditor = CaptureEditor(frame: .zero)
     private let noteHeading = Theme.label("", size: 21, color: Theme.ink)
     private let editButton = NSButton()
-    private let noteSaveButton = NSButton()
+    private let noteSaveButton = PrimaryButton()
     private var findShowsNote = false
     private var findNeedsRefresh = true
     private var noteURL: URL?
@@ -39,7 +40,7 @@ import CozyCore
         window.minSize = NSSize(width: 760, height: 540)
         window.backgroundColor = Theme.canvas
         window.titlebarAppearsTransparent = true
-        window.appearance = NSAppearance(named: .aqua)
+        window.appearance = nil
         window.center()
         super.init(window: window)
         window.delegate = self
@@ -54,19 +55,34 @@ import CozyCore
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
-        let brand = Theme.label("cozy notes", size: 19, color: Theme.accent)
-        brand.font = .systemFont(ofSize: 19, weight: .semibold)
-        brand.toolTip = vault.root.path
+        let emblem = PaperSurface(cornerRadius: 10, color: Theme.accentSoft, bordered: false)
+        let notebook = Theme.symbol("book.closed.fill", size: 17, color: Theme.accent)
+        Theme.fill(notebook, in: emblem, inset: 8)
+        emblem.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        emblem.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        let brand = Theme.label("Cozy Notes", size: 15, color: Theme.ink)
+        brand.font = .systemFont(ofSize: 15, weight: .semibold)
+        let identity = Theme.label("Your local notebook", size: 11)
+        let name = Theme.stack([brand, identity], orientation: .vertical, spacing: 2)
+        let signature = Theme.stack([emblem, name], spacing: 10)
+        signature.toolTip = vault.root.path
         modeSwitch.target = self
         modeSwitch.action = #selector(changeMode(_:))
         modeSwitch.selectedSegment = 0
-        modeSwitch.setWidth(92, forSegment: 0)
-        modeSwitch.setWidth(92, forSegment: 1)
+        modeSwitch.segmentStyle = .rounded
+        modeSwitch.controlSize = .large
+        modeSwitch.setWidth(112, forSegment: 0)
+        modeSwitch.setWidth(112, forSegment: 1)
+        modeSwitch.setImage(NSImage(systemSymbolName: "square.and.pencil", accessibilityDescription: nil), forSegment: 0)
+        modeSwitch.setImage(NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil), forSegment: 1)
+        modeSwitch.setImageScaling(.scaleProportionallyDown, forSegment: 0)
+        modeSwitch.setImageScaling(.scaleProportionallyDown, forSegment: 1)
+        modeSwitch.heightAnchor.constraint(greaterThanOrEqualToConstant: 32).isActive = true
         modeSwitch.setAccessibilityLabel("Workspace mode")
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let header = Theme.stack([brand, spacer, modeSwitch])
-        header.edgeInsets = NSEdgeInsets(top: 18, left: 26, bottom: 14, right: 26)
+        let header = Theme.stack([signature, spacer, modeSwitch])
+        header.edgeInsets = NSEdgeInsets(top: 10, left: 26, bottom: 12, right: 26)
         let body = NSView()
         Theme.fill(captureView, in: body)
         Theme.fill(findView, in: body)
@@ -80,35 +96,42 @@ import CozyCore
     }
 
     private func buildCapture() {
-        let title = Theme.label("Keep a little something.", size: 28, color: Theme.ink)
-        title.font = .systemFont(ofSize: 28, weight: .medium)
-        let subtitle = Theme.label("A thought, a link, a screenshot. No organizing needed.", size: 13)
-        let intro = Theme.stack([title, subtitle], orientation: .vertical, spacing: 9)
-        intro.edgeInsets = NSEdgeInsets(top: 30, left: 30, bottom: 8, right: 30)
+        captureContext.font = .systemFont(ofSize: 11, weight: .medium)
+        let title = Theme.label("Leave it here.", size: 35, color: Theme.ink)
+        title.font = Theme.displayFont(35)
+        let subtitle = Theme.label("Write a thought, paste a link, or drop in a file. Keep it without sorting it.", size: 13)
+        let intro = Theme.stack([captureContext, title, subtitle], orientation: .vertical, spacing: 5)
         saveButton.title = "Keep capture"
         saveButton.target = self
         saveButton.action = #selector(saveCapture)
-        saveButton.bezelStyle = .rounded
-        saveButton.contentTintColor = Theme.accent
-        saveButton.font = .systemFont(ofSize: 14, weight: .semibold)
         saveButton.toolTip = "Save this capture (⌘Return)"
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let actions = Theme.stack([spacer, saveButton])
-        actions.edgeInsets = NSEdgeInsets(top: 0, left: 24, bottom: 20, right: 24)
-        let column = Theme.stack([intro, editor, actions], orientation: .vertical, spacing: 8)
+        let shortcut = Theme.label("⌘ Return", size: 11)
+        shortcut.setAccessibilityLabel("Command Return to keep capture")
+        let actions = Theme.stack([spacer, shortcut, saveButton], spacing: 12)
+        actions.edgeInsets = NSEdgeInsets(top: 4, left: 22, bottom: 14, right: 22)
+        let sheet = PaperSurface()
+        let sheetContents = Theme.stack([editor, actions], orientation: .vertical, spacing: 0)
+        Theme.fill(sheetContents, in: sheet)
+        editor.widthAnchor.constraint(equalTo: sheetContents.widthAnchor).isActive = true
+        actions.widthAnchor.constraint(equalTo: sheetContents.widthAnchor).isActive = true
+        editor.heightAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+        let column = Theme.stack([intro, sheet], orientation: .vertical, spacing: 18)
         column.translatesAutoresizingMaskIntoConstraints = false
         captureView.addSubview(column)
-        for child in [intro, editor, actions] { child.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true }
-        let fillWidth = column.widthAnchor.constraint(equalTo: captureView.widthAnchor, constant: -36)
+        intro.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+        sheet.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+        sheet.setContentHuggingPriority(.defaultLow, for: .vertical)
+        let fillWidth = column.widthAnchor.constraint(equalTo: captureView.widthAnchor, constant: -64)
         fillWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
             column.centerXAnchor.constraint(equalTo: captureView.centerXAnchor),
-            column.leadingAnchor.constraint(greaterThanOrEqualTo: captureView.leadingAnchor, constant: 18),
-            column.trailingAnchor.constraint(lessThanOrEqualTo: captureView.trailingAnchor, constant: -18),
-            column.topAnchor.constraint(equalTo: captureView.topAnchor),
-            column.bottomAnchor.constraint(equalTo: captureView.bottomAnchor),
-            column.widthAnchor.constraint(lessThanOrEqualToConstant: 820),
+            column.leadingAnchor.constraint(greaterThanOrEqualTo: captureView.leadingAnchor, constant: 24),
+            column.trailingAnchor.constraint(lessThanOrEqualTo: captureView.trailingAnchor, constant: -24),
+            column.topAnchor.constraint(equalTo: captureView.topAnchor, constant: 18),
+            column.bottomAnchor.constraint(equalTo: captureView.bottomAnchor, constant: -22),
+            column.widthAnchor.constraint(lessThanOrEqualToConstant: 850),
             fillWidth
         ])
         editor.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -123,13 +146,19 @@ import CozyCore
         folderName.toolTip = vault.root.path
         folderName.lineBreakMode = .byTruncatingMiddle
         folderName.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let folderIcon = Theme.symbol("folder", size: 12, color: Theme.muted)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let folder = Theme.button("Open folder", target: self, action: #selector(revealFolder))
         let choose = Theme.button("Change folder…", target: self, action: #selector(chooseFolder))
         let recovery = Theme.button("Recovery…", target: self, action: #selector(showRecovery))
-        let footer = Theme.stack([folderName, spacer, folder, choose, recovery], spacing: 9)
-        footer.edgeInsets = NSEdgeInsets(top: 8, left: 24, bottom: 16, right: 24)
+        for button in [folder, choose, recovery] {
+            button.controlSize = .small
+            button.font = .systemFont(ofSize: 11)
+            button.contentTintColor = Theme.muted
+        }
+        let footer = Theme.stack([folderIcon, folderName, spacer, folder, choose, recovery], spacing: 9)
+        footer.edgeInsets = NSEdgeInsets(top: 10, left: 28, bottom: 14, right: 28)
         let layout = Theme.stack([destination, footer], orientation: .vertical, spacing: 0)
         Theme.fill(layout, in: findView)
         destination.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
@@ -138,6 +167,11 @@ import CozyCore
 
         let back = Theme.button("← Results", target: self, action: #selector(backToResults))
         back.toolTip = "Return to the same query and results"
+        back.controlSize = .small
+        back.contentTintColor = Theme.muted
+        noteHeading.font = .systemFont(ofSize: 12, weight: .medium)
+        noteHeading.textColor = Theme.muted
+        noteHeading.maximumNumberOfLines = 1
         noteHeading.lineBreakMode = .byTruncatingTail
         noteHeading.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         editButton.title = "Edit note"
@@ -146,23 +180,41 @@ import CozyCore
         editButton.bezelStyle = .rounded
         noteSaveButton.target = self
         noteSaveButton.action = #selector(saveNote)
-        noteSaveButton.bezelStyle = .rounded
         let titleSpacer = NSView()
         titleSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let toolbar = Theme.stack([back, noteHeading, titleSpacer, editButton, noteSaveButton], spacing: 10)
-        toolbar.edgeInsets = NSEdgeInsets(top: 16, left: 24, bottom: 8, right: 24)
+        toolbar.edgeInsets = NSEdgeInsets(top: 14, left: 24, bottom: 8, right: 24)
         noteEditor.allowsAttachments = false
         noteEditor.textView.isEditable = false
         noteEditor.textView.placeholder = "This note is empty."
+        let paper = PaperSurface()
         let detail = Theme.stack([toolbar, noteEditor], orientation: .vertical, spacing: 0)
-        Theme.fill(detail, in: detailView)
+        Theme.fill(detail, in: paper)
         toolbar.widthAnchor.constraint(equalTo: detail.widthAnchor).isActive = true
         noteEditor.widthAnchor.constraint(equalTo: detail.widthAnchor).isActive = true
+        noteEditor.setContentHuggingPriority(.defaultLow, for: .vertical)
+        paper.translatesAutoresizingMaskIntoConstraints = false
+        detailView.addSubview(paper)
+        let paperWidth = paper.widthAnchor.constraint(equalTo: detailView.widthAnchor, constant: -64)
+        paperWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            paper.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+            paper.topAnchor.constraint(equalTo: detailView.topAnchor, constant: 18),
+            paper.bottomAnchor.constraint(equalTo: detailView.bottomAnchor, constant: -6),
+            paper.leadingAnchor.constraint(greaterThanOrEqualTo: detailView.leadingAnchor, constant: 24),
+            paper.trailingAnchor.constraint(lessThanOrEqualTo: detailView.trailingAnchor, constant: -24),
+            paper.widthAnchor.constraint(lessThanOrEqualToConstant: 850),
+            paperWidth
+        ])
         updateNoteControls()
     }
 
     private func presentMode(focus: Bool) {
         modeSwitch.selectedSegment = mode == .capture ? 0 : 1
+        if mode == .capture {
+            let date = DateFormatter.localizedString(from: Date(), dateStyle: .long, timeStyle: .none)
+            captureContext.stringValue = "\(date)  ·  Local capture"
+        }
         captureView.isHidden = mode != .capture
         findView.isHidden = mode != .find
         searchPanel.isHidden = findShowsNote
