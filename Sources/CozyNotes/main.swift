@@ -55,12 +55,17 @@ import CozyCore
     @objc private func quick() { quickCapture?.summon() }
     @objc private func save() {
         if NSApp.keyWindow === quickCapture?.window { quickCapture?.save() }
-        else { workspace?.saveCapture() }
+        else { workspace?.saveCurrent() }
     }
-    @objc private func search() { workspace?.focusSearch() }
+    @objc private func search() { workspace?.focusSearch(); workspace?.showAndFocus() }
     @objc private func makeSearchable() { workspace?.makeSearchable() }
     @objc private func recovery() { workspace?.showRecovery() }
     @objc private func showWorkspace() { workspace?.showAndFocus() }
+    @objc private func captureMode() { workspace?.showCapture(); workspace?.showAndFocus() }
+    @objc private func findMode() { workspace?.showFind(); workspace?.showAndFocus() }
+    @objc private func openFolder() {
+        if let root = workspace?.vault.root { NSWorkspace.shared.open(root) }
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         workspace?.showAndFocus()
@@ -92,6 +97,7 @@ import CozyCore
         add("Keep / Save", action: #selector(save), key: "\r", to: file)
         file.addItem(.separator())
         add("Choose Notes Folder…", action: #selector(chooseFolder), key: "o", modifiers: [.command, .shift], to: file)
+        add("Open Notes Folder", action: #selector(openFolder), key: "", to: file)
         add("Recovery…", action: #selector(recovery), key: "", to: file)
         add("Make Searchable", action: #selector(makeSearchable), key: "", to: file)
         let editItem = NSMenuItem()
@@ -112,8 +118,10 @@ import CozyCore
         let view = NSMenu(title: "View")
         viewItem.submenu = view
         bar.addItem(viewItem)
+        add("Capture", action: #selector(captureMode), key: "1", to: view)
+        add("Find", action: #selector(findMode), key: "2", to: view)
         add("Search Captures", action: #selector(search), key: "f", to: view)
-        add("Show Workspace", action: #selector(showWorkspace), key: "1", to: view)
+        add("Show Workspace", action: #selector(showWorkspace), key: "", to: view)
         NSApp.mainMenu = bar
     }
     private func add(_ title: String, action: Selector, key: String, modifiers: NSEvent.ModifierFlags = .command, to menu: NSMenu) {

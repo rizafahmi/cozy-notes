@@ -1,20 +1,30 @@
 import AppKit
 import CozyCore
 
-@MainActor final class WorkspaceController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
+@MainActor final class WorkspaceController: NSWindowController, NSWindowDelegate {
+    enum Mode { case capture, find }
+
     let vault: Vault
     let editor = CaptureEditor(frame: .zero)
-    private let table = NSTableView()
-    private let heading = Theme.label("A little room to think.", size: 22, color: Theme.ink)
-    private let count = Theme.label("YOUR NOTES", size: 11)
+    private(set) var mode: Mode = .capture
+    private let modeSwitch = NSSegmentedControl(labels: ["Capture", "Find"], trackingMode: .selectOne, target: nil, action: nil)
+    private let captureView = NSView()
+    private let findView = NSView()
+    private let detailView = NSView()
     private let saveButton = NSButton()
     private let searchPanel: SearchPanel
-    private var records: [NoteRecord] = []
-    private var selectedURL: URL?
-    private var baseline = ""
-    private var dirty = false
-    private var conflicted = false
-    private var changingSelection = false
+    private let noteEditor = CaptureEditor(frame: .zero)
+    private let noteHeading = Theme.label("", size: 21, color: Theme.ink)
+    private let editButton = NSButton()
+    private let noteSaveButton = NSButton()
+    private var findShowsNote = false
+    private var findNeedsRefresh = true
+    private var noteURL: URL?
+    private var noteBaseline = ""
+    private var noteDirty = false
+    private var noteConflicted = false
+    private var noteAvailable = true
+    private var noteEditing = false
     private var autosave: Timer?
     private var watcher: VaultWatcher?
     var onChooseFolder: (() -> Void)?
@@ -22,10 +32,11 @@ import CozyCore
     init(vault: Vault) {
         self.vault = vault
         self.searchPanel = SearchPanel(vault: vault)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Cozy Notes"
-        window.minSize = NSSize(width: 820, height: 580)
+        window.representedURL = vault.root
+        window.minSize = NSSize(width: 760, height: 540)
         window.backgroundColor = Theme.canvas
         window.titlebarAppearsTransparent = true
         window.appearance = NSAppearance(named: .aqua)
@@ -33,215 +44,338 @@ import CozyCore
         super.init(window: window)
         window.delegate = self
         buildUI()
-        editor.onChange = { [weak self] in self?.editorChanged() }
+        editor.onChange = { [weak self] in self?.updateCaptureButton() }
+        noteEditor.onChange = { [weak self] in self?.noteChanged() }
         searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         watcher = VaultWatcher(root: vault.root) { [weak self] in self?.refresh() }
-        refresh()
+        presentMode(focus: false)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
-        let sidebar = NSView()
-        sidebar.wantsLayer = true
-        sidebar.layer?.backgroundColor = Theme.sidebar.cgColor
-        let brand = Theme.label("cozy notes", size: 22, color: Theme.accent)
-        brand.font = .systemFont(ofSize: 22, weight: .semibold)
-        let new = Theme.button("New capture", target: self, action: #selector(newCapture))
-        new.keyEquivalent = "n"
-        new.keyEquivalentModifierMask = .command
-        new.toolTip = "Start a new capture (⌘N)"
-        table.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("notes")))
-        table.headerView = nil
-        table.rowHeight = 76
-        table.intercellSpacing = NSSize(width: 0, height: 4)
-        table.backgroundColor = .clear
-        table.selectionHighlightStyle = .regular
-        table.delegate = self
-        table.dataSource = self
-        let list = NSScrollView()
-        list.documentView = table
-        list.drawsBackground = false
-        list.hasVerticalScroller = true
-        list.autohidesScrollers = true
-        let folder = Theme.button("Open folder", target: self, action: #selector(revealFolder))
-        let change = Theme.button("Change…", target: self, action: #selector(chooseFolder))
-        let folderRow = Theme.stack([folder, change], spacing: 4)
-        let folderName = Theme.label(vault.root.lastPathComponent, size: 11)
-        folderName.toolTip = vault.root.path
-        folderName.lineBreakMode = .byTruncatingMiddle
-        let sidebarStack = Theme.stack([brand, new, count, list, folderName, folderRow], orientation: .vertical, spacing: 18)
-        sidebarStack.edgeInsets = NSEdgeInsets(top: 25, left: 18, bottom: 18, right: 18)
-        Theme.fill(sidebarStack, in: sidebar)
-        list.widthAnchor.constraint(equalTo: sidebarStack.widthAnchor, constant: -36).isActive = true
-        folderName.widthAnchor.constraint(lessThanOrEqualTo: list.widthAnchor).isActive = true
-        sidebar.widthAnchor.constraint(equalToConstant: 254).isActive = true
+        let brand = Theme.label("cozy notes", size: 19, color: Theme.accent)
+        brand.font = .systemFont(ofSize: 19, weight: .semibold)
+        brand.toolTip = vault.root.path
+        modeSwitch.target = self
+        modeSwitch.action = #selector(changeMode(_:))
+        modeSwitch.selectedSegment = 0
+        modeSwitch.setWidth(92, forSegment: 0)
+        modeSwitch.setWidth(92, forSegment: 1)
+        modeSwitch.setAccessibilityLabel("Workspace mode")
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let header = Theme.stack([brand, spacer, modeSwitch])
+        header.edgeInsets = NSEdgeInsets(top: 18, left: 26, bottom: 14, right: 26)
+        let body = NSView()
+        Theme.fill(captureView, in: body)
+        Theme.fill(findView, in: body)
+        let layout = Theme.stack([header, body], orientation: .vertical, spacing: 0)
+        Theme.fill(layout, in: content)
+        header.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+        body.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+        body.setContentHuggingPriority(.defaultLow, for: .vertical)
+        buildCapture()
+        buildFind()
+    }
 
+    private func buildCapture() {
+        let title = Theme.label("Keep a little something.", size: 28, color: Theme.ink)
+        title.font = .systemFont(ofSize: 28, weight: .medium)
+        let subtitle = Theme.label("A thought, a link, a screenshot. No organizing needed.", size: 13)
+        let intro = Theme.stack([title, subtitle], orientation: .vertical, spacing: 9)
+        intro.edgeInsets = NSEdgeInsets(top: 30, left: 30, bottom: 8, right: 30)
         saveButton.title = "Keep capture"
         saveButton.target = self
         saveButton.action = #selector(saveCapture)
         saveButton.bezelStyle = .rounded
         saveButton.contentTintColor = Theme.accent
+        saveButton.font = .systemFont(ofSize: 14, weight: .semibold)
         saveButton.toolTip = "Save this capture (⌘Return)"
-        let history = Theme.button("Recovery…", target: self, action: #selector(showRecovery))
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        heading.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        heading.lineBreakMode = .byTruncatingTail
-        let toolbar = Theme.stack([heading, spacer, history, saveButton], spacing: 10)
-        toolbar.edgeInsets = NSEdgeInsets(top: 20, left: 30, bottom: 10, right: 24)
-        let hint = Theme.label("Save it here. Find it by the words you remember.", size: 13)
-        let hintRow = Theme.stack([hint])
-        hintRow.edgeInsets = NSEdgeInsets(top: 0, left: 32, bottom: 0, right: 24)
-        searchPanel.heightAnchor.constraint(equalToConstant: 300).isActive = true
-        let main = Theme.stack([toolbar, hintRow, searchPanel, editor], orientation: .vertical, spacing: 6)
-        main.alignment = .leading
-        for view in [toolbar, hintRow, searchPanel, editor] {
-            view.widthAnchor.constraint(equalTo: main.widthAnchor).isActive = true
-        }
-        let layout = Theme.stack([sidebar, main], spacing: 0)
-        layout.alignment = .top
-        Theme.fill(layout, in: content)
-        sidebar.heightAnchor.constraint(equalTo: layout.heightAnchor).isActive = true
-        main.heightAnchor.constraint(equalTo: layout.heightAnchor).isActive = true
+        let actions = Theme.stack([spacer, saveButton])
+        actions.edgeInsets = NSEdgeInsets(top: 0, left: 24, bottom: 20, right: 24)
+        let column = Theme.stack([intro, editor, actions], orientation: .vertical, spacing: 8)
+        column.translatesAutoresizingMaskIntoConstraints = false
+        captureView.addSubview(column)
+        for child in [intro, editor, actions] { child.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true }
+        let fillWidth = column.widthAnchor.constraint(equalTo: captureView.widthAnchor, constant: -36)
+        fillWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            column.centerXAnchor.constraint(equalTo: captureView.centerXAnchor),
+            column.leadingAnchor.constraint(greaterThanOrEqualTo: captureView.leadingAnchor, constant: 18),
+            column.trailingAnchor.constraint(lessThanOrEqualTo: captureView.trailingAnchor, constant: -18),
+            column.topAnchor.constraint(equalTo: captureView.topAnchor),
+            column.bottomAnchor.constraint(equalTo: captureView.bottomAnchor),
+            column.widthAnchor.constraint(lessThanOrEqualToConstant: 820),
+            fillWidth
+        ])
         editor.setContentHuggingPriority(.defaultLow, for: .vertical)
-        updateSaveButton()
+        updateCaptureButton()
     }
 
+    private func buildFind() {
+        let destination = NSView()
+        Theme.fill(searchPanel, in: destination)
+        Theme.fill(detailView, in: destination)
+        let folderName = Theme.label(vault.root.lastPathComponent, size: 11)
+        folderName.toolTip = vault.root.path
+        folderName.lineBreakMode = .byTruncatingMiddle
+        folderName.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let folder = Theme.button("Open folder", target: self, action: #selector(revealFolder))
+        let choose = Theme.button("Change folder…", target: self, action: #selector(chooseFolder))
+        let recovery = Theme.button("Recovery…", target: self, action: #selector(showRecovery))
+        let footer = Theme.stack([folderName, spacer, folder, choose, recovery], spacing: 9)
+        footer.edgeInsets = NSEdgeInsets(top: 8, left: 24, bottom: 16, right: 24)
+        let layout = Theme.stack([destination, footer], orientation: .vertical, spacing: 0)
+        Theme.fill(layout, in: findView)
+        destination.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+        footer.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+        destination.setContentHuggingPriority(.defaultLow, for: .vertical)
+
+        let back = Theme.button("← Results", target: self, action: #selector(backToResults))
+        back.toolTip = "Return to the same query and results"
+        noteHeading.lineBreakMode = .byTruncatingTail
+        noteHeading.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        editButton.title = "Edit note"
+        editButton.target = self
+        editButton.action = #selector(toggleNoteEditing)
+        editButton.bezelStyle = .rounded
+        noteSaveButton.target = self
+        noteSaveButton.action = #selector(saveNote)
+        noteSaveButton.bezelStyle = .rounded
+        let titleSpacer = NSView()
+        titleSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let toolbar = Theme.stack([back, noteHeading, titleSpacer, editButton, noteSaveButton], spacing: 10)
+        toolbar.edgeInsets = NSEdgeInsets(top: 16, left: 24, bottom: 8, right: 24)
+        noteEditor.allowsAttachments = false
+        noteEditor.textView.isEditable = false
+        noteEditor.textView.placeholder = "This note is empty."
+        let detail = Theme.stack([toolbar, noteEditor], orientation: .vertical, spacing: 0)
+        Theme.fill(detail, in: detailView)
+        toolbar.widthAnchor.constraint(equalTo: detail.widthAnchor).isActive = true
+        noteEditor.widthAnchor.constraint(equalTo: detail.widthAnchor).isActive = true
+        updateNoteControls()
+    }
+
+    private func presentMode(focus: Bool) {
+        modeSwitch.selectedSegment = mode == .capture ? 0 : 1
+        captureView.isHidden = mode != .capture
+        findView.isHidden = mode != .find
+        searchPanel.isHidden = findShowsNote
+        detailView.isHidden = !findShowsNote
+        if mode == .find {
+            if findShowsNote { refreshNoteIfClean() }
+            else if findNeedsRefresh { findNeedsRefresh = false; searchPanel.refresh() }
+        }
+        guard focus else { return }
+        if mode == .capture { editor.focus() }
+        else if findShowsNote { noteEditor.focus() }
+        else { searchPanel.focusSearch() }
+    }
+
+    @objc private func changeMode(_ sender: NSSegmentedControl) {
+        if sender.selectedSegment == 0 { showCapture() }
+        else { showFind() }
+        modeSwitch.selectedSegment = mode == .capture ? 0 : 1
+    }
+    @objc func showCapture() {
+        guard persistNoteIfNeeded() else { return }
+        mode = .capture
+        presentMode(focus: true)
+    }
+    @objc func showFind() {
+        mode = .find
+        presentMode(focus: true)
+    }
     func showAndFocus() {
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
-        editor.focus()
+        presentMode(focus: true)
     }
     func refresh() {
-        searchPanel.refresh()
-        do {
-            records = try vault.notes()
-            changingSelection = true
-            table.reloadData()
-            if let selectedURL, let index = records.firstIndex(where: { $0.url == selectedURL }) {
-                table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            } else { table.deselectAll(nil) }
-            changingSelection = false
-            count.stringValue = records.isEmpty ? "YOUR NOTES · NOTHING HERE YET" : "YOUR NOTES · \(records.count)"
-            if let selectedURL, !dirty {
-                do {
-                    let current = try vault.read(selectedURL)
-                    if current != baseline { baseline = current; editor.text = current }
-                } catch {
-                    editor.status.stringValue = "This note moved or was removed elsewhere. Your view is preserved."
-                }
-            }
-        } catch { editor.status.stringValue = "Couldn’t refresh: \(error.localizedDescription)" }
-    }
-    private func editorChanged() {
-        dirty = selectedURL == nil ? editor.hasContent : editor.text != baseline
-        updateSaveButton()
-        guard selectedURL != nil, !conflicted else { return }
-        autosave?.invalidate()
-        autosave = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { _ = self?.persistCurrent() }
+        findNeedsRefresh = true
+        if mode == .find {
+            if findShowsNote { refreshNoteIfClean() }
+            else { findNeedsRefresh = false; searchPanel.refresh() }
         }
     }
-    private func updateSaveButton() {
-        saveButton.title = conflicted ? "Keep as new capture" : (selectedURL == nil ? "Keep capture" : "Save changes")
-        saveButton.isEnabled = dirty || !editor.attachments.isEmpty
-    }
-    @discardableResult func persistCurrent() -> Bool {
-        autosave?.invalidate()
-        guard dirty || !editor.attachments.isEmpty else { return true }
+    private func updateCaptureButton() { saveButton.isEnabled = editor.hasContent }
+
+    @discardableResult private func persistCapture() -> Bool {
+        guard editor.hasContent else { return true }
         do {
-            if let url = selectedURL {
-                try vault.save(editor.text, to: url, expectedContent: baseline)
-                baseline = editor.text
-                dirty = false
-                editor.status.stringValue = "Saved · \(url.lastPathComponent)"
-            } else {
-                guard editor.hasContent else { return true }
-                let note = try vault.capture(text: editor.text, attachments: editor.attachments)
-                editor.reset()
-                dirty = false
-                editor.status.stringValue = "Kept · \(note.url.lastPathComponent)"
-            }
-            conflicted = false
-            updateSaveButton()
+            let note = try vault.capture(text: editor.text, attachments: editor.attachments)
+            editor.reset()
+            editor.status.stringValue = "Kept · \(note.url.lastPathComponent)"
+            updateCaptureButton()
             refresh()
             return true
         } catch {
-            if selectedURL != nil {
-                conflicted = true
-                editor.status.stringValue = "Couldn’t save safely. Your edits are here; keep them as a new capture."
-            }
-            updateSaveButton()
+            mode = .capture
+            presentMode(focus: true)
             showError(error, in: window)
             return false
         }
     }
-    @objc func saveCapture() {
-        if conflicted {
-            do {
-                _ = try vault.capture(text: editor.text, attachments: editor.attachments)
-                dirty = false
-                conflicted = false
-                selectedURL = nil
-                baseline = ""
-                editor.reset()
-                editor.allowsAttachments = true
-                heading.stringValue = "A little room to think."
-                updateSaveButton()
-                refresh()
-            } catch { showError(error, in: window) }
-        } else { _ = persistCurrent() }
-        editor.focus()
+    @discardableResult func persistCurrent() -> Bool {
+        guard persistNoteIfNeeded() else { return false }
+        return persistCapture()
+    }
+    @objc func saveCapture() { if persistCapture() { editor.focus() } }
+    @objc func saveCurrent() {
+        if mode == .capture { saveCapture() }
+        else if findShowsNote, noteEditing { saveNote() }
     }
     @objc func newCapture() {
         guard persistCurrent() else { return }
-        selectedURL = nil
-        baseline = ""
-        dirty = false
-        conflicted = false
-        changingSelection = true
-        table.deselectAll(nil)
-        changingSelection = false
-        editor.reset()
-        editor.allowsAttachments = true
-        heading.stringValue = "A little room to think."
-        updateSaveButton()
-        editor.focus()
+        mode = .capture
+        presentMode(focus: true)
     }
-    @objc func focusSearch() { searchPanel.focusSearch() }
+    @objc func focusSearch() { backToResults() }
     @objc func makeSearchable() {
-        guard persistCurrent() else { return }
+        guard returnToResults() else { return }
         searchPanel.makeSearchable()
     }
+    @objc private func backToResults() { _ = returnToResults() }
+    @discardableResult private func returnToResults() -> Bool {
+        guard persistNoteIfNeeded() else { return false }
+        noteEditing = false
+        noteEditor.textView.isEditable = false
+        findShowsNote = false
+        mode = .find
+        updateNoteControls()
+        presentMode(focus: true)
+        return true
+    }
+
     private func openNote(_ url: URL) {
-        guard url != selectedURL else { editor.focus(); return }
-        guard persistCurrent() else { refresh(); return }
+        guard persistNoteIfNeeded() else { return }
         do {
             let text = try vault.read(url)
-            selectedURL = url
-            baseline = text
-            dirty = false
-            conflicted = false
-            editor.reset()
-            editor.allowsAttachments = false
-            editor.text = text
-            editor.status.stringValue = url.path.replacingOccurrences(of: vault.root.path + "/", with: "")
-            heading.stringValue = records.first(where: { $0.url == url })?.title ?? url.deletingPathExtension().lastPathComponent
-            updateSaveButton()
-            changingSelection = true
-            if let index = records.firstIndex(where: { $0.url == url }) {
-                table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            } else { table.deselectAll(nil) }
-            changingSelection = false
-            editor.focus()
+            noteURL = url
+            noteBaseline = text
+            noteDirty = false
+            noteConflicted = false
+            noteAvailable = true
+            noteEditing = false
+            noteEditor.text = text
+            noteEditor.textView.isEditable = false
+            noteEditor.status.stringValue = relativePath(url)
+            noteHeading.stringValue = title(text, fallback: url.deletingPathExtension().lastPathComponent)
+            findShowsNote = true
+            mode = .find
+            updateNoteControls()
+            presentMode(focus: true)
         } catch { showError(error, in: window) }
     }
+    private func title(_ text: String, fallback: String) -> String {
+        var result = fallback
+        text.enumerateLines { line, stop in
+            guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+            result = Vault.title(from: String(line.prefix(160)))
+            stop = true
+        }
+        return result
+    }
+    private func relativePath(_ url: URL) -> String { String(url.path.dropFirst(vault.root.path.count + 1)) }
+    private func refreshNoteIfClean() {
+        guard let noteURL, !noteDirty, !noteConflicted else { return }
+        do {
+            let text = try vault.read(noteURL)
+            if text != noteBaseline {
+                noteBaseline = text
+                noteEditor.text = text
+                noteHeading.stringValue = title(text, fallback: noteURL.deletingPathExtension().lastPathComponent)
+            }
+            if !noteAvailable { noteEditor.status.stringValue = relativePath(noteURL) }
+            noteAvailable = true
+        } catch {
+            noteAvailable = false
+            noteEditor.status.stringValue = "Original unavailable. Its last view is preserved. \(error.localizedDescription)"
+        }
+        updateNoteControls()
+    }
+    @objc private func toggleNoteEditing() {
+        if noteEditing {
+            guard persistNoteIfNeeded() else { return }
+            noteEditing = false
+        } else {
+            guard noteAvailable else { return }
+            noteEditing = true
+        }
+        noteEditor.textView.isEditable = noteEditing
+        updateNoteControls()
+        noteEditor.focus()
+    }
+    private func noteChanged() {
+        guard noteEditing else { return }
+        noteDirty = noteEditor.text != noteBaseline
+        updateNoteControls()
+        autosave?.invalidate()
+        guard noteDirty, !noteConflicted else { return }
+        noteEditor.status.stringValue = "Unsaved changes"
+        autosave = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { _ = self?.persistNoteIfNeeded() }
+        }
+    }
+    private func updateNoteControls() {
+        editButton.title = noteEditing ? "Done editing" : "Edit note"
+        editButton.isEnabled = noteAvailable && !noteConflicted
+        noteSaveButton.title = noteConflicted ? "Keep as new note" : "Save changes"
+        noteSaveButton.isHidden = !noteEditing && !noteConflicted
+        noteSaveButton.isEnabled = noteDirty
+    }
+    @discardableResult private func persistNoteIfNeeded() -> Bool {
+        autosave?.invalidate()
+        guard noteDirty, let noteURL else { return true }
+        guard !noteConflicted else { return false }
+        do {
+            try vault.save(noteEditor.text, to: noteURL, expectedContent: noteBaseline)
+            noteBaseline = noteEditor.text
+            noteDirty = false
+            noteEditor.status.stringValue = "Saved · \(relativePath(noteURL))"
+            noteHeading.stringValue = title(noteBaseline, fallback: noteURL.deletingPathExtension().lastPathComponent)
+            updateNoteControls()
+            refresh()
+            return true
+        } catch {
+            noteConflicted = true
+            noteEditor.status.stringValue = "Couldn’t save safely. Keep your edits as a new note; the original will not be overwritten."
+            updateNoteControls()
+            showError(error, in: window)
+            return false
+        }
+    }
+    @objc private func saveNote() {
+        if !noteConflicted { _ = persistNoteIfNeeded(); return }
+        do {
+            let note = try vault.capture(text: noteEditor.text)
+            noteURL = note.url
+            noteBaseline = try vault.read(note.url)
+            noteEditor.text = noteBaseline
+            noteDirty = false
+            noteConflicted = false
+            noteAvailable = true
+            noteEditing = false
+            noteEditor.textView.isEditable = false
+            noteHeading.stringValue = note.title
+            noteEditor.status.stringValue = "Kept as a new note · \(relativePath(note.url))"
+            updateNoteControls()
+            refresh()
+        } catch { showError(error, in: window) }
+    }
+
     @objc private func revealFolder() { NSWorkspace.shared.open(vault.root) }
     @objc private func chooseFolder() { onChooseFolder?() }
     @objc func showRecovery() {
-        guard persistCurrent() else { return }
-        guard !searchPanel.isProcessing else {
+        guard persistNoteIfNeeded() else { return }
+        mode = .find
+        presentMode(focus: false)
+        guard !searchPanel.isExtracting else {
             showError(NSError(domain: "CozyNotes", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "Wait for extraction to finish or cancel it before recovering files."
             ]), in: window)
@@ -251,7 +385,7 @@ import CozyCore
             let snapshots = try vault.snapshots()
             let alert = NSAlert()
             alert.messageText = "Recover an earlier version"
-            alert.informativeText = "Restore notes and attachments from a checkpoint. New files created since then are kept. A fresh checkpoint is made before recovery. You can also create a checkpoint of the current collection."
+            alert.informativeText = "Restore saved files from a checkpoint. New files and the current capture draft are kept. A fresh checkpoint is made before recovery."
             let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 430, height: 26))
             let formatter = DateFormatter()
             formatter.dateStyle = .medium
@@ -266,24 +400,22 @@ import CozyCore
             alert.beginSheetModal(for: window) { [weak self] response in
                 guard let self, response == .alertFirstButtonReturn || response == .alertThirdButtonReturn else { return }
                 do {
-                    guard !self.searchPanel.isProcessing else {
-                        throw NSError(domain: "CozyNotes", code: 1, userInfo: [
-                            NSLocalizedDescriptionKey: "Wait for extraction to finish before recovering files."
-                        ])
+                    guard !self.searchPanel.isExtracting else {
+                        throw NSError(domain: "CozyNotes", code: 1, userInfo: [NSLocalizedDescriptionKey: "Wait for extraction to finish before recovering files."])
                     }
                     if response == .alertThirdButtonReturn {
                         _ = try self.vault.snapshot(label: "Manual checkpoint")
-                        self.editor.status.stringValue = "Recovery checkpoint saved."
                         return
                     }
                     guard snapshots.indices.contains(picker.indexOfSelectedItem) else { return }
                     try self.vault.restore(snapshotID: snapshots[picker.indexOfSelectedItem].id)
-                    self.selectedURL = nil
-                    self.baseline = ""
-                    self.editor.reset()
-                    self.editor.allowsAttachments = true
-                    self.heading.stringValue = "A little room to think."
-                    self.refresh()
+                    self.noteURL = nil
+                    self.noteEditor.reset()
+                    self.findShowsNote = false
+                    self.noteEditing = false
+                    self.noteEditor.textView.isEditable = false
+                    self.findNeedsRefresh = true
+                    self.presentMode(focus: true)
                 } catch { showError(error, in: self.window) }
             }
         } catch { showError(error, in: window) }
@@ -293,24 +425,5 @@ import CozyCore
         guard persistCurrent() else { return false }
         sender.orderOut(nil)
         return false
-    }
-    func numberOfRows(in tableView: NSTableView) -> Int { records.count }
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let note = records[row]
-        let title = Theme.label(note.title, size: 13, color: Theme.ink)
-        title.font = .systemFont(ofSize: 13, weight: .medium)
-        title.lineBreakMode = .byTruncatingTail
-        let excerpt = Theme.label(note.excerpt, size: 12)
-        excerpt.lineBreakMode = .byTruncatingTail
-        let date = Theme.label(note.modifiedAt.formatted(date: .abbreviated, time: .shortened), size: 10)
-        let stack = Theme.stack([title, excerpt, date], orientation: .vertical, spacing: 4)
-        stack.edgeInsets = NSEdgeInsets(top: 7, left: 7, bottom: 7, right: 7)
-        title.widthAnchor.constraint(lessThanOrEqualToConstant: 196).isActive = true
-        excerpt.widthAnchor.constraint(lessThanOrEqualToConstant: 196).isActive = true
-        return stack
-    }
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        guard !changingSelection, records.indices.contains(table.selectedRow) else { return }
-        openNote(records[table.selectedRow].url)
     }
 }

@@ -2,6 +2,8 @@ import AppKit
 import UniformTypeIdentifiers
 
 @MainActor final class MarkdownTextView: NSTextView {
+    private let editorUndoManager = UndoManager()
+    override var undoManager: UndoManager? { editorUndoManager }
     var onFiles: (([URL]) -> Void)?
     var onClipboardImage: ((Data) -> Void)?
     var placeholder = "A thought, a link, a little thing to keep…" { didSet { needsDisplay = true } }

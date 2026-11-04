@@ -8,6 +8,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     var onOpenNote: ((URL) -> Void)?
     var onStatus: ((String) -> Void)?
     var isProcessing: Bool { busy }
+    var isExtracting: Bool { extracting }
 
     private let vault: Vault
     private let engine: CaptureSearch
@@ -18,6 +19,10 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private let status = Theme.label("Loading local sources…", size: 11)
     private let empty = Theme.label("Loading local sources…")
     private let progress = NSProgressIndicator()
+    private let processingRow = NSStackView()
+    private let processingLabel = Theme.label("", size: 12)
+    private let recentLabel = Theme.label("RECENT CAPTURES", size: 11)
+    private var renderedQuery: String?
     private var makeButton: NSButton!
     private var cancelButton: NSButton!
     private var openButton: NSButton!
@@ -51,7 +56,20 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         cancelButton.isHidden = true
         openButton = Theme.button("Open original", target: self, action: #selector(openSelected))
         openButton.isEnabled = false
-        let toolbar = Theme.stack([field, makeButton, cancelButton, openButton], spacing: 8)
+        let toolbar = Theme.stack([field, openButton], spacing: 8)
+        processingLabel.lineBreakMode = .byTruncatingTail
+        processingLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let processingSpacer = NSView()
+        processingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        processingRow.orientation = .horizontal
+        processingRow.alignment = .centerY
+        processingRow.distribution = .fill
+        processingRow.spacing = 8
+        for view in [processingLabel, processingSpacer, makeButton!, cancelButton!] { processingRow.addArrangedSubview(view) }
+        processingRow.isHidden = true
+        let top = Theme.stack([toolbar, processingRow, recentLabel], orientation: .vertical, spacing: 12)
+        toolbar.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
+        processingRow.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
         progress.style = .bar
         progress.isIndeterminate = true
         progress.isHidden = true
@@ -88,21 +106,21 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
             empty.trailingAnchor.constraint(equalTo: results.trailingAnchor, constant: -16),
             empty.centerYAnchor.constraint(equalTo: results.centerYAnchor)
         ])
-        for view in [toolbar, results, footer] {
+        for view in [top, results, footer] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
         NSLayoutConstraint.activate([
-            toolbar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            toolbar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            toolbar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
+            top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
+            top.topAnchor.constraint(equalTo: topAnchor, constant: 20),
             field.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
-            results.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            results.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            results.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
+            results.leadingAnchor.constraint(equalTo: top.leadingAnchor),
+            results.trailingAnchor.constraint(equalTo: top.trailingAnchor),
+            results.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 12),
             results.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -6),
-            footer.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor),
-            footer.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor),
+            footer.leadingAnchor.constraint(equalTo: top.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: top.trailingAnchor),
             footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8)
         ])
     }
@@ -166,6 +184,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         progress.isIndeterminate = true
         progress.startAnimation(nil)
         setStatus(extract ? "Making sources searchable on this Mac…" : "Reading local sources…")
+        updateProcessingNotice()
         let engine = self.engine
         let vault = self.vault
         let lifetime = self.lifetime
@@ -232,27 +251,59 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
 
     private func render() {
         guard !closed else { return }
+        let query = field.stringValue
+        let browsing = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let selected = table.selectedRow >= 0 && table.selectedRow < hits.count ? hits[table.selectedRow] : nil
-        hits = snapshot?.search(field.stringValue) ?? []
+        let previousOffset = table.enclosingScrollView?.contentView.bounds.origin ?? .zero
+        hits = snapshot?.search(query) ?? []
+        if browsing {
+            hits.sort {
+                let left = stamps[$0.source.url]?.modified ?? .distantPast
+                let right = stamps[$1.source.url]?.modified ?? .distantPast
+                return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
+            }
+        }
         table.reloadData()
         if let selected, let row = hits.firstIndex(where: { $0.source.url == selected.source.url && $0.page == selected.page }) {
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
+        if let scroll = table.enclosingScrollView {
+            let height = hits.isEmpty ? 0 : table.rect(ofRow: hits.count - 1).maxY
+            let y = renderedQuery == query ? min(previousOffset.y, max(0, height - scroll.contentView.bounds.height)) : 0
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        renderedQuery = query
+        recentLabel.isHidden = !browsing
+        updateProcessingNotice()
         empty.isHidden = !hits.isEmpty
         let pending = snapshot?.pendingCount ?? 0
         if snapshot == nil {
-            empty.stringValue = busy ? "Reading local sources…" : "Sources could not be loaded. Try Make searchable or refresh the folder."
+            empty.stringValue = busy ? "Reading local sources…" : "Sources could not be loaded. Check folder access or choose another folder."
         } else if snapshot?.sources.isEmpty == true {
             empty.stringValue = "No sources yet. Capture a note or add files to this folder."
         } else {
             empty.stringValue = "No matches.\(pending > 0 ? " \(pending) sources still need Make searchable; their filenames can already be searched." : " Try other original-language words or a filename.")"
         }
         if !busy, let snapshot {
-            let browsing = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let noun = browsing ? (hits.count == 1 ? "source" : "sources") : (hits.count == 1 ? "result" : "results")
             setStatus("\(hits.count) \(noun) · \(snapshot.readyCount) ready · \(snapshot.pendingCount) pending · \(snapshot.issueCount) need attention · Local only")
         }
         openButton.isEnabled = !busy && !hits.isEmpty
+    }
+
+    private func updateProcessingNotice() {
+        let pending = snapshot?.pendingCount ?? 0
+        let issues = snapshot?.issueCount ?? 0
+        let retryable = snapshot?.sources.contains {
+            ($0.kind == .image || $0.kind == .pdf) && $0.state == .unreadable
+        } ?? false
+        processingRow.isHidden = !extracting && pending == 0 && issues == 0
+        makeButton.isHidden = extracting || (pending == 0 && !retryable)
+        makeButton.title = pending > 0 ? "Make searchable" : "Retry extraction"
+        if extracting { processingLabel.stringValue = "Processing on this Mac. Originals stay unchanged." }
+        else if pending > 0 { processingLabel.stringValue = "\(pending) \(pending == 1 ? "file needs" : "files need") text extraction." }
+        else { processingLabel.stringValue = "\(issues) \(issues == 1 ? "file needs" : "files need") attention. Clear search to review statuses." }
     }
 
     private func setStatus(_ text: String) {
