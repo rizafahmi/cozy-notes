@@ -383,7 +383,7 @@ import AppKit
         NSFont.monospacedSystemFont(ofSize: size, weight: weight)
     }
     static func label(_ text: String, size: CGFloat = 13, color: NSColor? = nil) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
+        let label = WindowDraggableLabel(labelWithString: text)
         label.font = .systemFont(ofSize: size)
         label.textColor = color ?? muted
         return label
@@ -455,6 +455,7 @@ import AppKit
 
 /// Resolve semantic colors while drawing, including appearance and contrast changes.
 @MainActor final class PaperSurface: NSView {
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     private let radius: CGFloat
     private let color: NSColor
     private let bordered: Bool
@@ -489,6 +490,7 @@ import AppKit
 
 /// Tactile inset journal folio sitting on the desk with a subtle shadow, top catch-light, and left scholarly margin rule.
 @MainActor final class FolioPageSurface: NSView {
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     var marginX: CGFloat = 56 { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -595,6 +597,8 @@ import AppKit
 }
 
 @MainActor final class HairlineView: NSView {
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+
     override func draw(_ dirtyRect: NSRect) {
         (NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? Theme.muted : Theme.border).setFill()
         bounds.fill()
@@ -663,6 +667,16 @@ import AppKit
     }
 }
 
+
+@MainActor final class WindowDraggableLabel: NSTextField {
+    override func mouseDown(with event: NSEvent) {
+        if !isEditable && !isSelectable, let window {
+            window.performDrag(with: event)
+        } else {
+            super.mouseDown(with: event)
+        }
+    }
+}
 @MainActor func showError(_ error: Error, in window: NSWindow?) {
     let alert = NSAlert(error: error)
     if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
