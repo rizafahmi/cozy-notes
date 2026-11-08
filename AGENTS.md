@@ -7,7 +7,7 @@ Cozy Notes (`local.cozy.notes`) is a local-first macOS workspace (AppKit, Swift 
 Core invariants:
 - **Plain-file storage**: Notes (`Inbox/<UTC-timestamp>-<UUID>.md`), attachments (`Attachments/<UUID>/<filename>`), and OCR/PDF extraction sidecars (`Extracted Text/<sha256-of-relative-path>.md`) are ordinary local files synced externally (e.g., via Syncthing).
 - **Offline & private**: Zero network requests, zero LLMs/cloud APIs, zero persistent databases, and zero external Swift Package dependencies.
-- **Repository & vault Markdown discovery**: `Vault` surfaces all `.md` / `.markdown` files (including `AGENTS.md`, `README.md`, `PLAN.md`, and `docs/**/*.md`). When opened on a project repository (`Vault.isProjectRepository`), it prunes build/dependency directories (`node_modules`, `target`, `build`, `dist`, `vendor`, `DerivedData`, etc.) and scopes indexing outside `Inbox/`, `Attachments/`, and `Extracted Text/` to Markdown files.
+- **Repository & vault Markdown discovery**: `Vault` surfaces all `.md` / `.markdown` files (including `AGENTS.md`, `README.md`, `PLAN.md`, and `docs/**/*.md`). Unambiguous dependency and environment folders (`node_modules`, `Pods`, `DerivedData`, `site-packages`, `venv`, directories containing `pyvenv.cfg`, bundle suffixes, etc.) are pruned in every vault; generic build/dependency folders (`deps`, `_build`, `target`, `build`, `dist`, `vendor`, etc.) are pruned inside root or nested project repositories while preserving ordinary user note folders. When opened directly on a project repository (`Vault.isProjectRepository`), indexing outside `Inbox/`, `Attachments/`, and `Extracted Text/` is scoped to Markdown files.
 
 ---
 

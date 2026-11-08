@@ -359,6 +359,60 @@ final class VaultTests: XCTestCase {
         try fixture.vault.save("# Execution Plan\nUser Overwrite", to: planURL, expectedContent: "# Execution Plan\nExternal Agent Edit")
         XCTAssertEqual(try fixture.vault.read(planURL), "# Execution Plan\nUser Overwrite")
     }
+
+    func testDependencyDirectoriesAreHiddenWhileUserNoteFoldersRemainVisibleAndSnapshotted() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let fm = FileManager.default
+        XCTAssertFalse(fixture.vault.isProjectRepository)
+
+        // User folders in a non-repo vault (including "Captures/" and "notes/build/") must stay visible and snapshotted
+        let capturesNote = fixture.root.appendingPathComponent("Captures/idea.md")
+        let buildNote = fixture.root.appendingPathComponent("notes/build/idea.md")
+        let rootBuildNote = fixture.root.appendingPathComponent("build/plan.md")
+        for url in [capturesNote, buildNote, rootBuildNote] {
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "# \(url.deletingLastPathComponent().lastPathComponent) Note\nUser content".write(to: url, atomically: true, encoding: .utf8)
+        }
+
+        // Nested Node project with package.json + node_modules, plus a custom Python virtualenv with pyvenv.cfg
+        let nestedProj = fixture.root.appendingPathComponent("proj", isDirectory: true)
+        let nestedNodeMod = nestedProj.appendingPathComponent("node_modules/x", isDirectory: true)
+        let nestedProjReadme = nestedProj.appendingPathComponent("README.md")
+        try fm.createDirectory(at: nestedNodeMod, withIntermediateDirectories: true)
+        try "{\"name\":\"proj\"}".write(to: nestedProj.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        try "# Project Readme".write(to: nestedProjReadme, atomically: true, encoding: .utf8)
+        try "# Hidden NPM Readme".write(to: nestedNodeMod.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+
+        let customVenv = fixture.root.appendingPathComponent("custom-py-env", isDirectory: true)
+        let venvPkg = customVenv.appendingPathComponent("lib/python3.12/site-packages/pkg", isDirectory: true)
+        try fm.createDirectory(at: venvPkg, withIntermediateDirectories: true)
+        try "home = /usr/bin\n".write(to: customVenv.appendingPathComponent("pyvenv.cfg"), atomically: true, encoding: .utf8)
+        try "# Hidden Venv Readme".write(to: venvPkg.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+
+        // Nested Elixir project with mix.exs + deps/ and _build/
+        let elixirProj = fixture.root.appendingPathComponent("elixir-app", isDirectory: true)
+        let elixirDeps = elixirProj.appendingPathComponent("deps/phoenix", isDirectory: true)
+        let elixirBuild = elixirProj.appendingPathComponent("_build/dev", isDirectory: true)
+        let elixirGuide = elixirProj.appendingPathComponent("GUIDE.md")
+        try fm.createDirectory(at: elixirDeps, withIntermediateDirectories: true)
+        try fm.createDirectory(at: elixirBuild, withIntermediateDirectories: true)
+        try "defmodule App.MixProject do end".write(to: elixirProj.appendingPathComponent("mix.exs"), atomically: true, encoding: .utf8)
+        try "# Elixir Guide".write(to: elixirGuide, atomically: true, encoding: .utf8)
+        try "# Phoenix Dep Readme".write(to: elixirDeps.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        try "# Mix Build Artifact".write(to: elixirBuild.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+
+        let noteURLs = Set(try fixture.vault.notes().map(\.url))
+        XCTAssertEqual(noteURLs, Set([capturesNote, buildNote, rootBuildNote, nestedProjReadme, elixirGuide]))
+
+        let checkpoint = try fixture.vault.snapshot(label: "Preserve user folders")
+        let snapshotStorage = fixture.history.appendingPathComponent(checkpoint.id).appendingPathComponent("Files")
+        XCTAssertTrue(fm.fileExists(atPath: snapshotStorage.appendingPathComponent("Captures/idea.md").path))
+        XCTAssertTrue(fm.fileExists(atPath: snapshotStorage.appendingPathComponent("notes/build/idea.md").path))
+        XCTAssertTrue(fm.fileExists(atPath: snapshotStorage.appendingPathComponent("build/plan.md").path))
+        XCTAssertFalse(fm.fileExists(atPath: snapshotStorage.appendingPathComponent("proj/node_modules/x/README.md").path))
+        XCTAssertFalse(fm.fileExists(atPath: snapshotStorage.appendingPathComponent("elixir-app/deps/phoenix/README.md").path))
+    }
 }
 
 #if canImport(Testing)
@@ -424,6 +478,11 @@ struct VaultCoreSuite {
     @Test("Project repository prunes build/dependency dirs and scopes indexing to Markdown and managed folders")
     func projectRepositoryScoping() throws {
         try VaultTests().testProjectRepositoryPrunesBuildDirectoriesAndScopesToMarkdownAndManagedFolders()
+    }
+
+    @Test("Dependency directories are hidden while user note folders remain visible and snapshotted")
+    func dependencyDirectoriesHiddenWhileUserNoteFoldersPreserved() throws {
+        try VaultTests().testDependencyDirectoriesAreHiddenWhileUserNoteFoldersRemainVisibleAndSnapshotted()
     }
 }
 #endif

@@ -710,13 +710,24 @@ public final class Vault: @unchecked Sendable {
             return false
         }) else { return [] }
         var result: [URL] = []
+        var nestedRepoRoots: [URL] = []
         for case let url as URL in enumerator {
             let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey, .isDirectoryKey])
             if values.isSymbolicLink == true { enumerator.skipDescendants(); continue }
-            if isRepo && values.isDirectory == true {
-                if Self.ignoredDirectoryNames.contains(url.lastPathComponent.lowercased()) {
-                    enumerator.skipDescendants()
-                    continue
+            if values.isDirectory == true {
+                let canonicalDir = url.standardizedFileURL.resolvingSymlinksInPath()
+                let inManagedSubfolder = Self.contains(canonicalDir, in: inboxRoot)
+                    || Self.contains(canonicalDir, in: attachmentsRoot)
+                    || Self.contains(canonicalDir, in: extractedRoot)
+                if !inManagedSubfolder {
+                    let inRepo = isRepo || nestedRepoRoots.contains(where: { Self.contains(canonicalDir, in: $0) })
+                    if Self.shouldIgnoreDirectory(url, inRepository: inRepo, fileManager: fm) {
+                        enumerator.skipDescendants()
+                        continue
+                    }
+                    if !inRepo && Self.isRepositoryDirectory(url, fileManager: fm) {
+                        nestedRepoRoots.append(canonicalDir)
+                    }
                 }
             }
             if values.isRegularFile == true {
@@ -847,11 +858,70 @@ public final class Vault: @unchecked Sendable {
 
     private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "svg", "avif", "ico"]
 
-    public static let ignoredDirectoryNames: Set<String> = [
-        "node_modules", "target", "build", "dist", "out", "vendor",
-        "pods", "deriveddata", "carthage", "__pycache__", "venv",
-        "coverage", "bin", "obj", "gradle", "cmake-build-debug", "cmake-build-release"
+    public static let alwaysIgnoredDirectoryNames: Set<String> = [
+        "node_modules", "bower_components", "jspm_packages", "web_modules",
+        "pods", "carthage", "deriveddata", "sourcepackages", "xcuserdata",
+        "__pycache__", "__pypackages__", "site-packages", "dist-packages",
+        "venv", "virtualenv", "pip-wheel-metadata",
+        "elm-stuff", "vcpkg_installed", "zig-cache", "lua_modules",
+        "dist-newstyle", "_opam", "renv", "packrat"
     ]
+
+    public static let projectIgnoredDirectoryNames: Set<String> = [
+        "build", "dist", "out", "target", "vendor",
+        "deps", "_build", "_checkouts", "ebin",
+        "bin", "obj", "coverage", "gradle", "packages", "checkouts",
+        "subprojects", "third_party", "third-party", "3rdparty", "3rd-party", "thirdparty",
+        "artifacts", "testresults", "zig-out",
+        "_esy", "_site", "godeps", "blib",
+        "cmake-build-debug", "cmake-build-release",
+        "cmake-build-relwithdebinfo", "cmake-build-minsizerel",
+        "cdk.out", "terraform.tfstate.d"
+    ]
+    public static let ignoredDirectoryNames: Set<String> = alwaysIgnoredDirectoryNames.union(projectIgnoredDirectoryNames)
+
+    public static let projectIgnoredDirectoryPrefixes: [String] = [
+        "cmake-build-",
+        "bazel-"
+    ]
+
+    public static let alwaysIgnoredDirectorySuffixes: [String] = [
+        ".egg-info",
+        ".dist-info",
+        ".egg",
+        ".framework",
+        ".xcframework",
+        ".dsym",
+        ".xcodeproj",
+        ".xcworkspace",
+        ".playground",
+        ".doccarchive",
+        ".xctest"
+    ]
+
+    private static let ignoredDirectoryMarkerFiles: [String] = [
+        "pyvenv.cfg",
+        "conda-meta",
+        "CACHEDIR.TAG"
+    ]
+
+    public static func shouldIgnoreDirectory(_ url: URL, inRepository: Bool, fileManager: FileManager = .default) -> Bool {
+        let name = url.lastPathComponent.lowercased()
+        guard !name.isEmpty else { return false }
+        if name.hasPrefix(".") { return true }
+        if alwaysIgnoredDirectoryNames.contains(name) { return true }
+        if alwaysIgnoredDirectorySuffixes.contains(where: { name.hasSuffix($0) }) { return true }
+        if inRepository {
+            if projectIgnoredDirectoryNames.contains(name) { return true }
+            if projectIgnoredDirectoryPrefixes.contains(where: { name.hasPrefix($0) }) { return true }
+        }
+        for marker in ignoredDirectoryMarkerFiles {
+            if fileManager.fileExists(atPath: url.appendingPathComponent(marker).path) {
+                return true
+            }
+        }
+        return false
+    }
 
     public static let ignoredSourceExtensions: Set<String> = [
         "swift", "kt", "kts", "java", "c", "cc", "cpp", "h", "hpp", "m", "mm",
@@ -860,22 +930,31 @@ public final class Vault: @unchecked Sendable {
         "json", "jsonl", "xml", "plist", "gradle", "properties", "lock", "sum", "mod",
         "pbxproj", "xcworkspacedata", "storyboard", "xib", "strings", "sql", "sqlite", "db",
         "o", "a", "dylib", "so", "dll", "exe", "class", "jar", "aar", "apk", "ipa", "wasm", "map",
-        "css", "scss", "less", "html", "htm", "vue", "svelte"
+        "css", "scss", "less", "html", "htm", "vue", "svelte", "ex", "exs", "erl", "hrl",
+        "gleam", "zig", "hs", "ml", "mli", "elm", "lua", "r", "jl", "dart", "cmake", "nix"
     ]
 
-    private static let repositoryMarkers: [String] = [
-        ".git", "Package.swift", "package.json", "Cargo.toml", "go.mod",
-        "pyproject.toml", "build.gradle", "build.gradle.kts", "pom.xml",
-        "Makefile", "CMakeLists.txt"
+    private static let repositoryMarkers: Set<String> = [
+        ".git", "Package.swift", "Podfile", "Cartfile",
+        "package.json", "deno.json", "deno.jsonc", "bunfig.toml", "pnpm-workspace.yaml",
+        "Cargo.toml", "go.mod", "go.work",
+        "mix.exs", "rebar.config", "gleam.toml",
+        "pyproject.toml", "setup.py", "Pipfile",
+        "Gemfile", "composer.json",
+        "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "pom.xml", "build.sbt",
+        "deps.edn", "project.clj",
+        "pubspec.yaml", "elm.json", "dune-project", "stack.yaml", "cabal.project",
+        "build.zig", "build.zig.zon", "renv.lock",
+        "Makefile", "CMakeLists.txt", "meson.build",
+        "vcpkg.json", "conanfile.py", "BUILD.bazel", "MODULE.bazel",
+        "global.json", "Directory.Build.props", "flake.nix"
     ]
 
     private static func isRepositoryDirectory(_ directory: URL, fileManager: FileManager) -> Bool {
-        for marker in repositoryMarkers {
-            if fileManager.fileExists(atPath: directory.appendingPathComponent(marker).path) {
-                return true
-            }
+        guard let entries = try? fileManager.contentsOfDirectory(atPath: directory.path) else {
+            return false
         }
-        return false
+        return entries.contains(where: { repositoryMarkers.contains($0) })
     }
 
 }
