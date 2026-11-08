@@ -4,8 +4,24 @@ import ImageIO
 import QuartzCore
 import CozyCore
 
+@MainActor private final class CozyUndoManager: UndoManager {
+    override func undo() {
+        autoreleasepool { super.undo() }
+    }
+    override func undoNestedGroup() {
+        autoreleasepool { super.undoNestedGroup() }
+    }
+    override func redo() {
+        autoreleasepool { super.redo() }
+    }
+}
+
 @MainActor final class MarkdownTextView: NSTextView {
-    private let editorUndoManager = UndoManager()
+    private let editorUndoManager: UndoManager = {
+        let um = CozyUndoManager()
+        um.levelsOfUndo = 2
+        return um
+    }()
     override var undoManager: UndoManager? { editorUndoManager }
     var onFiles: (([URL]) -> Void)?
     var onClipboardImage: ((Data) -> Void)?
@@ -27,6 +43,27 @@ import CozyCore
     var inlineCodeRanges: [NSRange] = []
     var headingGutterItems: [HeadingGutter] = []
 
+    struct EditRecord {
+        let affectedRange: NSRange
+        let replacementLength: Int
+        let delta: Int
+        let oldTotalLength: Int
+        let windowStart: Int
+        let oldWindowEnd: Int
+        let oldWindowWords: Int
+        let needsFullWordCount: Bool
+        let requiresFullFormat: Bool
+        let mayHaveLink: Bool
+    }
+    var pendingEdit: EditRecord?
+    private var isEditingText = false
+    var cachedFullText: String = ""
+    var cachedFullTextLength: Int = 0
+    var cachedFullTextSig: Int = 0
+    private var lastClipboardChangeCount: Int = -1
+    private var lastClipboardString: String = ""
+    private var lastClipboardLength: Int = -1
+    private var lastClipboardSig: Int = 0
     /// Bike-style smooth typewriter caret layer driven by additive critically-damped springs.
     private let caretLayer: CALayer = {
         let layer = CALayer()
@@ -50,14 +87,40 @@ import CozyCore
     private var windowFocusObservers: [NSObjectProtocol] = []
     var suppressCaretUpdates = false
 
+    override func setNeedsDisplay(_ invalidRect: NSRect, avoidAdditionalLayout flag: Bool) {
+        if enclosingScrollView != nil {
+            let vis = visibleRect
+            if vis.width > 0 && vis.height > 0 {
+                let clipped = invalidRect.intersection(vis)
+                guard !clipped.isNull && clipped.width > 0 && clipped.height > 0 else { return }
+                super.setNeedsDisplay(clipped, avoidAdditionalLayout: true)
+                return
+            }
+        }
+        super.setNeedsDisplay(invalidRect, avoidAdditionalLayout: flag)
+    }
+
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard let layoutManager = layoutManager, let textContainer = textContainer else { return }
+        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty else { return }
+        guard let layoutManager = layoutManager, let textContainer = textContainer, let storage = textStorage else { return }
+        let totalLength = storage.length
+        guard totalLength > 0 else { return }
         let origin = textContainerOrigin
         let columnWidth = max(0, bounds.width - 2 * origin.x)
-        let totalLength = (string as NSString).length
 
-        for block in fencedBlocks where NSMaxRange(block.fullRange) <= totalLength && NSMaxRange(block.bodyRange) <= totalLength {
+        let queryRect = rect.offsetBy(dx: -origin.x, dy: -origin.y).insetBy(dx: 0, dy: -96)
+        let visibleGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: queryRect, in: textContainer)
+        guard visibleGlyphs.length > 0 else { return }
+        let visibleChars = layoutManager.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
+        let visStart = visibleChars.location
+        let visEnd = NSMaxRange(visibleChars)
+
+        for block in fencedBlocks {
+            if block.fullRange.location > visEnd { break }
+            guard NSMaxRange(block.fullRange) >= visStart,
+                  NSMaxRange(block.fullRange) <= totalLength,
+                  NSMaxRange(block.bodyRange) <= totalLength else { continue }
             let bodyGlyphs = layoutManager.glyphRange(forCharacterRange: block.bodyRange, actualCharacterRange: nil)
             let bodyRect = layoutManager.boundingRect(forGlyphRange: bodyGlyphs, in: textContainer)
             let verticalPad: CGFloat = 14
@@ -84,26 +147,32 @@ import CozyCore
             path.stroke()
         }
 
-        let codeFont = Theme.monoFont(Theme.baseProseSize - 2.0, weight: .medium)
-        let pillHeight = ceil(codeFont.ascender - codeFont.descender) + 5
-        for inner in inlineCodeRanges where NSMaxRange(inner) <= totalLength {
-            let glyphRange = layoutManager.glyphRange(forCharacterRange: inner, actualCharacterRange: nil)
-            let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-            let pill = NSRect(
-                x: origin.x + raw.minX - 5,
-                y: origin.y + raw.minY,
-                width: raw.width + 10,
-                height: pillHeight
-            )
-            let path = NSBezierPath(roundedRect: pill, xRadius: 5.5, yRadius: 5.5)
-            Theme.inlineCodeFill.setFill()
-            path.fill()
-            Theme.inlineCodeBorder.setStroke()
-            path.lineWidth = 1
-            path.stroke()
+        if !inlineCodeRanges.isEmpty {
+            let codeFont = Theme.monoFont(Theme.baseProseSize - 2.0, weight: .medium)
+            let pillHeight = ceil(codeFont.ascender - codeFont.descender) + 5
+            for inner in inlineCodeRanges {
+                if inner.location > visEnd { break }
+                guard NSMaxRange(inner) >= visStart, NSMaxRange(inner) <= totalLength else { continue }
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: inner, actualCharacterRange: nil)
+                let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                let pill = NSRect(
+                    x: origin.x + raw.minX - 5,
+                    y: origin.y + raw.minY,
+                    width: raw.width + 10,
+                    height: pillHeight
+                )
+                let path = NSBezierPath(roundedRect: pill, xRadius: 5.5, yRadius: 5.5)
+                Theme.inlineCodeFill.setFill()
+                path.fill()
+                Theme.inlineCodeBorder.setStroke()
+                path.lineWidth = 1
+                path.stroke()
+            }
         }
 
-        for range in blockquoteRanges where NSMaxRange(range) <= totalLength {
+        for range in blockquoteRanges {
+            if range.location > visEnd { break }
+            guard NSMaxRange(range) >= visStart, NSMaxRange(range) <= totalLength else { continue }
             let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             var box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
             box.origin.x = origin.x
@@ -121,29 +190,33 @@ import CozyCore
             bar.fill()
         }
 
-        let badgeAttrs: [NSAttributedString.Key: Any] = [
-            .font: Theme.monoFont(9.5, weight: .semibold),
-            .foregroundColor: Theme.subtle.withAlphaComponent(0.8)
-        ]
-        for item in headingGutterItems where NSMaxRange(item.range) <= totalLength {
-            let glyphRange = layoutManager.glyphRange(forCharacterRange: item.range, actualCharacterRange: nil)
-            let box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-            if origin.x >= 56 {
-                let badgeSize = (item.label as NSString).size(withAttributes: badgeAttrs)
-                let x = origin.x - 24 - badgeSize.width
-                let y = origin.y + box.minY + max(0, (box.height - badgeSize.height) / 2) - 2
-                (item.label as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: badgeAttrs)
-            }
-            if item.level == 1 {
-                Theme.marginLine.setFill()
-                NSRect(x: origin.x + 4, y: origin.y + box.maxY + 4, width: max(0, columnWidth - 8), height: 1).fill()
+        if !headingGutterItems.isEmpty {
+            let badgeAttrs: [NSAttributedString.Key: Any] = [
+                .font: Theme.monoFont(9.5, weight: .semibold),
+                .foregroundColor: Theme.subtle.withAlphaComponent(0.8)
+            ]
+            for item in headingGutterItems {
+                if item.range.location > visEnd { break }
+                guard NSMaxRange(item.range) >= visStart, NSMaxRange(item.range) <= totalLength else { continue }
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: item.range, actualCharacterRange: nil)
+                let box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                if origin.x >= 56 {
+                    let badgeSize = (item.label as NSString).size(withAttributes: badgeAttrs)
+                    let x = origin.x - 24 - badgeSize.width
+                    let y = origin.y + box.minY + max(0, (box.height - badgeSize.height) / 2) - 2
+                    (item.label as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: badgeAttrs)
+                }
+                if item.level == 1 {
+                    Theme.marginLine.setFill()
+                    NSRect(x: origin.x + 4, y: origin.y + box.maxY + 4, width: max(0, columnWidth - 8), height: 1).fill()
+                }
             }
         }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard string.isEmpty else { return }
+        guard (textStorage?.length ?? 0) == 0 else { return }
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 7.5
         let attributes: [NSAttributedString.Key: Any] = [
@@ -212,14 +285,182 @@ import CozyCore
         return ok
     }
 
+    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+        guard ok, let ns = textStorage?.mutableString else { return ok }
+        isEditingText = true
+        let oldLen = ns.length
+        let repNS = (replacementString ?? "") as NSString
+        let repLen = repNS.length
+        let delta = repLen - affectedCharRange.length
+        let isLargeEdit = affectedCharRange.length > 4096 || repLen > 4096
+        var requiresFullFormat = isLargeEdit || !fencedBlocks.isEmpty
+        if !requiresFullFormat {
+            if affectedCharRange.length > 0 {
+                let checkRange = ns.lineRange(for: affectedCharRange)
+                if ns.range(of: "```", options: .literal, range: checkRange).location != NSNotFound {
+                    requiresFullFormat = true
+                }
+            }
+            if !requiresFullFormat && repLen >= 3 {
+                if repNS.range(of: "```", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound {
+                    requiresFullFormat = true
+                }
+            }
+        }
+        let mayHaveLink = repLen > 0 && (repNS.range(of: "](", options: .literal).location != NSNotFound || repNS.range(of: ")", options: .literal).location != NSNotFound)
+        if isLargeEdit {
+            pendingEdit = EditRecord(
+                affectedRange: affectedCharRange,
+                replacementLength: repLen,
+                delta: delta,
+                oldTotalLength: oldLen,
+                windowStart: 0,
+                oldWindowEnd: oldLen,
+                oldWindowWords: 0,
+                needsFullWordCount: true,
+                requiresFullFormat: true,
+                mayHaveLink: false
+            )
+        } else {
+            let wStart = max(0, affectedCharRange.location - 1)
+            let wEnd = min(oldLen, NSMaxRange(affectedCharRange) + 1)
+            let oldWords = CaptureEditor.countWords(in: ns, range: NSRange(location: wStart, length: max(0, wEnd - wStart)))
+            pendingEdit = EditRecord(
+                affectedRange: affectedCharRange,
+                replacementLength: repLen,
+                delta: delta,
+                oldTotalLength: oldLen,
+                windowStart: wStart,
+                oldWindowEnd: wEnd,
+                oldWindowWords: oldWords,
+                needsFullWordCount: false,
+                requiresFullFormat: requiresFullFormat,
+                mayHaveLink: mayHaveLink
+            )
+        }
+        return ok
+    }
+
+    override func insertText(_ string: Any, replacementRange: NSRange) {
+        let clipView = enclosingScrollView?.contentView
+        let savedOriginY = clipView?.bounds.origin.y
+        let str: String
+        if let s = string as? String {
+            str = s
+        } else if let attr = string as? NSAttributedString {
+            str = attr.string
+        } else {
+            str = String(describing: string)
+        }
+        let targetRange = replacementRange.location == NSNotFound ? selectedRange() : replacementRange
+        applyUndoableReplacement(in: targetRange, with: str)
+        if let clipView, let savedOriginY, abs(clipView.bounds.origin.y - savedOriginY) > 0.01 {
+            let caret = currentCaretRect()
+            let visTop = savedOriginY
+            let visBottom = savedOriginY + clipView.bounds.height
+            if caret.minY >= visTop + 8 && caret.maxY <= visBottom - 8 {
+                clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: savedOriginY))
+            }
+        }
+    }
+
+    override func copy(_ sender: Any?) {
+        autoreleasepool {
+            let sel = selectedRange()
+            guard sel.length > 0, let ns = textStorage?.mutableString, NSMaxRange(sel) <= ns.length else { return }
+            let pb = NSPasteboard.general
+            let sig = CaptureEditor.sampleSignature(of: ns, range: sel)
+            if pb.changeCount == lastClipboardChangeCount && sel.length == lastClipboardLength && sig == lastClipboardSig {
+                return
+            }
+            let str: String
+            if sel.location == 0 && sel.length == ns.length && sel.length == cachedFullTextLength && sig == cachedFullTextSig {
+                str = cachedFullText
+            } else {
+                str = ns.substring(with: sel)
+            }
+            pb.clearContents()
+            pb.setString(str, forType: .string)
+            lastClipboardChangeCount = pb.changeCount
+            lastClipboardString = str
+            lastClipboardLength = sel.length
+            lastClipboardSig = sig
+        }
+    }
+
+    override func cut(_ sender: Any?) {
+        autoreleasepool {
+            let sel = selectedRange()
+            guard sel.length > 0 else { return }
+            copy(sender)
+            applyUndoableReplacement(in: sel, with: "")
+        }
+    }
+
+    override func scrollRangeToVisible(_ range: NSRange) {
+        autoreleasepool {
+            super.scrollRangeToVisible(range)
+        }
+    }
+
+    override func selectAll(_ sender: Any?) {
+        autoreleasepool {
+            super.selectAll(sender)
+        }
+    }
+
+    private func applyUndoableReplacement(in range: NSRange, with replacement: String) {
+        autoreleasepool {
+            guard let storage = textStorage else { return }
+            breakUndoCoalescing()
+            let ns = storage.mutableString
+            let safeLoc = min(range.location, ns.length)
+            let safeRange = NSRange(location: safeLoc, length: min(range.length, ns.length - safeLoc))
+
+            let prevAllowsUndo = allowsUndo
+            allowsUndo = false
+            editorUndoManager.disableUndoRegistration()
+            let allowed = shouldChangeText(in: safeRange, replacementString: replacement)
+            editorUndoManager.enableUndoRegistration()
+            allowsUndo = prevAllowsUndo
+            guard allowed else { return }
+
+            let previousString: String
+            if safeRange.length == 0 {
+                previousString = ""
+            } else if safeRange.location == 0 && safeRange.length == ns.length && safeRange.length == cachedFullTextLength && CaptureEditor.sampleSignature(of: ns, range: safeRange) == cachedFullTextSig {
+                previousString = cachedFullText
+            } else {
+                previousString = ns.substring(with: safeRange)
+            }
+
+            let repLen = (replacement as NSString).length
+            let inverseRange = NSRange(location: safeRange.location, length: repLen)
+            editorUndoManager.registerUndo(withTarget: self) { target in
+                target.applyUndoableReplacement(in: inverseRange, with: previousString)
+            }
+
+            editorUndoManager.disableUndoRegistration()
+            storage.beginEditing()
+            storage.replaceCharacters(in: safeRange, with: replacement)
+            storage.endEditing()
+            editorUndoManager.enableUndoRegistration()
+
+            setSelectedRange(NSRange(location: safeRange.location + repLen, length: 0))
+            didChangeText()
+        }
+    }
+
     override func didChangeText() {
+        isEditingText = false
         super.didChangeText()
         updateCaret(animated: true)
     }
 
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelectingFlag)
-        guard !suppressCaretUpdates else { return }
+        guard !suppressCaretUpdates && !isEditingText else { return }
         updateCaret(animated: !stillSelectingFlag)
     }
 
@@ -246,13 +487,17 @@ import CozyCore
 
     /// Computes the exact glyph-aligned caret rect in view coordinates, excluding trailing lineSpacing/paragraphSpacing.
     func currentCaretRect() -> NSRect {
-        guard let lm = layoutManager, let tc = textContainer else { return .zero }
-        lm.ensureLayout(for: tc)
+        guard let lm = layoutManager, let tc = textContainer, let storage = textStorage else { return .zero }
         let origin = textContainerOrigin
-        let ns = string as NSString
+        let ns = storage.mutableString
         let len = ns.length
         let charIdx = min(selectedRange().location, len)
         let caretWidth: CGFloat = 2.0
+        if len > 0 {
+            let ensureLoc = min(charIdx, len - 1)
+            let ensureRange = ns.lineRange(for: NSRange(location: ensureLoc, length: 0))
+            lm.ensureLayout(forCharacterRange: ensureRange)
+        }
 
         let fallbackFont = (typingAttributes[.font] as? NSFont) ?? font ?? Theme.bodyFont()
         let fallbackPara = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)
@@ -321,7 +566,6 @@ import CozyCore
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        refreshCaretAppearance()
         caretLayer.isHidden = false
         caretLayer.opacity = 1.0
         caretLayer.position = targetPos
@@ -416,14 +660,28 @@ import CozyCore
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: next)
     }
     override func paste(_ sender: Any?) {
-        if let urls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            onFiles?(urls)
-        } else if NSPasteboard.general.string(forType: .string) == nil,
-                  let image = NSImage(pasteboard: .general), let tiff = image.tiffRepresentation,
-                  let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) {
-            onClipboardImage?(png)
-        } else {
-            pasteAsPlainText(sender)
+        autoreleasepool {
+            let pb = NSPasteboard.general
+            if pb.types?.contains(.fileURL) == true,
+               let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+                onFiles?(urls)
+            } else if pb.availableType(from: [.string]) == nil,
+                      let image = NSImage(pasteboard: pb), let tiff = image.tiffRepresentation,
+                      let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) {
+                onClipboardImage?(png)
+            } else {
+                let str: String?
+                if pb.changeCount == lastClipboardChangeCount && lastClipboardLength >= 0 {
+                    str = lastClipboardString
+                } else {
+                    str = pb.string(forType: .string)
+                }
+                if let str {
+                    applyUndoableReplacement(in: selectedRange(), with: str)
+                } else {
+                    pasteAsPlainText(sender)
+                }
+            }
         }
     }
 
@@ -450,8 +708,17 @@ import CozyCore
     var onRemoveLinkedAttachment: ((LinkedAttachment) -> Void)?
     var onHorizontalInsetChange: ((CGFloat) -> Void)?
     var compactLayout = false { didSet { needsLayout = true } }
-    var attachments: [URL] = [] { didSet { updateAttachments() } }
-    var linkedAttachments: [LinkedAttachment] = [] { didSet { updateAttachments() } }
+    var attachments: [URL] = [] {
+        didSet {
+            if attachments != oldValue { updateAttachments() }
+        }
+    }
+    var linkedAttachments: [LinkedAttachment] = [] {
+        didSet {
+            if linkedAttachments != oldValue { updateAttachments() }
+        }
+    }
+    private(set) var hasPotentialLinks = false
     var allowsAttachments = true {
         didSet { attachmentButton?.isHidden = !allowsAttachments }
     }
@@ -470,7 +737,10 @@ import CozyCore
     private var temporaryFiles: [URL] = []
     private var isFormatting = false
     private var lastCursorLine = NSRange(location: NSNotFound, length: 0)
-
+    private var cachedWordCount = 0
+    private var lastFullCountLength = -1
+    private var lastFullCountSampleHash = 0
+    private var lastFullCountWords = 0
     private let heading = try! NSRegularExpression(pattern: "(?m)^(#{1,6}) (.+)$")
     private let blockquote = try! NSRegularExpression(pattern: "(?m)^(>+) (.*)$")
     private let listMarker = try! NSRegularExpression(pattern: "(?m)^([ \\t]*(?:[-*+]|\\d+\\.)(?:\\s+\\[[ xX]\\])?) (.*)$")
@@ -498,8 +768,9 @@ import CozyCore
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        textView.layoutManager?.allowsNonContiguousLayout = true
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.containerSize = NSSize(width: 640, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainerInset = NSSize(width: 36, height: 26)
         textView.drawsBackground = false
         textView.insertionPointColor = Theme.accent
@@ -507,7 +778,7 @@ import CozyCore
         textView.registerForDraggedTypes([.fileURL])
         textView.onFiles = { [weak self] in self?.addAttachments($0) }
         textView.onClipboardImage = { [weak self] in self?.addClipboardImage($0) }
-        textView.onFocusChange = { [weak self] in self?.formatMarkdown() }
+        textView.onFocusChange = { [weak self] in self?.handleFocusChange() }
         scroll.verticalScroller = CozyScroller()
         scroll.documentView = textView
         scroll.scrollerStyle = .overlay
@@ -595,45 +866,115 @@ import CozyCore
         super.layout()
         scroll.layoutSubtreeIfNeeded()
         let contentWidth = scroll.contentSize.width
+        let columnWidth = compactLayout
+            ? max(1, contentWidth - 2 * minPad)
+            : max(1, min(maxMeasure, contentWidth - 2 * minPad))
+        let insetX = compactLayout ? minPad : max(minPad, floor((contentWidth - columnWidth) / 2))
+
+        var geometryChanged = false
+        if abs(textView.textContainerInset.width - insetX) > 0.5 || abs(textView.textContainerInset.height - vertical) > 0.5 {
+            textView.textContainerInset = NSSize(width: insetX, height: vertical)
+            textView.invalidateTextContainerOrigin()
+            geometryChanged = true
+        }
+        if let container = textView.textContainer, contentWidth > 0, abs(container.containerSize.width - columnWidth) > 0.5 {
+            let clipView = scroll.contentView
+            let originY = clipView.bounds.origin.y
+            var anchorChar: Int?
+            if originY > 100, let lm = textView.layoutManager, let storage = textView.textStorage, storage.length > 0 {
+                let visRect = clipView.documentVisibleRect.offsetBy(dx: -textView.textContainerOrigin.x, dy: -textView.textContainerOrigin.y)
+                let visGlyphs = lm.glyphRange(forBoundingRectWithoutAdditionalLayout: visRect, in: container)
+                if visGlyphs.length > 0 {
+                    anchorChar = lm.characterIndexForGlyph(at: visGlyphs.location)
+                } else {
+                    let ratio = min(1.0, max(0.0, originY / max(1.0, textView.bounds.height)))
+                    anchorChar = min(storage.length - 1, Int(Double(storage.length) * ratio))
+                }
+            }
+            container.containerSize = NSSize(width: columnWidth, height: CGFloat.greatestFiniteMagnitude)
+            if let anchorChar, let lm = textView.layoutManager, let storage = textView.textStorage, storage.length > 0 {
+                let ns = storage.mutableString as NSString
+                let start = max(0, anchorChar - 600)
+                let end = min(ns.length, anchorChar + 2400)
+                let windowRange = ns.lineRange(for: NSRange(location: start, length: end - start))
+                lm.ensureLayout(forCharacterRange: windowRange)
+                let glyphIdx = lm.glyphIndexForCharacter(at: min(anchorChar, ns.length - 1))
+                let rect = lm.boundingRect(forGlyphRange: NSRange(location: glyphIdx, length: 0), in: container)
+                let targetY = max(0, rect.minY + textView.textContainerOrigin.y)
+                clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
+                scroll.reflectScrolledClipView(clipView)
+            }
+            geometryChanged = true
+        }
         if contentWidth > 0 && abs(textView.frame.width - contentWidth) > 0.5 {
             textView.setFrameSize(NSSize(width: contentWidth, height: textView.frame.height))
+            geometryChanged = true
         }
-        if abs(textView.textContainerInset.width - horizontal) > 0.5 || abs(textView.textContainerInset.height - vertical) > 0.5 {
-            textView.textContainerInset = NSSize(width: horizontal, height: vertical)
+        onHorizontalInsetChange?(insetX)
+        if geometryChanged {
+            textView.updateCaret(animated: false)
+            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
         }
-        textView.invalidateTextContainerOrigin()
-        if let container = textView.textContainer {
-            textView.layoutManager?.textContainerChangedGeometry(container)
-            textView.layoutManager?.ensureLayout(for: container)
-        }
-        onHorizontalInsetChange?(horizontal)
-        textView.updateCaret(animated: false)
-        textView.needsDisplay = true
+    }
+
+    var nsText: NSString {
+        textView.textStorage?.mutableString ?? ("" as NSString)
     }
 
     var text: String {
         get { textView.string }
         set {
-            let previousSelection = textView.selectedRange()
-            textView.suppressCaretUpdates = true
-            textView.resetCaretPosition()
-            textView.string = newValue
-            textView.undoManager?.removeAllActions()
-            formatMarkdown()
-            let clampedLocation = min(previousSelection.location, (newValue as NSString).length)
-            textView.setSelectedRange(NSRange(location: clampedLocation, length: 0))
-            textView.suppressCaretUpdates = false
-            textView.updateCaret(animated: false)
-            updateWordCount()
-            textView.needsDisplay = true
+            autoreleasepool {
+                let previousSelection = textView.selectedRange()
+                textView.suppressCaretUpdates = true
+                textView.resetCaretPosition()
+                textView.pendingEdit = nil
+                let nsNew = newValue as NSString
+                let newLen = nsNew.length
+                let sig = Self.sampleSignature(of: nsNew)
+                textView.cachedFullText = newValue
+                textView.cachedFullTextLength = newLen
+                textView.cachedFullTextSig = sig
+                let clampedLocation = min(previousSelection.location, newLen)
+                let scan = performOrReuseScan(on: nsNew, length: newLen, sig: sig)
+                cachedWordCount = scan.words
+                renderWordCountLabel()
+                isFormatting = true
+                if let storage = textView.textStorage {
+                    textView.undoManager?.disableUndoRegistration()
+                    storage.beginEditing()
+                    storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: newValue)
+                    applyFullMarkdownAttributes(to: storage, cursor: NSRange(location: clampedLocation, length: 0), scanHint: scan)
+                    storage.endEditing()
+                    textView.undoManager?.enableUndoRegistration()
+                } else {
+                    textView.string = newValue
+                }
+                isFormatting = false
+                textView.undoManager?.removeAllActions()
+                textView.setSelectedRange(NSRange(location: clampedLocation, length: 0))
+                let ns = nsText
+                lastCursorLine = ns.length > 0 ? ns.lineRange(for: NSRange(location: min(clampedLocation, ns.length), length: 0)) : NSRange(location: 0, length: 0)
+                textView.suppressCaretUpdates = false
+                textView.updateCaret(animated: false)
+                textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            }
         }
     }
-    var hasContent: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty }
+    var hasContent: Bool {
+        if !attachments.isEmpty { return true }
+        let ns = nsText
+        guard ns.length > 0 else { return false }
+        return Self.countWords(in: ns, range: NSRange(location: 0, length: min(ns.length, 256))) > 0
+            || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     func focus() { window?.makeFirstResponder(textView) }
     func clearPendingAttachments() {
-        attachments = []
-        for url in temporaryFiles { try? FileManager.default.removeItem(at: url) }
-        temporaryFiles.removeAll()
+        if !attachments.isEmpty { attachments = [] }
+        if !temporaryFiles.isEmpty {
+            for url in temporaryFiles { try? FileManager.default.removeItem(at: url) }
+            temporaryFiles.removeAll()
+        }
     }
     func reset() {
         text = ""
@@ -642,21 +983,44 @@ import CozyCore
         status.stringValue = ""
     }
     func textDidChange(_ notification: Notification) {
-        formatMarkdown()
-        updateWordCount()
-        textView.needsDisplay = true
-        onChange?()
+        autoreleasepool {
+            let edit = textView.pendingEdit
+            textView.pendingEdit = nil
+            let didTouchAttributes: Bool
+            if let edit, !edit.requiresFullFormat {
+                didTouchAttributes = formatIncrementalEdit(edit)
+            } else {
+                formatMarkdown()
+                didTouchAttributes = true
+            }
+            if let edit, !edit.needsFullWordCount, let storage = textView.textStorage {
+                let ns = storage.mutableString as NSString
+                let newWEnd = min(ns.length, max(edit.windowStart, edit.oldWindowEnd + edit.delta))
+                let newWords = Self.countWords(in: ns, range: NSRange(location: edit.windowStart, length: max(0, newWEnd - edit.windowStart)))
+                cachedWordCount = max(0, cachedWordCount + newWords - edit.oldWindowWords)
+                renderWordCountLabel()
+            } else {
+                recalculateFullWordCount()
+            }
+            if let edit, edit.mayHaveLink {
+                hasPotentialLinks = true
+            }
+            if didTouchAttributes {
+                textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            }
+            onChange?()
+        }
     }
     func textViewDidChangeSelection(_ notification: Notification) {
-        guard !isFormatting else { return }
-        let ns = text as NSString
+        guard !isFormatting, let storage = textView.textStorage else { return }
+        let ns = storage.mutableString as NSString
         let sel = textView.selectedRange()
         let clamped = NSRange(location: min(sel.location, ns.length), length: 0)
         let line = ns.lineRange(for: clamped)
         guard line != lastCursorLine else { return }
+        let prevLine = lastCursorLine
         lastCursorLine = line
-        formatMarkdown()
-        textView.needsDisplay = true
+        refreshCursorDependentLines(oldLine: prevLine, newLine: line)
     }
     func addAttachments(_ urls: [URL]) {
         guard allowsAttachments else {
@@ -796,28 +1160,366 @@ import CozyCore
     func refreshTypography() {
         formatMarkdown()
         textView.updateCaret(animated: false)
-        textView.needsDisplay = true
+        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+    }
+
+    private func handleFocusChange() {
+        guard !isFormatting, let storage = textView.textStorage else { return }
+        let ns = storage.mutableString as NSString
+        let sel = textView.selectedRange()
+        let clamped = NSRange(location: min(sel.location, ns.length), length: 0)
+        let line = ns.lineRange(for: clamped)
+        refreshCursorDependentLines(oldLine: lastCursorLine, newLine: line)
+    }
+
+    struct DocumentScanResult {
+        let words: Int
+        let hasStar: Bool
+        let hasDoubleStar: Bool
+        let hasBacktick: Bool
+        let hasTripleBacktick: Bool
+        let hasLinkOpen: Bool
+    }
+    private var lastScanResult: DocumentScanResult?
+
+    static func sampleSignature(of ns: NSString, range: NSRange? = nil) -> Int {
+        let r = range ?? NSRange(location: 0, length: ns.length)
+        let len = r.length
+        guard len > 0, NSMaxRange(r) <= ns.length else { return 0 }
+        let base = r.location
+        var h = len &* 31
+        let p0 = ns.character(at: base)
+        let pMid = ns.character(at: base + len / 2)
+        let pEnd = ns.character(at: base + len - 1)
+        h = (h &* 31) &+ Int(p0)
+        h = (h &* 31) &+ Int(pMid)
+        h = (h &* 31) &+ Int(pEnd)
+        if len > 100 {
+            h = (h &* 31) &+ Int(ns.character(at: base + len / 4))
+            h = (h &* 31) &+ Int(ns.character(at: base + (len * 3) / 4))
+        }
+        return h
+    }
+
+    static func scanDocument(in ns: NSString, range: NSRange) -> DocumentScanResult {
+        guard range.length > 0 else {
+            return DocumentScanResult(words: 0, hasStar: false, hasDoubleStar: false, hasBacktick: false, hasTripleBacktick: false, hasLinkOpen: false)
+        }
+        let cfStr = ns as CFString
+        var words = 0
+        var inWord = false
+        var hasStar = false
+        var hasDoubleStar = false
+        var hasBacktick = false
+        var hasTripleBacktick = false
+        var hasLinkOpen = false
+        var prevChar: UniChar = 0
+        var runBackticks = 0
+
+        let chunkCap = 16384
+        let allocSize = min(chunkCap, range.length)
+        let buf = UnsafeMutablePointer<UniChar>.allocate(capacity: allocSize)
+        defer { buf.deallocate() }
+
+        var offset = range.location
+        let end = NSMaxRange(range)
+        while offset < end {
+            let count = min(allocSize, end - offset)
+            CFStringGetCharacters(cfStr, CFRange(location: offset, length: count), buf)
+            var i = 0
+            while i < count {
+                let u = buf[i]
+                if u > 0x60 && u < 0x0085 {
+                    if !inWord {
+                        inWord = true
+                        words &+= 1
+                    }
+                    prevChar = 0
+                    runBackticks = 0
+                } else if u <= 0x20 {
+                    if u == 0x20 || (u >= 0x09 && u <= 0x0D) {
+                        inWord = false
+                    } else if !inWord {
+                        inWord = true
+                        words &+= 1
+                    }
+                    prevChar = 0
+                    runBackticks = 0
+                } else {
+                    let isWS = u >= 0x0085 && ((u == 0x0085) || (u == 0x00A0) || (u >= 0x2000 && u <= 0x200A) || (u == 0x2028) || (u == 0x2029) || (u == 0x202F) || (u == 0x205F) || (u == 0x3000))
+                    if isWS {
+                        inWord = false
+                        prevChar = 0
+                        runBackticks = 0
+                    } else {
+                        if !inWord {
+                            inWord = true
+                            words &+= 1
+                        }
+                        if u == 0x2A {
+                            hasStar = true
+                            if prevChar == 0x2A { hasDoubleStar = true }
+                            runBackticks = 0
+                        } else if u == 0x60 {
+                            hasBacktick = true
+                            runBackticks &+= 1
+                            if runBackticks >= 3 { hasTripleBacktick = true }
+                        } else {
+                            if u == 0x28 && prevChar == 0x5D {
+                                hasLinkOpen = true
+                            }
+                            runBackticks = 0
+                        }
+                        prevChar = u
+                    }
+                }
+                i &+= 1
+            }
+            offset &+= count
+        }
+        return DocumentScanResult(
+            words: words,
+            hasStar: hasStar,
+            hasDoubleStar: hasDoubleStar,
+            hasBacktick: hasBacktick,
+            hasTripleBacktick: hasTripleBacktick,
+            hasLinkOpen: hasLinkOpen
+        )
+    }
+
+    static func countWords(in ns: NSString, range: NSRange) -> Int {
+        scanDocument(in: ns, range: range).words
+    }
+
+    private func performOrReuseScan(on ns: NSString, length: Int, sig: Int) -> DocumentScanResult {
+        if length == 0 {
+            return DocumentScanResult(words: 0, hasStar: false, hasDoubleStar: false, hasBacktick: false, hasTripleBacktick: false, hasLinkOpen: false)
+        }
+        if length == lastFullCountLength, sig == lastFullCountSampleHash, let cached = lastScanResult {
+            return cached
+        }
+        let scan = Self.scanDocument(in: ns, range: NSRange(location: 0, length: length))
+        lastFullCountLength = length
+        lastFullCountSampleHash = sig
+        lastFullCountWords = scan.words
+        lastScanResult = scan
+        return scan
+    }
+
+    private func recalculateFullWordCount() {
+        let ns = nsText
+        let len = ns.length
+        if len == 0 {
+            cachedWordCount = 0
+            renderWordCountLabel()
+            return
+        }
+        let sig = Self.sampleSignature(of: ns)
+        let scan = performOrReuseScan(on: ns, length: len, sig: sig)
+        cachedWordCount = scan.words
+        renderWordCountLabel()
     }
 
     private func updateWordCount() {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            wordCount.stringValue = "BLANK FOLIO"
+        recalculateFullWordCount()
+    }
+
+    private func renderWordCountLabel() {
+        let words = cachedWordCount
+        guard words > 0 else {
+            if wordCount.stringValue != "BLANK FOLIO" {
+                wordCount.stringValue = "BLANK FOLIO"
+            }
             return
         }
-        let words = trimmed.split { $0.isWhitespace || $0.isNewline }.count
-        let mins = max(1, Int(ceil(Double(words) / 200.0)))
-        wordCount.stringValue = "\(words) \(words == 1 ? "WORD" : "WORDS")  ·  \(mins) MIN READ"
+        let mins = max(1, (words + 199) / 200)
+        let next = "\(words) \(words == 1 ? "WORD" : "WORDS")  ·  \(mins) MIN READ"
+        if wordCount.stringValue != next {
+            wordCount.stringValue = next
+        }
+    }
+
+    private func lineHasCursorSensitiveSyntax(_ ns: NSString, lineRange: NSRange) -> Bool {
+        guard lineRange.location != NSNotFound, lineRange.length > 0, NSMaxRange(lineRange) <= ns.length else { return false }
+        let first = ns.character(at: lineRange.location)
+        if first == 0x23 || first == 0x60 { return true }
+        if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
+        return false
+    }
+
+    private func refreshCursorDependentLines(oldLine: NSRange, newLine: NSRange) {
+        guard let storage = textView.textStorage else { return }
+        let ns = storage.mutableString as NSString
+        let oldNeeds = lineHasCursorSensitiveSyntax(ns, lineRange: oldLine)
+        let newNeeds = lineHasCursorSensitiveSyntax(ns, lineRange: newLine)
+        guard oldNeeds || newNeeds else { return }
+        if !textView.fencedBlocks.isEmpty {
+            formatMarkdown()
+            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            return
+        }
+        isFormatting = true
+        defer { isFormatting = false }
+        let cursor = textView.selectedRange()
+        storage.beginEditing()
+        if oldNeeds, NSMaxRange(oldLine) <= ns.length {
+            var q: [NSRange] = []
+            var h: [MarkdownTextView.HeadingGutter] = []
+            var c: [NSRange] = []
+            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c)
+        }
+        if newNeeds, newLine != oldLine, NSMaxRange(newLine) <= ns.length {
+            var q: [NSRange] = []
+            var h: [MarkdownTextView.HeadingGutter] = []
+            var c: [NSRange] = []
+            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c)
+        }
+        storage.endEditing()
+        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+    }
+
+    private func lineHasMarkdownSyntax(_ ns: NSString, lineRange: NSRange) -> Bool {
+        guard lineRange.length > 0, NSMaxRange(lineRange) <= ns.length else { return false }
+        let c0 = ns.character(at: lineRange.location)
+        if c0 == 0x23 || c0 == 0x3E || c0 == 0x2D || c0 == 0x2A || c0 == 0x2B || c0 == 0x20 || c0 == 0x09 || (c0 >= 0x30 && c0 <= 0x39) {
+            return true
+        }
+        if ns.range(of: "*", options: .literal, range: lineRange).location != NSNotFound { return true }
+        if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
+        if ns.range(of: "](", options: .literal, range: lineRange).location != NSNotFound { return true }
+        return false
+    }
+
+    @discardableResult
+    private func formatIncrementalEdit(_ edit: MarkdownTextView.EditRecord) -> Bool {
+        guard !isFormatting, let storage = textView.textStorage else { return false }
+        isFormatting = true
+        defer { isFormatting = false }
+        let ns = storage.mutableString as NSString
+        let newLen = ns.length
+        let editLoc = min(edit.affectedRange.location, newLen)
+        let newEditedRange = NSRange(location: editLoc, length: min(edit.replacementLength, newLen - editLoc))
+        let newLineRange = ns.lineRange(for: newEditedRange)
+        let oldLineEnd = max(newLineRange.location, NSMaxRange(newLineRange) - edit.delta)
+        let oldLineRange = NSRange(location: newLineRange.location, length: oldLineEnd - newLineRange.location)
+        let delta = edit.delta
+
+        let hadItemsInOldLine = textView.headingGutterItems.contains { NSIntersectionRange($0.range, oldLineRange).length > 0 || $0.range.location == oldLineRange.location }
+            || textView.blockquoteRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
+            || textView.inlineCodeRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
+
+        let newHasSyntax = lineHasMarkdownSyntax(ns, lineRange: newLineRange)
+
+        if !hadItemsInOldLine && !newHasSyntax {
+            // Fast path for plain prose editing: shift subsequent decoration ranges without touching NSTextStorage attributes
+            if delta != 0 {
+                let shiftStart = oldLineEnd
+                for i in textView.headingGutterItems.indices where textView.headingGutterItems[i].range.location >= shiftStart {
+                    let r = textView.headingGutterItems[i].range
+                    textView.headingGutterItems[i] = MarkdownTextView.HeadingGutter(
+                        range: NSRange(location: r.location + delta, length: r.length),
+                        label: textView.headingGutterItems[i].label,
+                        level: textView.headingGutterItems[i].level
+                    )
+                }
+                for i in textView.blockquoteRanges.indices where textView.blockquoteRanges[i].location >= shiftStart {
+                    let r = textView.blockquoteRanges[i]
+                    textView.blockquoteRanges[i] = NSRange(location: r.location + delta, length: r.length)
+                }
+                for i in textView.inlineCodeRanges.indices where textView.inlineCodeRanges[i].location >= shiftStart {
+                    let r = textView.inlineCodeRanges[i]
+                    textView.inlineCodeRanges[i] = NSRange(location: r.location + delta, length: r.length)
+                }
+            }
+            lastCursorLine = ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, newLen), length: 0))
+            return false
+        }
+
+        var newQuotes: [NSRange] = []
+        var newHeadings: [MarkdownTextView.HeadingGutter] = []
+        var newCodes: [NSRange] = []
+        let cursor = textView.selectedRange()
+
+        textView.undoManager?.disableUndoRegistration()
+        storage.beginEditing()
+        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, headings: &newHeadings, codes: &newCodes)
+        storage.endEditing()
+        textView.undoManager?.enableUndoRegistration()
+
+        let oldEnd = NSMaxRange(oldLineRange)
+        var updatedHeadings: [MarkdownTextView.HeadingGutter] = []
+        updatedHeadings.reserveCapacity(textView.headingGutterItems.count + newHeadings.count)
+        var insertedHeadings = false
+        for item in textView.headingGutterItems {
+            if NSMaxRange(item.range) <= oldLineRange.location && item.range.location < oldLineRange.location {
+                updatedHeadings.append(item)
+            } else if item.range.location >= oldEnd && oldEnd > oldLineRange.location {
+                if !insertedHeadings {
+                    updatedHeadings.append(contentsOf: newHeadings)
+                    insertedHeadings = true
+                }
+                updatedHeadings.append(MarkdownTextView.HeadingGutter(
+                    range: NSRange(location: item.range.location + delta, length: item.range.length),
+                    label: item.label,
+                    level: item.level
+                ))
+            }
+        }
+        if !insertedHeadings { updatedHeadings.append(contentsOf: newHeadings) }
+        textView.headingGutterItems = updatedHeadings
+
+        var updatedQuotes: [NSRange] = []
+        var insertedQuotes = false
+        for r in textView.blockquoteRanges {
+            if NSMaxRange(r) <= oldLineRange.location && r.location < oldLineRange.location {
+                updatedQuotes.append(r)
+            } else if r.location >= oldEnd && oldEnd > oldLineRange.location {
+                if !insertedQuotes {
+                    updatedQuotes.append(contentsOf: newQuotes)
+                    insertedQuotes = true
+                }
+                updatedQuotes.append(NSRange(location: r.location + delta, length: r.length))
+            }
+        }
+        if !insertedQuotes { updatedQuotes.append(contentsOf: newQuotes) }
+        textView.blockquoteRanges = updatedQuotes
+
+        var updatedCodes: [NSRange] = []
+        var insertedCodes = false
+        for r in textView.inlineCodeRanges {
+            if NSMaxRange(r) <= oldLineRange.location && r.location < oldLineRange.location {
+                updatedCodes.append(r)
+            } else if r.location >= oldEnd && oldEnd > oldLineRange.location {
+                if !insertedCodes {
+                    updatedCodes.append(contentsOf: newCodes)
+                    insertedCodes = true
+                }
+                updatedCodes.append(NSRange(location: r.location + delta, length: r.length))
+            }
+        }
+        if !insertedCodes { updatedCodes.append(contentsOf: newCodes) }
+        textView.inlineCodeRanges = updatedCodes
+
+        lastCursorLine = ns.lineRange(for: NSRange(location: min(cursor.location, newLen), length: 0))
+        return true
     }
 
     private func formatMarkdown() {
         guard !isFormatting, let storage = textView.textStorage else { return }
         isFormatting = true
         defer { isFormatting = false }
-        let current = text
-        let ns = current as NSString
-        let range = NSRange(location: 0, length: storage.length)
         let cursor = textView.selectedRange()
+        textView.undoManager?.disableUndoRegistration()
+        storage.beginEditing()
+        applyFullMarkdownAttributes(to: storage, cursor: cursor, scanHint: nil)
+        storage.endEditing()
+        textView.undoManager?.enableUndoRegistration()
+    }
+
+    private func applyFullMarkdownAttributes(to storage: NSTextStorage, cursor: NSRange, scanHint: DocumentScanResult?) {
+        let ns = storage.mutableString as NSString
+        let totalLen = ns.length
+        let range = NSRange(location: 0, length: totalLen)
         let proseSize = Theme.baseProseSize
         let baseFont = Theme.bodyFont(proseSize)
         let tracking = Theme.proseTracking
@@ -826,247 +1528,398 @@ import CozyCore
         bodyParagraph.lineSpacing = 8.0
         bodyParagraph.paragraphSpacing = 11.5
 
-        let quoteParagraph = NSMutableParagraphStyle()
-        quoteParagraph.lineSpacing = 6.5
-        quoteParagraph.paragraphSpacing = 10.0
-        quoteParagraph.firstLineHeadIndent = 14
-        quoteParagraph.headIndent = 26
+        let baseAttrs: [NSAttributedString.Key: Any] = [
+            .font: baseFont,
+            .foregroundColor: Theme.ink,
+            .paragraphStyle: bodyParagraph,
+            .kern: tracking
+        ]
 
-        let codeBodyParagraph = NSMutableParagraphStyle()
-        codeBodyParagraph.lineSpacing = 4.5
-        codeBodyParagraph.paragraphSpacing = 2.5
-        codeBodyParagraph.firstLineHeadIndent = 16
-        codeBodyParagraph.headIndent = 16
-
-        let openFenceParagraph = NSMutableParagraphStyle()
-        openFenceParagraph.lineSpacing = 2.0
-        openFenceParagraph.paragraphSpacingBefore = 8.0
-        openFenceParagraph.paragraphSpacing = 21.0
-        openFenceParagraph.firstLineHeadIndent = 16
-        openFenceParagraph.headIndent = 16
-
-        let closeFenceParagraph = NSMutableParagraphStyle()
-        closeFenceParagraph.lineSpacing = 1.0
-        closeFenceParagraph.paragraphSpacingBefore = 8.0
-        closeFenceParagraph.paragraphSpacing = 12.0
-        closeFenceParagraph.firstLineHeadIndent = 16
-        closeFenceParagraph.headIndent = 16
-
-        let quoteMatches = blockquote.matches(in: current, range: range)
-        let fenceMatches = fencedCode.matches(in: current, range: range)
-        let headingMatches = heading.matches(in: current, range: range)
-        let listMatches = listMarker.matches(in: current, range: range)
-
-        textView.blockquoteRanges = quoteMatches.map(\.range)
-        textView.headingGutterItems = headingMatches.map { match in
-            let level = min(6, match.range(at: 1).length)
-            return MarkdownTextView.HeadingGutter(range: match.range, label: "H\(level)", level: level)
-        }
         textView.selectedTextAttributes = [
             .backgroundColor: Theme.selectionHighlight,
             .foregroundColor: Theme.headingInk
         ]
         textView.insertionPointColor = Theme.accent
         textView.refreshCaretAppearance()
+        textView.typingAttributes = baseAttrs
+
+        guard totalLen > 0 else {
+            textView.blockquoteRanges = []
+            textView.headingGutterItems = []
+            textView.inlineCodeRanges = []
+            textView.fencedBlocks = []
+            hasPotentialLinks = false
+            return
+        }
+
+        let scan = scanHint ?? performOrReuseScan(on: ns, length: totalLen, sig: Self.sampleSignature(of: ns))
+
+        storage.setAttributes(baseAttrs, range: range)
+
+        var quotes: [NSRange] = []
+        var headings: [MarkdownTextView.HeadingGutter] = []
         var inlinePills: [NSRange] = []
         var parsedFences: [MarkdownTextView.FencedBlock] = []
 
-        storage.beginEditing()
-        storage.setAttributes([
-            .font: baseFont,
-            .foregroundColor: Theme.ink,
-            .paragraphStyle: bodyParagraph,
-            .kern: tracking
-        ], range: range)
+        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, headings: &headings, codes: &inlinePills)
 
-        for match in quoteMatches {
-            storage.addAttribute(.paragraphStyle, value: quoteParagraph, range: match.range)
-            storage.addAttributes([
-                .font: Theme.monoFont(12.5, weight: .semibold),
-                .foregroundColor: Theme.accent
-            ], range: match.range(at: 1))
-            storage.addAttributes([
-                .font: Theme.italicDisplayFont(proseSize + 0.5),
-                .foregroundColor: Theme.muted,
-                .kern: 0.05
-            ], range: match.range(at: 2))
+        if scan.hasTripleBacktick && ns.range(of: "```", options: .literal, range: range).location != NSNotFound {
+            let codeBodyParagraph = NSMutableParagraphStyle()
+            codeBodyParagraph.lineSpacing = 4.5
+            codeBodyParagraph.paragraphSpacing = 2.5
+            codeBodyParagraph.firstLineHeadIndent = 16
+            codeBodyParagraph.headIndent = 16
+
+            let openFenceParagraph = NSMutableParagraphStyle()
+            openFenceParagraph.lineSpacing = 2.0
+            openFenceParagraph.paragraphSpacingBefore = 8.0
+            openFenceParagraph.paragraphSpacing = 21.0
+            openFenceParagraph.firstLineHeadIndent = 16
+            openFenceParagraph.headIndent = 16
+
+            let closeFenceParagraph = NSMutableParagraphStyle()
+            closeFenceParagraph.lineSpacing = 1.0
+            closeFenceParagraph.paragraphSpacingBefore = 8.0
+            closeFenceParagraph.paragraphSpacing = 12.0
+            closeFenceParagraph.firstLineHeadIndent = 16
+            closeFenceParagraph.headIndent = 16
+
+            let current = ns as String
+            for match in fencedCode.matches(in: current, range: range) {
+                storage.addAttributes([
+                    .font: Theme.monoFont(proseSize - 2.5),
+                    .foregroundColor: Theme.headingInk,
+                    .paragraphStyle: codeBodyParagraph,
+                    .kern: 0.0
+                ], range: match.range)
+
+                for kw in codeKeyword.matches(in: current, range: match.range) {
+                    storage.addAttributes([
+                        .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
+                        .foregroundColor: Theme.accent
+                    ], range: kw.range)
+                }
+                for str in codeString.matches(in: current, range: match.range) {
+                    storage.addAttributes([
+                        .foregroundColor: Theme.sage
+                    ], range: str.range)
+                }
+
+                let blockString = ns.substring(with: match.range)
+                if let firstNewline = blockString.firstIndex(of: "\n") {
+                    let openFenceLen = blockString.distance(from: blockString.startIndex, to: firstNewline)
+                    let headerRange = NSRange(location: match.range.location, length: openFenceLen)
+                    let bodyStart = min(NSMaxRange(match.range), match.range.location + openFenceLen + 1)
+                    let bodyEnd = max(bodyStart, NSMaxRange(match.range) - 4)
+                    let bodyRange = NSRange(location: bodyStart, length: bodyEnd - bodyStart)
+                    parsedFences.append(MarkdownTextView.FencedBlock(fullRange: match.range, headerRange: headerRange, bodyRange: bodyRange))
+                    storage.addAttributes([
+                        .font: Theme.monoFont(11, weight: .semibold),
+                        .foregroundColor: Theme.muted,
+                        .paragraphStyle: openFenceParagraph,
+                        .kern: 0.6
+                    ], range: headerRange)
+                    let cursorOnFence = cursor.location >= headerRange.location && cursor.location <= NSMaxRange(headerRange)
+                    if !cursorOnFence && openFenceLen > 3 {
+                        storage.addAttributes([
+                            .font: NSFont.systemFont(ofSize: 0.1),
+                            .foregroundColor: NSColor.clear
+                        ], range: NSRange(location: match.range.location, length: 3))
+                    }
+                }
+                if match.range.length >= 3 {
+                    let closeRange = NSRange(location: NSMaxRange(match.range) - 3, length: 3)
+                    let cursorOnClose = cursor.location >= closeRange.location && cursor.location <= NSMaxRange(closeRange)
+                    storage.addAttributes([
+                        .font: cursorOnClose ? Theme.monoFont(11, weight: .medium) : Theme.monoFont(4),
+                        .foregroundColor: cursorOnClose ? Theme.subtle : NSColor.clear,
+                        .paragraphStyle: closeFenceParagraph
+                    ], range: closeRange)
+                }
+            }
         }
-        for match in bold.matches(in: current, range: range) {
-            storage.addAttributes([
-                .font: Theme.bodyFont(proseSize, weight: .semibold),
-                .foregroundColor: Theme.headingInk
-            ], range: match.range)
-            let open = NSRange(location: match.range.location, length: 2)
-            let close = NSRange(location: NSMaxRange(match.range) - 2, length: 2)
-            storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)], range: open)
-            storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)], range: close)
+
+        textView.blockquoteRanges = quotes
+        textView.headingGutterItems = headings
+        textView.inlineCodeRanges = inlinePills
+        textView.fencedBlocks = parsedFences
+    }
+
+    private func formatLineRange(
+        _ targetRange: NSRange,
+        in storage: NSTextStorage,
+        ns: NSString,
+        cursor: NSRange,
+        scan: DocumentScanResult? = nil,
+        quotes: inout [NSRange],
+        headings: inout [MarkdownTextView.HeadingGutter],
+        codes: inout [NSRange]
+    ) {
+        let totalLen = ns.length
+        guard targetRange.length > 0, NSMaxRange(targetRange) <= totalLen else { return }
+        let proseSize = Theme.baseProseSize
+        let baseFont = Theme.bodyFont(proseSize)
+        let tracking = Theme.proseTracking
+
+        let bodyParagraph = NSMutableParagraphStyle()
+        bodyParagraph.lineSpacing = 8.0
+        bodyParagraph.paragraphSpacing = 11.5
+
+        if targetRange.length < totalLen {
+            storage.setAttributes([
+                .font: baseFont,
+                .foregroundColor: Theme.ink,
+                .paragraphStyle: bodyParagraph,
+                .kern: tracking
+            ], range: targetRange)
         }
-        for match in italic.matches(in: current, range: range) {
-            storage.addAttributes([.font: Theme.italicBodyFont(proseSize)], range: match.range(at: 1))
-            let open = NSRange(location: match.range.location, length: 1)
-            let close = NSRange(location: NSMaxRange(match.range) - 1, length: 1)
-            storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)], range: open)
-            storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)], range: close)
+
+        let checkDoubleStar = scan?.hasDoubleStar ?? true
+        let checkStar = scan?.hasStar ?? true
+        let checkLink = scan?.hasLinkOpen ?? true
+        let checkBacktick = scan?.hasBacktick ?? true
+
+        // 1. Inline spans via fast literal search on NSString
+        if checkDoubleStar && ns.range(of: "**", options: .literal, range: targetRange).location != NSNotFound {
+            let boldFont = Theme.bodyFont(proseSize, weight: .semibold)
+            let markerAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)]
+            var searchStart = targetRange.location
+            let targetEnd = NSMaxRange(targetRange)
+            while searchStart < targetEnd {
+                let hit = ns.range(of: "**", options: .literal, range: NSRange(location: searchStart, length: targetEnd - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let lineStr = ns.substring(with: lineRange)
+                for match in bold.matches(in: lineStr, range: NSRange(location: 0, length: lineRange.length)) {
+                    let full = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                    storage.addAttributes([.font: boldFont, .foregroundColor: Theme.headingInk], range: full)
+                    storage.addAttributes(markerAttrs, range: NSRange(location: full.location, length: 2))
+                    storage.addAttributes(markerAttrs, range: NSRange(location: NSMaxRange(full) - 2, length: 2))
+                }
+                searchStart = NSMaxRange(lineRange)
+            }
         }
-        for match in link.matches(in: current, range: range) {
-            storage.addAttributes([
-                .foregroundColor: Theme.accent,
-                .font: Theme.bodyFont(proseSize, weight: .medium)
-            ], range: match.range(at: 1))
-            storage.addAttributes([
-                .foregroundColor: Theme.subtle,
-                .font: Theme.monoFont(12)
-            ], range: match.range(at: 2))
+
+        if checkStar && ns.range(of: "*", options: .literal, range: targetRange).location != NSNotFound {
+            let italicFont = Theme.italicBodyFont(proseSize)
+            let markerAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)]
+            var searchStart = targetRange.location
+            let targetEnd = NSMaxRange(targetRange)
+            while searchStart < targetEnd {
+                let hit = ns.range(of: "*", options: .literal, range: NSRange(location: searchStart, length: targetEnd - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let lineStr = ns.substring(with: lineRange)
+                for match in italic.matches(in: lineStr, range: NSRange(location: 0, length: lineRange.length)) {
+                    let full = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                    let inner = NSRange(location: lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    storage.addAttributes([.font: italicFont], range: inner)
+                    storage.addAttributes(markerAttrs, range: NSRange(location: full.location, length: 1))
+                    storage.addAttributes(markerAttrs, range: NSRange(location: NSMaxRange(full) - 1, length: 1))
+                }
+                searchStart = NSMaxRange(lineRange)
+            }
         }
-        for match in code.matches(in: current, range: range) {
-            let inner = match.range(at: 1)
-            inlinePills.append(inner)
-            storage.addAttributes([
+
+        if checkLink && ns.range(of: "](", options: .literal, range: targetRange).location != NSNotFound {
+            hasPotentialLinks = true
+            let linkTextAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.accent, .font: Theme.bodyFont(proseSize, weight: .medium)]
+            let linkURLAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)]
+            var searchStart = targetRange.location
+            let targetEnd = NSMaxRange(targetRange)
+            while searchStart < targetEnd {
+                let hit = ns.range(of: "](", options: .literal, range: NSRange(location: searchStart, length: targetEnd - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let lineStr = ns.substring(with: lineRange)
+                for match in link.matches(in: lineStr, range: NSRange(location: 0, length: lineRange.length)) {
+                    let g1 = NSRange(location: lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    let g2 = NSRange(location: lineRange.location + match.range(at: 2).location, length: match.range(at: 2).length)
+                    storage.addAttributes(linkTextAttrs, range: g1)
+                    storage.addAttributes(linkURLAttrs, range: g2)
+                }
+                searchStart = NSMaxRange(lineRange)
+            }
+        } else if targetRange.length == totalLen {
+            hasPotentialLinks = false
+        }
+
+        if checkBacktick && ns.range(of: "`", options: .literal, range: targetRange).location != NSNotFound {
+            let codeAttrs: [NSAttributedString.Key: Any] = [
                 .font: Theme.monoFont(proseSize - 2.0, weight: .medium),
                 .foregroundColor: Theme.inlineCodeInk,
                 .kern: 0.15
-            ], range: inner)
-            let open = NSRange(location: match.range.location, length: 1)
-            let close = NSRange(location: NSMaxRange(match.range) - 1, length: 1)
-            let cursorNear = cursor.location >= match.range.location && cursor.location <= NSMaxRange(match.range)
-            let tickColor = cursorNear ? Theme.subtle : NSColor.clear
-            let tickFont = cursorNear ? Theme.monoFont(11) : Theme.monoFont(11.5)
-            storage.addAttributes([.foregroundColor: tickColor, .font: tickFont], range: open)
-            storage.addAttributes([.foregroundColor: tickColor, .font: tickFont], range: close)
-        }
-        for match in listMatches {
-            let markerRange = match.range(at: 1)
-            let bodyRange = match.range(at: 2)
-            let markerText = ns.substring(with: markerRange)
-            let isTask = markerText.hasSuffix("[ ]") || markerText.hasSuffix("[x]") || markerText.hasSuffix("[X]")
-            let itemParagraph = NSMutableParagraphStyle()
-            itemParagraph.lineSpacing = 5.5
-            itemParagraph.paragraphSpacing = 4.5
-            itemParagraph.headIndent = isTask ? 42 : 18
-            storage.addAttribute(.paragraphStyle, value: itemParagraph, range: match.range)
-            let completed = markerText.hasSuffix("[x]") || markerText.hasSuffix("[X]")
-            storage.addAttributes([
-                .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
-                .foregroundColor: completed ? Theme.sage : Theme.accent
-            ], range: markerRange)
-            if completed {
-                storage.addAttributes([
-                    .foregroundColor: Theme.muted,
-                    .strikethroughStyle: NSUnderlineStyle.single.rawValue,
-                    .strikethroughColor: Theme.subtle.withAlphaComponent(0.75)
-                ], range: bodyRange)
+            ]
+            let fontNear = Theme.monoFont(11)
+            let fontFar = Theme.monoFont(11.5)
+            var searchStart = targetRange.location
+            let targetEnd = NSMaxRange(targetRange)
+            while searchStart < targetEnd {
+                let hit = ns.range(of: "`", options: .literal, range: NSRange(location: searchStart, length: targetEnd - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let lineStr = ns.substring(with: lineRange)
+                for match in code.matches(in: lineStr, range: NSRange(location: 0, length: lineRange.length)) {
+                    let full = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                    let inner = NSRange(location: lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    codes.append(inner)
+                    storage.addAttributes(codeAttrs, range: inner)
+                    let open = NSRange(location: full.location, length: 1)
+                    let close = NSRange(location: NSMaxRange(full) - 1, length: 1)
+                    let cursorNear = cursor.location >= full.location && cursor.location <= NSMaxRange(full)
+                    let tickColor = cursorNear ? Theme.subtle : NSColor.clear
+                    let tickFont = cursorNear ? fontNear : fontFar
+                    storage.addAttributes([.foregroundColor: tickColor, .font: tickFont], range: open)
+                    storage.addAttributes([.foregroundColor: tickColor, .font: tickFont], range: close)
+                }
+                searchStart = NSMaxRange(lineRange)
             }
         }
-        for match in headingMatches {
-            let hashes = match.range(at: 1)
-            let titleRange = match.range(at: 2)
-            let prefixRange = NSRange(location: hashes.location, length: min(ns.length - hashes.location, hashes.length + 1))
-            let level = hashes.length
-            let headingFont = Theme.headingFont(level: level)
-            let headingParagraph = NSMutableParagraphStyle()
-            let headingKern: CGFloat
-            switch level {
-            case 1:
-                headingParagraph.lineSpacing = 3.0
-                headingParagraph.paragraphSpacingBefore = 4.0
-                headingParagraph.paragraphSpacing = 16.0
-                headingKern = -0.35
-            case 2:
-                headingParagraph.lineSpacing = 3.5
-                headingParagraph.paragraphSpacingBefore = 18.0
-                headingParagraph.paragraphSpacing = 8.0
-                headingKern = -0.20
-            default:
-                headingParagraph.lineSpacing = 4.0
-                headingParagraph.paragraphSpacingBefore = 14.0
-                headingParagraph.paragraphSpacing = 6.0
-                headingKern = -0.10
-            }
-            storage.addAttribute(.paragraphStyle, value: headingParagraph, range: match.range)
-            storage.addAttributes([
-                .font: headingFont,
-                .foregroundColor: Theme.headingInk,
-                .kern: headingKern
-            ], range: titleRange)
 
-            let cursorOnHeading = cursor.location >= match.range.location && cursor.location <= NSMaxRange(match.range) && textView.window?.firstResponder === textView
-            if cursorOnHeading || compactLayout {
-                let hashPt = round(headingFont.pointSize * 0.56)
-                storage.addAttributes([
-                    .font: Theme.monoFont(hashPt, weight: .semibold),
-                    .foregroundColor: Theme.accent.withAlphaComponent(0.7),
-                    .baselineOffset: round(headingFont.pointSize * 0.12)
-                ], range: hashes)
-            } else {
-                storage.addAttributes([
-                    .font: NSFont.systemFont(ofSize: 0.1),
-                    .foregroundColor: NSColor.clear
-                ], range: prefixRange)
-            }
-        }
-        for match in fenceMatches {
-            storage.addAttributes([
-                .font: Theme.monoFont(proseSize - 2.5),
-                .foregroundColor: Theme.headingInk,
-                .paragraphStyle: codeBodyParagraph,
-                .kern: 0.0
-            ], range: match.range)
+        // 2. Line-anchored constructs (headings, blockquotes, lists) by stepping line-by-line
+        var linePos = targetRange.location
+        let targetEnd = NSMaxRange(targetRange)
+        let isFocused = textView.window?.firstResponder === textView
+        var lazyQuoteParagraph: NSMutableParagraphStyle?
+        let hiddenAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 0.1),
+            .foregroundColor: NSColor.clear
+        ]
 
-            for kw in codeKeyword.matches(in: current, range: match.range) {
-                storage.addAttributes([
-                    .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
-                    .foregroundColor: Theme.accent
-                ], range: kw.range)
-            }
-            for str in codeString.matches(in: current, range: match.range) {
-                storage.addAttributes([
-                    .foregroundColor: Theme.sage
-                ], range: str.range)
-            }
+        while linePos < targetEnd {
+            let lineRange = ns.lineRange(for: NSRange(location: linePos, length: 0))
+            let nextPos = max(linePos + 1, NSMaxRange(lineRange))
+            defer { linePos = nextPos }
 
-            let blockString = ns.substring(with: match.range)
-            if let firstNewline = blockString.firstIndex(of: "\n") {
-                let openFenceLen = blockString.distance(from: blockString.startIndex, to: firstNewline)
-                let headerRange = NSRange(location: match.range.location, length: openFenceLen)
-                let bodyStart = min(NSMaxRange(match.range), match.range.location + openFenceLen + 1)
-                let bodyEnd = max(bodyStart, NSMaxRange(match.range) - 4)
-                let bodyRange = NSRange(location: bodyStart, length: bodyEnd - bodyStart)
-                parsedFences.append(MarkdownTextView.FencedBlock(fullRange: match.range, headerRange: headerRange, bodyRange: bodyRange))
-                storage.addAttributes([
-                    .font: Theme.monoFont(11, weight: .semibold),
-                    .foregroundColor: Theme.muted,
-                    .paragraphStyle: openFenceParagraph,
-                    .kern: 0.6
-                ], range: headerRange)
-                let cursorOnFence = cursor.location >= headerRange.location && cursor.location <= NSMaxRange(headerRange)
-                if !cursorOnFence && openFenceLen > 3 {
+            var contentEnd = min(NSMaxRange(lineRange), totalLen)
+            while contentEnd > lineRange.location {
+                let ch = ns.character(at: contentEnd - 1)
+                if ch == 10 || ch == 13 { contentEnd -= 1 } else { break }
+            }
+            let contentLen = contentEnd - lineRange.location
+            guard contentLen > 0 else { continue }
+
+            let c0 = ns.character(at: lineRange.location)
+            if c0 == 0x23 { // '#'
+                var h = 1
+                while h <= 6 && lineRange.location + h < contentEnd && ns.character(at: lineRange.location + h) == 0x23 {
+                    h += 1
+                }
+                if h <= 6 && lineRange.location + h + 1 <= contentEnd && lineRange.location + h < contentEnd && ns.character(at: lineRange.location + h) == 0x20 && lineRange.location + h + 1 <= contentEnd && (contentEnd - (lineRange.location + h + 1)) > 0 {
+                    let matchRange = NSRange(location: lineRange.location, length: contentLen)
+                    let hashes = NSRange(location: lineRange.location, length: h)
+                    let titleRange = NSRange(location: lineRange.location + h + 1, length: contentEnd - (lineRange.location + h + 1))
+                    let prefixRange = NSRange(location: hashes.location, length: min(totalLen - hashes.location, h + 1))
+                    let level = h
+                    headings.append(MarkdownTextView.HeadingGutter(range: matchRange, label: "H\(level)", level: level))
+                    let headingFont = Theme.headingFont(level: level)
+                    let headingParagraph = NSMutableParagraphStyle()
+                    let headingKern: CGFloat
+                    switch level {
+                    case 1:
+                        headingParagraph.lineSpacing = 3.0
+                        headingParagraph.paragraphSpacingBefore = 4.0
+                        headingParagraph.paragraphSpacing = 16.0
+                        headingKern = -0.35
+                    case 2:
+                        headingParagraph.lineSpacing = 3.5
+                        headingParagraph.paragraphSpacingBefore = 18.0
+                        headingParagraph.paragraphSpacing = 8.0
+                        headingKern = -0.20
+                    default:
+                        headingParagraph.lineSpacing = 4.0
+                        headingParagraph.paragraphSpacingBefore = 14.0
+                        headingParagraph.paragraphSpacing = 6.0
+                        headingKern = -0.10
+                    }
+                    storage.addAttribute(.paragraphStyle, value: headingParagraph, range: matchRange)
                     storage.addAttributes([
-                        .font: NSFont.systemFont(ofSize: 0.1),
-                        .foregroundColor: NSColor.clear
-                    ], range: NSRange(location: match.range.location, length: 3))
+                        .font: headingFont,
+                        .foregroundColor: Theme.headingInk,
+                        .kern: headingKern
+                    ], range: titleRange)
+
+                    let cursorOnHeading = cursor.location >= matchRange.location && cursor.location <= NSMaxRange(matchRange) && isFocused
+                    if cursorOnHeading || compactLayout {
+                        let hashPt = round(headingFont.pointSize * 0.56)
+                        storage.addAttributes([
+                            .font: Theme.monoFont(hashPt, weight: .semibold),
+                            .foregroundColor: Theme.accent.withAlphaComponent(0.7),
+                            .baselineOffset: round(headingFont.pointSize * 0.12)
+                        ], range: hashes)
+                    } else {
+                        storage.addAttributes(hiddenAttrs, range: prefixRange)
+                    }
+                }
+            } else if c0 == 0x3E { // '>'
+                var q = 1
+                while lineRange.location + q < contentEnd && ns.character(at: lineRange.location + q) == 0x3E {
+                    q += 1
+                }
+                if lineRange.location + q < contentEnd && ns.character(at: lineRange.location + q) == 0x20 {
+                    let matchRange = NSRange(location: lineRange.location, length: contentLen)
+                    let g1 = NSRange(location: lineRange.location, length: q)
+                    let g2 = NSRange(location: lineRange.location + q + 1, length: contentEnd - (lineRange.location + q + 1))
+                    quotes.append(matchRange)
+                    let qp: NSMutableParagraphStyle
+                    if let existing = lazyQuoteParagraph {
+                        qp = existing
+                    } else {
+                        let created = NSMutableParagraphStyle()
+                        created.lineSpacing = 6.5
+                        created.paragraphSpacing = 10.0
+                        created.firstLineHeadIndent = 14
+                        created.headIndent = 26
+                        lazyQuoteParagraph = created
+                        qp = created
+                    }
+                    storage.addAttribute(.paragraphStyle, value: qp, range: matchRange)
+                    storage.addAttributes([
+                        .font: Theme.monoFont(12.5, weight: .semibold),
+                        .foregroundColor: Theme.accent
+                    ], range: g1)
+                    storage.addAttributes([
+                        .font: Theme.italicDisplayFont(proseSize + 0.5),
+                        .foregroundColor: Theme.muted,
+                        .kern: 0.05
+                    ], range: g2)
+                }
+            } else if c0 == 0x2D || c0 == 0x2A || c0 == 0x2B || c0 == 0x20 || c0 == 0x09 || (c0 >= 0x30 && c0 <= 0x39) {
+                var p = lineRange.location
+                while p < contentEnd {
+                    let ch = ns.character(at: p)
+                    if ch == 0x20 || ch == 0x09 { p += 1 } else { break }
+                }
+                guard p < contentEnd else { continue }
+                let mc = ns.character(at: p)
+                guard mc == 0x2D || mc == 0x2A || mc == 0x2B || (mc >= 0x30 && mc <= 0x39) else { continue }
+                let contentRange = NSRange(location: lineRange.location, length: contentLen)
+                let lineStr = ns.substring(with: contentRange)
+                if let match = listMarker.firstMatch(in: lineStr, range: NSRange(location: 0, length: contentLen)) {
+                    let fullMatchRange = NSRange(location: contentRange.location + match.range.location, length: match.range.length)
+                    let markerRange = NSRange(location: contentRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    let bodyRange = NSRange(location: contentRange.location + match.range(at: 2).location, length: match.range(at: 2).length)
+                    let markerText = (lineStr as NSString).substring(with: match.range(at: 1))
+                    let isTask = markerText.hasSuffix("[ ]") || markerText.hasSuffix("[x]") || markerText.hasSuffix("[X]")
+                    let itemParagraph = NSMutableParagraphStyle()
+                    itemParagraph.lineSpacing = 5.5
+                    itemParagraph.paragraphSpacing = 4.5
+                    itemParagraph.headIndent = isTask ? 42 : 18
+                    storage.addAttribute(.paragraphStyle, value: itemParagraph, range: fullMatchRange)
+                    let completed = markerText.hasSuffix("[x]") || markerText.hasSuffix("[X]")
+                    storage.addAttributes([
+                        .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
+                        .foregroundColor: completed ? Theme.sage : Theme.accent
+                    ], range: markerRange)
+                    if completed {
+                        storage.addAttributes([
+                            .foregroundColor: Theme.muted,
+                            .strikethroughStyle: NSUnderlineStyle.single.rawValue,
+                            .strikethroughColor: Theme.subtle.withAlphaComponent(0.75)
+                        ], range: bodyRange)
+                    }
                 }
             }
-            if match.range.length >= 3 {
-                let closeRange = NSRange(location: NSMaxRange(match.range) - 3, length: 3)
-                let cursorOnClose = cursor.location >= closeRange.location && cursor.location <= NSMaxRange(closeRange)
-                storage.addAttributes([
-                    .font: cursorOnClose ? Theme.monoFont(11, weight: .medium) : Theme.monoFont(4),
-                    .foregroundColor: cursorOnClose ? Theme.subtle : NSColor.clear,
-                    .paragraphStyle: closeFenceParagraph
-                ], range: closeRange)
-            }
         }
-        textView.inlineCodeRanges = inlinePills
-        textView.fencedBlocks = parsedFences
-        storage.endEditing()
-        if let tc = textView.textContainer {
-            textView.layoutManager?.ensureLayout(for: tc)
-        }
-        textView.typingAttributes = [
-            .font: baseFont,
-            .foregroundColor: Theme.ink,
-            .paragraphStyle: bodyParagraph,
-            .kern: tracking
-        ]
     }
 }

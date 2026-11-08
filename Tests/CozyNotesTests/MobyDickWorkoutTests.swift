@@ -27,9 +27,20 @@ final class MobyDickWorkoutTests: XCTestCase {
         XCTAssertEqual(report.step3.resizeStepMs.count, 4, "Step 3 should measure all 4 window resize steps")
         XCTAssertTrue(report.step4.intactAfterRedo, "Step 4 Select All / Cut / Paste / Undo / Redo must leave Moby Dick intact")
         XCTAssertEqual(report.step5.keystrokeCount, sample.count, "Step 5 should measure each keystroke")
+        XCTAssertLessThan(report.step1.cpu.cpuTimeMs, 150.0, "Step 1 CPU time should be < 150ms")
+        XCTAssertLessThan(report.step2.resizeAvgMs, 16.0, "Step 2 average resize time should be < 16ms")
+        XCTAssertLessThan(report.step3.resizeAvgMs, 16.0, "Step 3 average resize time should be < 16ms")
+        XCTAssertLessThan(report.step5.p95KeystrokeMs, 8.0, "Step 5 P95 keystroke latency should be < 8.0ms")
         XCTAssertEqual(report.repeats.count, max(0, cycles), "Step 6 should complete repeated workout cycles")
         for cycle in report.repeats {
             XCTAssertTrue(cycle.step4.intactAfterRedo, "Cycle #\(cycle.cycleIndex) must leave Moby Dick intact")
+            XCTAssertLessThan(cycle.step2.resizeAvgMs, 16.0)
+            XCTAssertLessThan(cycle.step3.resizeAvgMs, 16.0)
+            XCTAssertLessThan(cycle.step5.p95KeystrokeMs, 8.0)
+        }
+        if !report.repeats.isEmpty {
+            let growthPerCycle = (report.memoryFinal.physFootprintMB - report.memoryAfterFirstPass.physFootprintMB) / Double(report.repeats.count)
+            XCTAssertLessThan(growthPerCycle, 5.0, "Memory growth per cycle should be < 5 MB/cycle")
         }
     }
 }
@@ -54,10 +65,48 @@ struct MobyDickWorkoutSuite {
         #expect(report.step3.resizeStepMs.count == 4)
         #expect(report.step4.intactAfterRedo)
         #expect(report.step5.keystrokeCount == sample.count)
+        #expect(report.step1.cpu.cpuTimeMs < 150.0)
+        #expect(report.step2.resizeAvgMs < 16.0)
+        #expect(report.step3.resizeAvgMs < 16.0)
+        #expect(report.step5.p95KeystrokeMs < 8.0)
         #expect(report.repeats.count == max(0, cycles))
         for cycle in report.repeats {
             #expect(cycle.step4.intactAfterRedo)
+            #expect(cycle.step2.resizeAvgMs < 16.0)
+            #expect(cycle.step3.resizeAvgMs < 16.0)
+            #expect(cycle.step5.p95KeystrokeMs < 8.0)
         }
+        if !report.repeats.isEmpty {
+            let growthPerCycle = (report.memoryFinal.physFootprintMB - report.memoryAfterFirstPass.physFootprintMB) / Double(report.repeats.count)
+            #expect(growthPerCycle < 5.0)
+        }
+    }
+
+    @Test("Markdown formatting preserves headings, quotes, lists, inline tokens, and code fences")
+    @MainActor
+    func markdownFormattingInvariants() throws {
+        _ = NSApplication.shared
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        let sample = """
+        # Heading One
+        ## Heading Two
+        > Blockquote callout
+        - [x] Completed task
+        - [ ] Open task
+        1. Numbered item
+        Some **bold** and *italic* and `inline` and [link](https://example.com) prose.
+        ```swift
+        let answer = "42"
+        ```
+        """
+        editor.text = sample
+        #expect(editor.textView.headingGutterItems.count == 2)
+        #expect(editor.textView.headingGutterItems[0].label == "H1")
+        #expect(editor.textView.headingGutterItems[1].label == "H2")
+        #expect(editor.textView.blockquoteRanges.count == 1)
+        #expect(editor.textView.inlineCodeRanges.count == 1)
+        #expect(editor.textView.fencedBlocks.count == 1)
+        #expect(editor.wordCount.stringValue.contains("WORDS"))
     }
 }
 #endif

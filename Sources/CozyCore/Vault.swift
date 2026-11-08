@@ -214,21 +214,38 @@ public final class Vault: @unchecked Sendable {
         }
     }
 
+    private static let linkedAttachmentRegex = try! NSRegularExpression(pattern: "!?\\[[^\\]\\n]*\\]\\(([^\\)\\n]+)\\)")
+
     public func linkedAttachments(in text: String, relativeTo noteURL: URL) -> [LinkedAttachment] {
+        linkedAttachments(inNSString: text as NSString, relativeTo: noteURL)
+    }
+
+    public func linkedAttachments(inNSString ns: NSString, relativeTo noteURL: URL) -> [LinkedAttachment] {
         synchronized {
-            guard (try? validateNote(noteURL)) != nil,
-                  let regex = try? NSRegularExpression(pattern: "!?\\[[^\\]\\n]*\\]\\(([^\\)\\n]+)\\)") else { return [] }
-            let ns = text as NSString
+            guard ns.length > 4,
+                  ns.range(of: "](", options: .literal).location != NSNotFound,
+                  (try? validateNote(noteURL)) != nil else { return [] }
             let baseDir = noteURL.deletingLastPathComponent()
             var items: [LinkedAttachment] = []
-            for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) where match.numberOfRanges > 1 {
-                let rawTarget = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespaces)
-                guard !rawTarget.contains("://"), !rawTarget.hasPrefix("/"),
-                      let decoded = rawTarget.removingPercentEncoding,
-                      !decoded.isEmpty else { continue }
-                let candidate = baseDir.appendingPathComponent(decoded).standardizedFileURL.resolvingSymlinksInPath()
-                guard (try? validateSource(candidate)) != nil else { continue }
-                items.append(LinkedAttachment(url: candidate, markdownRange: match.range))
+            var searchStart = 0
+            let totalLen = ns.length
+            while searchStart < totalLen {
+                let hit = ns.range(of: "](", options: .literal, range: NSRange(location: searchStart, length: totalLen - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = ns.lineRange(for: hit)
+                let lineStr = ns.substring(with: lineRange)
+                let lineNS = lineStr as NSString
+                for match in Self.linkedAttachmentRegex.matches(in: lineStr, range: NSRange(location: 0, length: lineNS.length)) where match.numberOfRanges > 1 {
+                    let rawTarget = lineNS.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespaces)
+                    guard !rawTarget.contains("://"), !rawTarget.hasPrefix("/"),
+                          let decoded = rawTarget.removingPercentEncoding,
+                          !decoded.isEmpty else { continue }
+                    let candidate = baseDir.appendingPathComponent(decoded).standardizedFileURL.resolvingSymlinksInPath()
+                    guard (try? validateSource(candidate)) != nil else { continue }
+                    let fullRange = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                    items.append(LinkedAttachment(url: candidate, markdownRange: fullRange))
+                }
+                searchStart = NSMaxRange(lineRange)
             }
             return items
         }

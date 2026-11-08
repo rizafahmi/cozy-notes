@@ -23,8 +23,18 @@ import CozyCore
     private var ruleTrailingConstraint: NSLayoutConstraint?
 
     private(set) var isSidebarCollapsed = false
-    private(set) var noteURL: URL?
-    private var noteBaseline = ""
+    private(set) var noteURL: URL? {
+        didSet {
+            if noteURL != oldValue { cachedNoteStamp = nil }
+        }
+    }
+    private var noteBaseline = "" {
+        didSet {
+            noteBaselineUTF16Length = (noteBaseline as NSString).length
+        }
+    }
+    private var noteBaselineUTF16Length = 0
+    private var cachedNoteStamp: String?
     private var noteDirty = false
     private var noteConflicted = false
     private var noteAvailable = true
@@ -291,14 +301,23 @@ import CozyCore
     private func editorDidChange() {
         autosave?.invalidate()
         if let noteURL {
-            noteDirty = editor.text != noteBaseline
-            editor.linkedAttachments = vault.linkedAttachments(in: editor.text, relativeTo: noteURL)
+            let ns = editor.nsText
+            if ns.length != noteBaselineUTF16Length {
+                noteDirty = true
+            } else {
+                noteDirty = (ns as String) != noteBaseline
+            }
+            if editor.hasPotentialLinks || !editor.linkedAttachments.isEmpty {
+                editor.linkedAttachments = vault.linkedAttachments(inNSString: ns, relativeTo: noteURL)
+            }
         } else {
             noteDirty = editor.hasContent
         }
         updateEditorChrome()
         guard noteDirty, !noteConflicted else { return }
-        editor.status.stringValue = "Editing…"
+        if editor.status.stringValue != "Editing…" {
+            editor.status.stringValue = "Editing…"
+        }
         autosave = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { _ = self?.persistCurrent() }
         }
@@ -316,6 +335,7 @@ import CozyCore
                 noteBaseline = updated
                 noteDirty = false
                 noteAvailable = true
+                cachedNoteStamp = nil
                 editor.text = updated
                 editor.linkedAttachments = vault.linkedAttachments(in: updated, relativeTo: existingURL)
                 editor.status.stringValue = "Saved"
@@ -372,7 +392,8 @@ import CozyCore
                 try vault.save(editor.text, to: existingURL, expectedContent: noteBaseline)
                 noteBaseline = editor.text
                 noteDirty = false
-                editor.linkedAttachments = vault.linkedAttachments(in: editor.text, relativeTo: existingURL)
+                cachedNoteStamp = nil
+                editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: existingURL)
                 editor.status.stringValue = "Saved"
                 updateEditorChrome()
                 searchPanel.refresh()
@@ -479,9 +500,10 @@ import CozyCore
             noteDirty = false
             noteConflicted = false
             noteAvailable = true
+            cachedNoteStamp = nil
             editor.clearPendingAttachments()
             editor.text = text
-            editor.linkedAttachments = vault.linkedAttachments(in: text, relativeTo: url)
+            editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: url)
             editor.status.stringValue = ""
             searchPanel.selectNote(url)
             updateEditorChrome()
@@ -508,18 +530,30 @@ import CozyCore
     }
 
     private func updateEditorChrome() {
-        conflictSaveButton.isHidden = !noteConflicted
-        revealButton.isHidden = noteURL == nil
-        voiceButton.title = Theme.voice.shortBadge
-        atmosphereButton.title = Theme.atmosphere.shortBadge
+        if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
+        let hideReveal = noteURL == nil
+        if revealButton.isHidden != hideReveal { revealButton.isHidden = hideReveal }
+        let voiceBadge = Theme.voice.shortBadge
+        if voiceButton.title != voiceBadge { voiceButton.title = voiceBadge }
+        let atmoBadge = Theme.atmosphere.shortBadge
+        if atmosphereButton.title != atmoBadge { atmosphereButton.title = atmoBadge }
         if let noteURL {
-            let modified = (try? noteURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
-            let stamp = Self.headerDateFormatter.string(from: modified).uppercased()
-            contextLabel.stringValue = noteDirty ? "\(stamp)  ·  UNSAVED" : stamp
-            contextLabel.toolTip = String(noteURL.path.dropFirst(vault.root.path.count + 1))
+            let stamp: String
+            if let cached = cachedNoteStamp {
+                stamp = cached
+            } else {
+                let modified = (try? noteURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+                let formatted = Self.headerDateFormatter.string(from: modified).uppercased()
+                cachedNoteStamp = formatted
+                stamp = formatted
+                contextLabel.toolTip = String(noteURL.path.dropFirst(vault.root.path.count + 1))
+            }
+            let nextContext = noteDirty ? "\(stamp)  ·  UNSAVED" : stamp
+            if contextLabel.stringValue != nextContext { contextLabel.stringValue = nextContext }
         } else {
             let stamp = Self.headerDateFormatter.string(from: Date()).uppercased()
-            contextLabel.stringValue = "NEW FOLIO  ·  \(stamp)"
+            let nextContext = "NEW FOLIO  ·  \(stamp)"
+            if contextLabel.stringValue != nextContext { contextLabel.stringValue = nextContext }
             contextLabel.toolTip = vault.root.path
         }
     }
