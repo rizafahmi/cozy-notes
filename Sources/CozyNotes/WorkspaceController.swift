@@ -34,10 +34,16 @@ import CozyCore
     }
     private var noteBaseline = "" {
         didSet {
-            noteBaselineUTF16Length = (noteBaseline as NSString).length
+            if !noteBaseline.isContiguousUTF8 {
+                noteBaseline.makeContiguousUTF8()
+            }
+            let ns = noteBaseline as NSString
+            noteBaselineUTF16Length = ns.length
+            noteBaselineSig = CaptureEditor.sampleSignature(of: ns)
         }
     }
     private var noteBaselineUTF16Length = 0
+    private var noteBaselineSig = 0
     private var cachedNoteStamp: String?
     private var noteDirty = false
     private var noteConflicted = false
@@ -399,6 +405,10 @@ import CozyCore
             let ns = editor.nsText
             if ns.length != noteBaselineUTF16Length {
                 noteDirty = true
+            } else if CaptureEditor.sampleSignature(of: ns) != noteBaselineSig {
+                noteDirty = true
+            } else if ns.length > 4096 && ns.length == editor.textView.cachedFullTextLength && noteBaselineSig == editor.textView.cachedFullTextSig && editor.textView.cachedFullText == noteBaseline {
+                noteDirty = false
             } else {
                 noteDirty = (ns as String) != noteBaseline
             }
@@ -485,8 +495,11 @@ import CozyCore
         if let existingURL = noteURL {
             guard noteDirty else { return true }
             do {
-                try vault.save(editor.text, to: existingURL, expectedContent: noteBaseline)
-                noteBaseline = editor.text
+                var savedText = editor.text
+                savedText.makeContiguousUTF8()
+                try vault.save(savedText, to: existingURL, expectedContent: noteBaseline)
+                noteBaseline = savedText
+                editor.cacheFullText(savedText)
                 noteDirty = false
                 cachedNoteStamp = nil
                 editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: existingURL)
@@ -973,10 +986,16 @@ import CozyCore
     }
     private var noteBaseline = "" {
         didSet {
-            noteBaselineUTF16Length = (noteBaseline as NSString).length
+            if !noteBaseline.isContiguousUTF8 {
+                noteBaseline.makeContiguousUTF8()
+            }
+            let ns = noteBaseline as NSString
+            noteBaselineUTF16Length = ns.length
+            noteBaselineSig = CaptureEditor.sampleSignature(of: ns)
         }
     }
     private var noteBaselineUTF16Length = 0
+    private var noteBaselineSig = 0
     private var cachedNoteStamp: String?
     private(set) var noteDirty = false
     private(set) var noteConflicted = false
@@ -1175,6 +1194,10 @@ import CozyCore
             let ns = editor.nsText
             if ns.length != noteBaselineUTF16Length {
                 noteDirty = true
+            } else if CaptureEditor.sampleSignature(of: ns) != noteBaselineSig {
+                noteDirty = true
+            } else if ns.length > 4096 && ns.length == editor.textView.cachedFullTextLength && noteBaselineSig == editor.textView.cachedFullTextSig && editor.textView.cachedFullText == noteBaseline {
+                noteDirty = false
             } else {
                 noteDirty = (ns as String) != noteBaseline
             }
@@ -1201,8 +1224,11 @@ import CozyCore
         guard let existingURL = noteURL else { return true }
         guard noteDirty else { return true }
         do {
-            try vault.save(editor.text, to: existingURL, expectedContent: noteBaseline)
-            noteBaseline = editor.text
+            var savedText = editor.text
+            savedText.makeContiguousUTF8()
+            try vault.save(savedText, to: existingURL, expectedContent: noteBaseline)
+            noteBaseline = savedText
+            editor.cacheFullText(savedText)
             noteDirty = false
             cachedNoteStamp = nil
             editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: existingURL)
