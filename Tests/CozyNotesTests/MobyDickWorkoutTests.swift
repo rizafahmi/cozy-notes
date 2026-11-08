@@ -205,5 +205,63 @@ struct MobyDickWorkoutSuite {
         #expect(window.performKeyEquivalent(with: try keyEvent("c", keyCode: 8)))
         #expect(NSPasteboard.general.string(forType: .string) == "cut!")
     }
+
+    @Test("Deleting an active note checkpoints recovery, removes attachments, and resets workspace to a blank New Folio")
+    @MainActor
+    func workspaceDeleteNoteFlow() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+        let fileMenu = try #require(mainMenu.item(withTitle: "File")?.submenu)
+        let deleteItem = try #require(fileMenu.item(withTitle: "Delete Note…"))
+        #expect(deleteItem.keyEquivalent == "\u{08}")
+
+        let tempBase = FileManager.default.temporaryDirectory
+            .resolvingSymlinksInPath()
+            .appendingPathComponent("CozyDeleteTests-\(UUID().uuidString)", isDirectory: true)
+        let vaultRoot = tempBase.appendingPathComponent("Vault", isDirectory: true)
+        let historyRoot = tempBase.appendingPathComponent("History", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+
+        let attachmentFile = tempBase.appendingPathComponent("diagram.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: attachmentFile)
+
+        let vault = try Vault(root: vaultRoot, historyRoot: historyRoot)
+        let note = try vault.capture(text: "# Disposable Note\nWith an image attachment.", attachments: [attachmentFile])
+        let workspace = WorkspaceController(vault: vault)
+        defer {
+            workspace.shutdown()
+            workspace.window?.orderOut(nil)
+        }
+
+        // Initially on a blank New Folio: deleteButton is hidden
+        #expect(workspace.noteURL == nil)
+        #expect(workspace.deleteButton.isHidden)
+        #expect(!workspace.canDeleteNote)
+
+        // Opening the note reveals deleteButton and enables note deletion
+        workspace.openNote(note.url)
+        #expect(workspace.noteURL == note.url)
+        #expect(!workspace.deleteButton.isHidden)
+        #expect(workspace.canDeleteNote)
+        #expect(workspace.editor.linkedAttachments.count == 1)
+        let attachmentFolder = try #require(workspace.editor.linkedAttachments.first?.url.deletingLastPathComponent())
+        #expect(FileManager.default.fileExists(atPath: attachmentFolder.path))
+
+        // Deleting the active note checkpoints history, removes note & attachment folder, and resets to blank New Folio
+        #expect(workspace.performDeleteNote(note.url, moveToTrash: false))
+        #expect(!FileManager.default.fileExists(atPath: note.url.path))
+        #expect(!FileManager.default.fileExists(atPath: attachmentFolder.path))
+        #expect(workspace.noteURL == nil)
+        #expect(workspace.editor.text.isEmpty)
+        #expect(workspace.deleteButton.isHidden)
+        #expect(workspace.editor.status.stringValue == "Moved to Trash")
+
+        let snapshots = try vault.snapshots()
+        #expect(snapshots.count == 1)
+        #expect(snapshots[0].label == "Before deleting Disposable Note")
+    }
 }
 #endif

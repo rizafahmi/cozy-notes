@@ -7,6 +7,7 @@ import CozySearch
 final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     var onOpenNote: ((URL) -> Void)?
     var onNewNote: (() -> Void)?
+    var onDeleteNote: ((URL) -> Void)?
     var onToggleSidebar: (() -> Void)?
     var onToggleAppearance: (() -> Void)?
     var onSwitchAtmosphere: ((Theme.Atmosphere) -> Void)?
@@ -16,6 +17,11 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     var onStatus: ((String) -> Void)?
     var isProcessing: Bool { busy }
     var isExtracting: Bool { extracting }
+    var selectedNoteURL: URL? {
+        let row = table.selectedRow
+        guard hits.indices.contains(row), hits[row].source.kind == .note else { return nil }
+        return hits[row].source.url
+    }
 
     private let vault: Vault
     private let engine: CaptureSearch
@@ -146,6 +152,8 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         table.action = #selector(rowClicked)
         table.doubleAction = #selector(openSelected)
         table.onReturn = { [weak self] in self?.openSelected() }
+        table.onDelete = { [weak self] in self?.deleteSelectedNote() }
+        table.onMenuForRow = { [weak self] row in self?.contextMenuForRow(row) }
         let scroll = NSScrollView()
         scroll.verticalScroller = CozyScroller()
         scroll.documentView = table
@@ -244,6 +252,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         generation += 1
         onOpenNote = nil
         onNewNote = nil
+        onDeleteNote = nil
         onToggleSidebar = nil
         onRevealFolder = nil
         onChooseFolder = nil
@@ -524,6 +533,63 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         activateHit(hits[row], allowExternalViewer: true)
     }
 
+    @objc func deleteSelectedNote() {
+        guard !closed, !busy, let url = selectedNoteURL else { return }
+        onDeleteNote?(url)
+    }
+
+    func contextMenuForRow(_ row: Int) -> NSMenu? {
+        guard !closed, !busy, hits.indices.contains(row) else { return nil }
+        let hit = hits[row]
+        let menu = NSMenu()
+        let openItem = NSMenuItem(
+            title: hit.source.kind == .note ? "Open Note" : "Open",
+            action: #selector(openRowFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        openItem.target = self
+        openItem.representedObject = row
+        menu.addItem(openItem)
+
+        let revealItem = NSMenuItem(
+            title: "Reveal in Finder",
+            action: #selector(revealRowFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        revealItem.target = self
+        revealItem.representedObject = hit.source.url
+        menu.addItem(revealItem)
+
+        if hit.source.kind == .note {
+            menu.addItem(.separator())
+            let deleteItem = NSMenuItem(
+                title: "Delete Note…",
+                action: #selector(deleteRowFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            deleteItem.target = self
+            deleteItem.representedObject = hit.source.url
+            menu.addItem(deleteItem)
+        }
+        return menu
+    }
+
+    @objc private func openRowFromMenu(_ sender: NSMenuItem) {
+        guard !closed, !busy, let row = sender.representedObject as? Int, hits.indices.contains(row) else { return }
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        activateHit(hits[row], allowExternalViewer: true)
+    }
+
+    @objc private func revealRowFromMenu(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func deleteRowFromMenu(_ sender: NSMenuItem) {
+        guard !closed, !busy, let url = sender.representedObject as? URL else { return }
+        onDeleteNote?(url)
+    }
+
     private func activateHit(_ hit: SearchHit, allowExternalViewer: Bool) {
         guard let expected = stamps[hit.source.url] else {
             setStatus("Missing or unreadable: \(hit.source.relativePath)")
@@ -626,9 +692,26 @@ private final class SearchHitRow: NSTableRowView {
 @MainActor
 private final class SearchResultsTable: NSTableView {
     var onReturn: (() -> Void)?
+    var onDelete: (() -> Void)?
+    var onMenuForRow: ((Int) -> NSMenu?)?
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 36 || event.keyCode == 76 { onReturn?() }
-        else { super.keyDown(with: event) }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 36 || event.keyCode == 76 {
+            onReturn?()
+        } else if (event.keyCode == 51 || event.keyCode == 117) && (flags.isEmpty || flags == .command) {
+            onDelete?()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = self.row(at: point)
+        guard row >= 0 else { return nil }
+        if !selectedRowIndexes.contains(row) {
+            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        return onMenuForRow?(row)
     }
 }
 

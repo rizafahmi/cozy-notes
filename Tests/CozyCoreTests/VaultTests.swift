@@ -229,4 +229,51 @@ final class VaultTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: linked[0].url), Data([10, 20, 30]))
         XCTAssertEqual(try Data(contentsOf: linked[1].url), Data([40, 50, 60]))
     }
+
+    func testDeleteNoteCreatesRecoveryCheckpointAndRemovesAttachmentFolder() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let image = fixture.workspace.appendingPathComponent("sketch.png")
+        let imageBytes = Data([1, 3, 3, 7, 255])
+        try imageBytes.write(to: image)
+
+        let doomed = try fixture.vault.capture(text: "# Ephemeral Draft\nDelete this note and its attachment.", attachments: [image])
+        let keeper = try fixture.vault.capture(text: "# Keeper\nStay in the vault.")
+        let doomedText = try fixture.vault.read(doomed.url)
+        let linked = fixture.vault.linkedAttachments(in: doomedText, relativeTo: doomed.url)
+        XCTAssertEqual(linked.count, 1)
+        let attachmentURL = try XCTUnwrap(linked.first?.url)
+        let attachmentFolder = attachmentURL.deletingLastPathComponent()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentFolder.path))
+
+        let checkpoint = try fixture.vault.delete(doomed.url, moveToTrash: false)
+        XCTAssertTrue(checkpoint.label.contains("Ephemeral Draft"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: doomed.url.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentFolder.path))
+        XCTAssertEqual(try fixture.vault.notes().map(\.url), [keeper.url])
+
+        // Restoring the automatic checkpoint recovers both the deleted note and its attachment folder
+        try fixture.vault.restore(snapshotID: checkpoint.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: doomed.url.path))
+        XCTAssertEqual(try fixture.vault.read(doomed.url), doomedText)
+        XCTAssertEqual(try Data(contentsOf: attachmentURL), imageBytes)
+
+        // Deleting AGENTS.md or paths outside the vault must be rejected
+        let agents = fixture.root.appendingPathComponent("AGENTS.md")
+        try "# Instructions".write(to: agents, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try fixture.vault.delete(agents, moveToTrash: false))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: agents.path))
+    }
 }
+
+#if canImport(Testing)
+import Testing
+
+@Suite("Vault Delete")
+struct VaultDeleteSuite {
+    @Test("Deleting a note checkpoints recovery and removes its attachment folder")
+    func deleteNoteAndRecover() throws {
+        try VaultTests().testDeleteNoteCreatesRecoveryCheckpointAndRemovesAttachmentFolder()
+    }
+}
+#endif

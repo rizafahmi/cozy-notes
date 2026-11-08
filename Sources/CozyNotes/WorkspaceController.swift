@@ -12,7 +12,8 @@ import CozyCore
     private let contextLabel = Theme.label("", size: 10.5, color: Theme.muted)
     private let voiceButton = QuietButton(title: "AVENIR", symbol: "textformat", target: nil, action: nil)
     private let atmosphereButton = QuietButton(title: "OBSIDIAN", symbol: "sparkles", target: nil, action: nil)
-    private let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
+    let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
+    let deleteButton = QuietButton(symbol: "trash", target: nil, action: nil)
     private let conflictSaveButton = PrimaryButton()
     private let headerRule = HairlineView()
     private var sidebarWidthConstraint: NSLayoutConstraint?
@@ -120,6 +121,10 @@ import CozyCore
         revealButton.action = #selector(revealCurrentNote)
         revealButton.toolTip = "Reveal this note in Finder"
         revealButton.setAccessibilityLabel("Reveal note in Finder")
+        deleteButton.target = self
+        deleteButton.action = #selector(deleteCurrentNote)
+        deleteButton.toolTip = "Delete this note (⌘⌫)"
+        deleteButton.setAccessibilityLabel("Delete note")
 
         conflictSaveButton.title = "Keep as new note"
         conflictSaveButton.target = self
@@ -128,7 +133,7 @@ import CozyCore
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, revealButton], spacing: 6)
+        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, revealButton, deleteButton], spacing: 6)
 
         for view in [editorHeader, headerRule, editor] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -186,6 +191,7 @@ import CozyCore
         editor.onHorizontalInsetChange = { [weak self] inset in self?.syncFolioMargins(inset) }
         searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         searchPanel.onNewNote = { [weak self] in self?.newCapture() }
+        searchPanel.onDeleteNote = { [weak self] url in self?.confirmAndDeleteNote(url) }
         searchPanel.onToggleSidebar = { [weak self] in self?.toggleSidebar() }
         searchPanel.onToggleAppearance = { [weak self] in self?.toggleAppearance() }
         searchPanel.onSwitchAtmosphere = { [weak self] preset in self?.switchAtmosphere(preset) }
@@ -531,8 +537,9 @@ import CozyCore
 
     private func updateEditorChrome() {
         if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
-        let hideReveal = noteURL == nil
-        if revealButton.isHidden != hideReveal { revealButton.isHidden = hideReveal }
+        let hideNoteActions = noteURL == nil
+        if revealButton.isHidden != hideNoteActions { revealButton.isHidden = hideNoteActions }
+        if deleteButton.isHidden != hideNoteActions { deleteButton.isHidden = hideNoteActions }
         let voiceBadge = Theme.voice.shortBadge
         if voiceButton.title != voiceBadge { voiceButton.title = voiceBadge }
         let atmoBadge = Theme.atmosphere.shortBadge
@@ -561,6 +568,70 @@ import CozyCore
     @objc private func revealCurrentNote() {
         guard let noteURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([noteURL])
+    }
+
+    var canDeleteNote: Bool {
+        noteURL != nil || searchPanel.selectedNoteURL != nil
+    }
+
+    @objc func deleteCurrentNote() {
+        guard let targetURL = noteURL ?? searchPanel.selectedNoteURL else { return }
+        confirmAndDeleteNote(targetURL)
+    }
+
+    func confirmAndDeleteNote(_ url: URL) {
+        guard !searchPanel.isExtracting else {
+            showError(NSError(domain: "CozyNotes", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Wait for extraction to finish or cancel it before deleting notes."
+            ]), in: window)
+            return
+        }
+        let title = (try? vault.notes().first(where: { $0.url == url })?.title)
+            ?? url.deletingPathExtension().lastPathComponent
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete “\(title)”?"
+        alert.informativeText = "This note and its attachments will be moved to the Trash. A recovery checkpoint is saved first so you can also restore it from Recovery."
+        let trashBtn = alert.addButton(withTitle: "Move to Trash")
+        trashBtn.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        guard let window else {
+            _ = performDeleteNote(url)
+            return
+        }
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertFirstButtonReturn else { return }
+            _ = self.performDeleteNote(url)
+        }
+    }
+
+    @discardableResult
+    func performDeleteNote(_ url: URL, moveToTrash: Bool = true) -> Bool {
+        guard !searchPanel.isExtracting else { return false }
+        let deletingActiveNote = (noteURL == url)
+        if deletingActiveNote {
+            autosave?.invalidate()
+        }
+        do {
+            _ = try vault.delete(url, moveToTrash: moveToTrash)
+            if deletingActiveNote {
+                noteURL = nil
+                noteBaseline = ""
+                noteDirty = false
+                noteConflicted = false
+                noteAvailable = true
+                editor.reset()
+                editor.status.stringValue = "Moved to Trash"
+                searchPanel.selectNote(nil)
+                updateEditorChrome()
+                editor.focus()
+            }
+            searchPanel.refresh()
+            return true
+        } catch {
+            showError(error, in: window)
+            return false
+        }
     }
     @objc private func revealFolder() { NSWorkspace.shared.open(vault.root) }
     @objc private func chooseFolder() { onChooseFolder?() }

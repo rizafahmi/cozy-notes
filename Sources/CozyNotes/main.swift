@@ -1,7 +1,7 @@
 import AppKit
 import CozyCore
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private(set) var workspace: WorkspaceController?
     private var quickCapture: QuickCaptureController?
     private var hotKey: GlobalHotKey?
@@ -73,6 +73,7 @@ import CozyCore
         if NSApp.keyWindow === quickCapture?.window { quickCapture?.save() }
         else { workspace?.saveCurrent() }
     }
+    @objc private func deleteNote() { workspace?.deleteCurrentNote() }
     @objc private func search() { workspace?.focusSearch(); workspace?.showAndFocus() }
     @objc private func makeSearchable() { workspace?.makeSearchable() }
     @objc private func recovery() { workspace?.showRecovery() }
@@ -119,6 +120,7 @@ import CozyCore
         add("Quick Capture", action: #selector(quick), key: " ", modifiers: [.command, .shift], to: file)
         add("Save Note", action: #selector(save), key: "s", to: file)
         add("Keep / Save", action: #selector(save), key: "\r", to: file)
+        add("Delete Note…", action: #selector(deleteNote), key: "\u{08}", to: file)
         add("Choose Notes Folder…", action: #selector(chooseFolder), key: "o", modifiers: [.command, .shift], to: file)
         add("Open Notes Folder", action: #selector(openFolder), key: "", to: file)
         add("Recovery…", action: #selector(recovery), key: "", to: file)
@@ -160,6 +162,13 @@ import CozyCore
         let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
         item.target = self
         item.keyEquivalentModifierMask = modifiers
+    }
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(deleteNote) {
+            guard let workspace, NSApp.keyWindow === workspace.window || NSApp.keyWindow == nil else { return false }
+            return workspace.canDeleteNote
+        }
+        return true
     }
 }
 

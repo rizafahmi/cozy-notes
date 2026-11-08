@@ -146,6 +146,59 @@ public final class Vault: @unchecked Sendable {
         }
     }
 
+    /// Creates a recovery checkpoint, then moves the note and its dedicated `Attachments/<uuid>` folder to Trash (or removes them if Trash is unavailable or disabled).
+    @discardableResult
+    public func delete(_ noteURL: URL, moveToTrash: Bool = true) throws -> VaultSnapshot {
+        try synchronized {
+            try validateNote(noteURL)
+            guard noteURL.lastPathComponent != "AGENTS.md",
+                  !Self.isExtractedCompanion(noteURL, root: root) else {
+                throw VaultError.unsafePath(noteURL.path)
+            }
+            try validateSource(noteURL)
+            let noteRecord = try record(noteURL)
+            let noteText = try read(noteURL)
+            let checkpoint = try makeSnapshot(label: "Before deleting \(noteRecord.title)")
+
+            var attachmentFolders: Set<URL> = []
+            let attachmentsRoot = root.appendingPathComponent("Attachments", isDirectory: true)
+            let stem = noteURL.deletingPathExtension().lastPathComponent
+            if stem.count > 37, let uuid = UUID(uuidString: String(stem.suffix(36))) {
+                let dir = attachmentsRoot.appendingPathComponent(uuid.uuidString, isDirectory: true)
+                if fm.fileExists(atPath: dir.path) {
+                    attachmentFolders.insert(dir)
+                }
+            }
+            for linked in linkedAttachments(in: noteText, relativeTo: noteURL) {
+                let parent = linked.url.deletingLastPathComponent()
+                if parent.deletingLastPathComponent().path == attachmentsRoot.path,
+                   UUID(uuidString: parent.lastPathComponent) != nil {
+                    attachmentFolders.insert(parent)
+                }
+            }
+
+            try removeOrTrash(noteURL, moveToTrash: moveToTrash)
+            for folder in attachmentFolders.sorted(by: { $0.path < $1.path }) where fm.fileExists(atPath: folder.path) {
+                try validate(folder, beneath: root)
+                try removeOrTrash(folder, moveToTrash: moveToTrash)
+            }
+            return checkpoint
+        }
+    }
+
+    private func removeOrTrash(_ url: URL, moveToTrash: Bool) throws {
+        try validate(url, beneath: root)
+        if moveToTrash {
+            do {
+                try fm.trashItem(at: url, resultingItemURL: nil)
+                return
+            } catch {
+                // Fall back to direct removal when the volume does not support Trash
+            }
+        }
+        try fm.removeItem(at: url)
+    }
+
     public func attach(_ attachments: [URL], to noteURL: URL, text: String, expectedContent: String) throws -> String {
         try synchronized {
             try validateNote(noteURL)
