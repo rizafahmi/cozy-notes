@@ -170,6 +170,25 @@ final class CaptureSearchTests: XCTestCase {
         XCTAssertEqual(snapshot.sources.first?.state, .pending)
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.companion("cancel.pdf").path))
     }
+
+    func testProjectRepositorySearchIndexesOnlyMarkdownAndManagedFolders() throws {
+        let fixture = try Fixture(); defer { fixture.cleanup() }
+        let fm = FileManager.default
+        try fm.createDirectory(at: fixture.file(".git"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fixture.file("node_modules/pkg"), withIntermediateDirectories: true)
+        try "# Dependency Readme\nHidden from search".write(to: fixture.file("node_modules/pkg/README.md"), atomically: true, encoding: .utf8)
+        try fm.createDirectory(at: fixture.file("Sources"), withIntermediateDirectories: true)
+        try "let token = \"SWIFT_SOURCE_ONLY\"".write(to: fixture.file("Sources/main.swift"), atomically: true, encoding: .utf8)
+        try Data([1, 2, 3]).write(to: fixture.file("Sources/archive.zip"))
+        try fm.createDirectory(at: fixture.file("docs"), withIntermediateDirectories: true)
+        try "# Harness Spec\nThinking companion architecture".write(to: fixture.file("docs/SPEC.md"), atomically: true, encoding: .utf8)
+
+        let snapshot = try CaptureSearch(vault: fixture.vault).scan()
+        XCTAssertEqual(snapshot.sources.map(\.relativePath), ["docs/SPEC.md"])
+        XCTAssertEqual(snapshot.search("Thinking companion").first?.source.title, "Harness Spec")
+        XCTAssertTrue(snapshot.search("SWIFT_SOURCE_ONLY").isEmpty)
+        XCTAssertTrue(snapshot.search("Dependency").isEmpty)
+    }
 }
 
 #if canImport(Testing)
@@ -210,6 +229,11 @@ struct CaptureSearchSuite {
     @Test("Cancellation before commit creates no companion")
     func cancellationBeforeCommit() throws {
         try CaptureSearchTests().testCancellationBeforeCommitCreatesNoCompanion()
+    }
+
+    @Test("Project repository search indexes only Markdown and managed folders")
+    func projectRepositorySearchScoping() throws {
+        try CaptureSearchTests().testProjectRepositorySearchIndexesOnlyMarkdownAndManagedFolders()
     }
 }
 #endif

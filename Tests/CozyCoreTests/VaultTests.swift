@@ -306,6 +306,59 @@ final class VaultTests: XCTestCase {
         XCTAssertEqual(try fixture.vault.read(createdResult.record.url), "# Architecture RFC\n\n")
         XCTAssertEqual(try fixture.vault.resolveNote(matching: "Architecture RFC")?.url, createdResult.record.url)
     }
+
+    func testProjectRepositoryPrunesBuildDirectoriesAndScopesToMarkdownAndManagedFolders() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let fm = FileManager.default
+
+        // Mark root as a project repository (.git + Package.swift)
+        try fm.createDirectory(at: fixture.root.appendingPathComponent(".git", isDirectory: true), withIntermediateDirectories: true)
+        try "// swift-tools-version: 5.9\n".write(to: fixture.root.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+        XCTAssertTrue(fixture.vault.isProjectRepository)
+
+        // Create Markdown docs at root and in docs/
+        let planURL = fixture.root.appendingPathComponent("PLAN.md")
+        let archURL = fixture.root.appendingPathComponent("docs/architecture.md")
+        try fm.createDirectory(at: archURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "# Execution Plan\nStep 1".write(to: planURL, atomically: true, encoding: .utf8)
+        try "# System Architecture\nLayers".write(to: archURL, atomically: true, encoding: .utf8)
+
+        // Create ignored directories (node_modules, build, target, vendor) containing .md files
+        for ignored in ["node_modules/pkg", "build/gen", "target/debug", "vendor/bundle", "DerivedData/Index"] {
+            let dir = fixture.root.appendingPathComponent(ignored, isDirectory: true)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try "# Ignored Dependency Doc\nNoise".write(to: dir.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        }
+
+        // Create repo source files and non-vault assets outside Attachments/
+        let srcDir = fixture.root.appendingPathComponent("Sources/App", isDirectory: true)
+        try fm.createDirectory(at: srcDir, withIntermediateDirectories: true)
+        try "struct App {}".write(to: srcDir.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        try Data([0, 1, 2, 3]).write(to: srcDir.appendingPathComponent("icon.png"))
+
+        // Capture a note with an attachment inside managed Inbox/ and Attachments/
+        let externalImg = fixture.workspace.appendingPathComponent("screenshot.png")
+        try Data([10, 20, 30]).write(to: externalImg)
+        let captured = try fixture.vault.capture(text: "# Captured Scratchpad\nNotes", attachments: [externalImg])
+
+        let noteURLs = Set(try fixture.vault.notes().map(\.url))
+        XCTAssertEqual(noteURLs, Set([planURL, archURL, captured.url]))
+
+        let sources = try fixture.vault.sourceFiles()
+        XCTAssertTrue(sources.contains(planURL))
+        XCTAssertTrue(sources.contains(archURL))
+        XCTAssertTrue(sources.contains(captured.url))
+        XCTAssertTrue(sources.contains { $0.lastPathComponent == "screenshot.png" && $0.path.contains("/Attachments/") })
+        XCTAssertFalse(sources.contains { $0.lastPathComponent == "main.swift" })
+        XCTAssertFalse(sources.contains { $0.lastPathComponent == "icon.png" })
+        XCTAssertFalse(sources.contains { $0.path.contains("/node_modules/") || $0.path.contains("/build/") || $0.path.contains("/target/") })
+
+        // Verify CAS save works for in-place external conflict resolution against reviewed disk content
+        try "# Execution Plan\nExternal Agent Edit".write(to: planURL, atomically: true, encoding: .utf8)
+        try fixture.vault.save("# Execution Plan\nUser Overwrite", to: planURL, expectedContent: "# Execution Plan\nExternal Agent Edit")
+        XCTAssertEqual(try fixture.vault.read(planURL), "# Execution Plan\nUser Overwrite")
+    }
 }
 
 #if canImport(Testing)
@@ -366,6 +419,11 @@ struct VaultCoreSuite {
     @Test("Wiki-links parse, resolve by title or stem, and create missing notes")
     func wikiLinksResolveAndCreate() throws {
         try VaultTests().testWikiLinkParsingResolutionAndNoteCreation()
+    }
+
+    @Test("Project repository prunes build/dependency dirs and scopes indexing to Markdown and managed folders")
+    func projectRepositoryScoping() throws {
+        try VaultTests().testProjectRepositoryPrunesBuildDirectoriesAndScopesToMarkdownAndManagedFolders()
     }
 }
 #endif

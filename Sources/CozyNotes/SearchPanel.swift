@@ -858,6 +858,9 @@ private final class SearchHitCell: NSTableCellView {
             badge.textColor = Theme.subtle
         }
 
+        let customPathPrefix: String? = (source.kind == .note && !source.relativePath.hasPrefix("Inbox/"))
+            ? source.relativePath
+            : nil
         if hit.highlights.isEmpty {
             var preview = hit.snippet
             if source.kind == .note {
@@ -866,10 +869,22 @@ private final class SearchHitCell: NSTableCellView {
             if preview.isEmpty {
                 preview = source.kind == .note ? "No additional text" : source.detail
             }
-            snippet.attributedStringValue = NSAttributedString(
-                string: preview,
-                attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.muted]
-            )
+            if let customPathPrefix {
+                let combined = NSMutableAttributedString(
+                    string: "\(customPathPrefix) · ",
+                    attributes: [.font: Theme.monoFont(10.5, weight: .medium), .foregroundColor: Theme.subtle]
+                )
+                combined.append(NSAttributedString(
+                    string: preview,
+                    attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.muted]
+                ))
+                snippet.attributedStringValue = combined
+            } else {
+                snippet.attributedStringValue = NSAttributedString(
+                    string: preview,
+                    attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.muted]
+                )
+            }
         } else {
             let text = NSMutableAttributedString(
                 string: hit.snippet,

@@ -183,6 +183,13 @@ public final class Vault: @unchecked Sendable {
         }
     }
 
+
+    public var isProjectRepository: Bool {
+        synchronized {
+            Self.isRepositoryDirectory(root, fileManager: fm)
+        }
+    }
+
     /// Creates a recovery checkpoint, then moves the note and its dedicated `Attachments/<uuid>` folder to Trash (or removes them if Trash is unavailable or disabled).
     @discardableResult
     public func delete(_ noteURL: URL, moveToTrash: Bool = true) throws -> VaultSnapshot {
@@ -694,6 +701,10 @@ public final class Vault: @unchecked Sendable {
 
     private func files(under directory: URL) throws -> [URL] {
         try validate(directory, beneath: directory)
+        let isRepo = Self.isRepositoryDirectory(root, fileManager: fm)
+        let inboxRoot = root.appendingPathComponent("Inbox", isDirectory: true)
+        let attachmentsRoot = root.appendingPathComponent("Attachments", isDirectory: true)
+        let extractedRoot = root.appendingPathComponent("Extracted Text", isDirectory: true)
         var enumerationError: Error?
         guard let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: [.isSymbolicLinkKey, .isRegularFileKey, .isDirectoryKey], options: [.skipsHiddenFiles], errorHandler: { _, error in
             enumerationError = error
@@ -703,11 +714,26 @@ public final class Vault: @unchecked Sendable {
         for case let url as URL in enumerator {
             let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey, .isDirectoryKey])
             if values.isSymbolicLink == true { enumerator.skipDescendants(); continue }
+            if isRepo && values.isDirectory == true {
+                if Self.ignoredDirectoryNames.contains(url.lastPathComponent.lowercased()) {
+                    enumerator.skipDescendants()
+                    continue
+                }
+            }
             if values.isRegularFile == true {
                 // FileManager enumeration can return physical aliases (e.g. /private/tmp)
                 // while Foundation resolves the root to /tmp. Links were rejected above.
                 let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
                 try validate(canonical, beneath: directory)
+                if isRepo {
+                    let inManagedSubfolder = Self.contains(canonical, in: inboxRoot)
+                        || Self.contains(canonical, in: attachmentsRoot)
+                        || Self.contains(canonical, in: extractedRoot)
+                    if !inManagedSubfolder {
+                        let ext = canonical.pathExtension.lowercased()
+                        guard ext == "md" || ext == "markdown" else { continue }
+                    }
+                }
                 result.append(canonical)
             }
         }
@@ -821,5 +847,36 @@ public final class Vault: @unchecked Sendable {
     }
 
     private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "svg", "avif", "ico"]
+
+    public static let ignoredDirectoryNames: Set<String> = [
+        "node_modules", "target", "build", "dist", "out", "vendor",
+        "pods", "deriveddata", "carthage", "__pycache__", "venv",
+        "coverage", "bin", "obj", "gradle", "cmake-build-debug", "cmake-build-release"
+    ]
+
+    public static let ignoredSourceExtensions: Set<String> = [
+        "swift", "kt", "kts", "java", "c", "cc", "cpp", "h", "hpp", "m", "mm",
+        "rs", "go", "py", "pyc", "js", "jsx", "ts", "tsx", "mjs", "cjs",
+        "rb", "php", "cs", "sh", "bash", "zsh", "fish", "toml", "yaml", "yml",
+        "json", "jsonl", "xml", "plist", "gradle", "properties", "lock", "sum", "mod",
+        "pbxproj", "xcworkspacedata", "storyboard", "xib", "strings", "sql", "sqlite", "db",
+        "o", "a", "dylib", "so", "dll", "exe", "class", "jar", "aar", "apk", "ipa", "wasm", "map",
+        "css", "scss", "less", "html", "htm", "vue", "svelte"
+    ]
+
+    private static let repositoryMarkers: [String] = [
+        ".git", "Package.swift", "package.json", "Cargo.toml", "go.mod",
+        "pyproject.toml", "build.gradle", "build.gradle.kts", "pom.xml",
+        "Makefile", "CMakeLists.txt"
+    ]
+
+    private static func isRepositoryDirectory(_ directory: URL, fileManager: FileManager) -> Bool {
+        for marker in repositoryMarkers {
+            if fileManager.fileExists(atPath: directory.appendingPathComponent(marker).path) {
+                return true
+            }
+        }
+        return false
+    }
 
 }
