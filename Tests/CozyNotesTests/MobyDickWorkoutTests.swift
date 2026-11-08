@@ -457,5 +457,68 @@ struct MobyDickWorkoutSuite {
         #expect(editor.text == "- Adjustable point")
         #expect(editor.textView.bulletItems.first?.level == 0)
     }
+
+    @Test("Typing, newlines, and arrow navigation below the fold automatically scroll the cursor up with ~30% breathing room")
+    @MainActor
+    func belowTheFoldAutoScroll() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 320),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 640, height: 320))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        defer { window.orderOut(nil) }
+
+        let textView = editor.textView
+        let scrollView = try #require(textView.enclosingScrollView)
+        let clipView = scrollView.contentView
+        let visHeight = clipView.bounds.height
+
+        // Start with 20 lines so the bottom lines extend well below the 320pt window
+        let lines = (1...20).map { "Line number \($0) of the journal folio." }.joined(separator: "\n")
+        editor.text = lines
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+
+        // Scroll to top (originY = 0) while placing the cursor at the very end of line 20 (below the fold)
+        clipView.setBoundsOrigin(.zero)
+        scrollView.reflectScrolledClipView(clipView)
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        textView.doCommand(by: #selector(NSResponder.moveToEndOfDocument(_:)))
+        textView.completeScrollSpringImmediately()
+
+        // Navigating to the end below the fold must scroll clipView up so the caret sits at ~70% of visHeight (~30% breathing room below)
+        let caretAfterNav = textView.currentCaretRect()
+        let scrolledOriginAfterNav = clipView.bounds.origin.y
+        #expect(scrolledOriginAfterNav > 0, "Viewport should scroll down when cursor moves below the fold")
+        let bottomRoomAfterNav = (scrolledOriginAfterNav + visHeight) - caretAfterNav.maxY
+        #expect(abs(bottomRoomAfterNav - round(visHeight * 0.30)) <= 4.0, "Cursor should have ~30% viewport breathing room below it")
+
+        // Typing new lines at the end of the document keeps scrolling up and expanding document height to preserve ~30% breathing room
+        let originBeforeNewlines = clipView.bounds.origin.y
+        for i in 1...4 {
+            textView.insertText("\nAppended line \(i) below the fold", replacementRange: textView.selectedRange())
+        }
+        textView.completeScrollSpringImmediately()
+        let caretAfterTyping = textView.currentCaretRect()
+        let originAfterTyping = clipView.bounds.origin.y
+        #expect(originAfterTyping > originBeforeNewlines, "Typing new lines at the bottom must continue scrolling up")
+        let bottomRoomAfterTyping = (originAfterTyping + visHeight) - caretAfterTyping.maxY
+        let minComfortRoom = max(28.0, min(56.0, round(visHeight * 0.12))) - 2.0
+        let maxTypewriterRoom = round(visHeight * 0.30) + 4.0
+        #expect(bottomRoomAfterTyping >= minComfortRoom && bottomRoomAfterTyping <= maxTypewriterRoom, "Even on the last line, cursor must stay inside the typewriter comfort band")
+
+        // Typing while already inside the comfort zone must not jump the scroll origin
+        let steadyOrigin = clipView.bounds.origin.y
+        textView.insertText("!", replacementRange: textView.selectedRange())
+        #expect(abs(clipView.bounds.origin.y - steadyOrigin) < 0.01, "Same-line typing inside the comfort zone must remain steady")
+    }
 }
 #endif

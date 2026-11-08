@@ -96,8 +96,17 @@ import CozyCore
     private var caretAnimationSeq: UInt64 = 0
     private var caretBlinkWorkItem: DispatchWorkItem?
     private var caretBlinkOn = true
+    private(set) var scrollSpringTargetY: CGFloat?
+    private var scrollSpringVelocityY: CGFloat = 0
+    private var scrollSpringWorkItem: DispatchWorkItem?
+    private var lastEditWasLarge = false
+    private var minimumOverscrollHeight: CGFloat = 0
     private var windowFocusObservers: [NSObjectProtocol] = []
     var suppressCaretUpdates = false
+    override func setFrameSize(_ newSize: NSSize) {
+        let clampedHeight = max(newSize.height, minimumOverscrollHeight)
+        super.setFrameSize(NSSize(width: newSize.width, height: clampedHeight))
+    }
 
     override func setNeedsDisplay(_ invalidRect: NSRect, avoidAdditionalLayout flag: Bool) {
         if enclosingScrollView != nil {
@@ -365,6 +374,7 @@ import CozyCore
         let repLen = repNS.length
         let delta = repLen - affectedCharRange.length
         let isLargeEdit = affectedCharRange.length > 4096 || repLen > 4096
+        lastEditWasLarge = isLargeEdit
         var requiresFullFormat = isLargeEdit || !fencedBlocks.isEmpty
         if !requiresFullFormat {
             if affectedCharRange.length > 0 {
@@ -414,8 +424,6 @@ import CozyCore
     }
 
     override func insertText(_ string: Any, replacementRange: NSRange) {
-        let clipView = enclosingScrollView?.contentView
-        let savedOriginY = clipView?.bounds.origin.y
         let str: String
         if let s = string as? String {
             str = s
@@ -426,14 +434,6 @@ import CozyCore
         }
         let targetRange = replacementRange.location == NSNotFound ? selectedRange() : replacementRange
         applyUndoableReplacement(in: targetRange, with: str)
-        if let clipView, let savedOriginY, abs(clipView.bounds.origin.y - savedOriginY) > 0.01 {
-            let caret = currentCaretRect()
-            let visTop = savedOriginY
-            let visBottom = savedOriginY + clipView.bounds.height
-            if caret.minY >= visTop + 8 && caret.maxY <= visBottom - 8 {
-                clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: savedOriginY))
-            }
-        }
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -598,6 +598,7 @@ import CozyCore
 
     override func scrollRangeToVisible(_ range: NSRange) {
         autoreleasepool {
+            cancelScrollSpring()
             super.scrollRangeToVisible(range)
         }
     }
@@ -1092,11 +1093,18 @@ import CozyCore
                 target.applyUndoableReplacement(in: inverseRange, with: previousString, selectedRangeAfter: restoreSelection)
             }
 
+            let clipView = enclosingScrollView?.contentView
+            let savedOriginY = clipView?.bounds.origin.y
+
             editorUndoManager.disableUndoRegistration()
             storage.beginEditing()
             storage.replaceCharacters(in: safeRange, with: replacement)
             storage.endEditing()
             editorUndoManager.enableUndoRegistration()
+
+            if let clipView, let savedOriginY, abs(clipView.bounds.origin.y - savedOriginY) > 0.01 {
+                clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: savedOriginY))
+            }
 
             let nextSelection = selectedRangeAfter ?? NSRange(location: safeRange.location + repLen, length: 0)
             setSelectedRange(nextSelection)
@@ -1105,9 +1113,14 @@ import CozyCore
     }
 
     override func didChangeText() {
+        let wasLarge = lastEditWasLarge
+        lastEditWasLarge = false
         isEditingText = false
         super.didChangeText()
         updateCaret(animated: true)
+        if !wasLarge && !suppressCaretUpdates {
+            ensureCaretVisible(animated: true, useTypewriterStep: true)
+        }
     }
 
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
@@ -1116,9 +1129,152 @@ import CozyCore
         updateCaret(animated: !stillSelectingFlag)
     }
 
+    override func doCommand(by selector: Selector) {
+        super.doCommand(by: selector)
+        guard !suppressCaretUpdates && !isEditingText,
+              window?.firstResponder === self,
+              selectedRange().length == 0 else { return }
+        ensureCaretVisible(animated: true, useTypewriterStep: true)
+    }
+
     func resetCaretPosition() {
         hasCaretOrigin = false
+        minimumOverscrollHeight = 0
         caretLayer.removeAllAnimations()
+        cancelScrollSpring()
+    }
+
+    func cancelScrollSpring() {
+        scrollSpringWorkItem?.cancel()
+        scrollSpringWorkItem = nil
+        scrollSpringTargetY = nil
+        scrollSpringVelocityY = 0
+    }
+
+    func completeScrollSpringImmediately() {
+        guard let targetY = scrollSpringTargetY,
+              let scrollView = enclosingScrollView else { return }
+        let clipView = scrollView.contentView
+        cancelScrollSpring()
+        clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: targetY))
+        scrollView.reflectScrolledClipView(clipView)
+    }
+
+    /// Ensures the active insertion caret stays inside the visible viewport comfort zone.
+    /// When the caret moves below the fold, scrolls up with a ~30% viewport typewriter breathing margin below the cursor.
+    func ensureCaretVisible(animated: Bool, useTypewriterStep: Bool = true) {
+        guard !suppressCaretUpdates,
+              let scrollView = enclosingScrollView else { return }
+        let clipView = scrollView.contentView
+        let visHeight = clipView.bounds.height
+        guard visHeight > 60 else { return }
+
+        let caret = currentCaretRect()
+        guard caret.height > 0 else { return }
+
+        let currentY = scrollSpringTargetY ?? clipView.bounds.origin.y
+        let topMargin = max(20.0, min(44.0, round(visHeight * 0.08)))
+        let bottomMargin = max(28.0, min(56.0, round(visHeight * 0.12)))
+        let topBound = currentY + topMargin
+        let bottomBound = currentY + visHeight - bottomMargin
+
+        if caret.minY >= topBound && caret.maxY <= bottomBound {
+            return
+        }
+
+        let desiredY: CGFloat
+        if caret.maxY > bottomBound {
+            if !useTypewriterStep && caret.maxY <= currentY + visHeight {
+                return
+            }
+            let breathingRoom = useTypewriterStep ? round(visHeight * 0.30) : bottomMargin
+            desiredY = max(0, round(caret.maxY - (visHeight - breathingRoom)))
+            let requiredDocHeight = desiredY + visHeight
+            if requiredDocHeight > minimumOverscrollHeight {
+                minimumOverscrollHeight = requiredDocHeight
+            }
+            if frame.height < requiredDocHeight {
+                setFrameSize(NSSize(width: frame.width, height: requiredDocHeight))
+            }
+        } else {
+            if !useTypewriterStep && caret.minY >= currentY {
+                return
+            }
+            let topRoom = useTypewriterStep ? round(visHeight * 0.20) : topMargin
+            desiredY = max(0, round(caret.minY - topRoom))
+        }
+
+        smoothScrollClipView(to: desiredY, animated: animated)
+    }
+
+    private func smoothScrollClipView(to targetY: CGFloat, animated: Bool) {
+        guard let scrollView = enclosingScrollView else { return }
+        let clipView = scrollView.contentView
+        let visHeight = clipView.bounds.height
+        let currentY = clipView.bounds.origin.y
+        guard abs(targetY - currentY) > 0.5 else {
+            cancelScrollSpring()
+            return
+        }
+
+        let canAnimate = animated
+            && (window?.isVisible ?? false)
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            && abs(targetY - currentY) <= visHeight * 1.5
+
+        guard canAnimate else {
+            cancelScrollSpring()
+            clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: targetY))
+            scrollView.reflectScrolledClipView(clipView)
+            return
+        }
+
+        scrollSpringTargetY = targetY
+        stepScrollSpring()
+    }
+
+    private func stepScrollSpring() {
+        scrollSpringWorkItem?.cancel()
+        scrollSpringWorkItem = nil
+        guard let targetY = scrollSpringTargetY,
+              let scrollView = enclosingScrollView else {
+            cancelScrollSpring()
+            return
+        }
+        let clipView = scrollView.contentView
+        let currentY = clipView.bounds.origin.y
+        let displacement = currentY - targetY
+
+        // Analytical critically-damped spring (response = 0.14s, dampingRatio = 1.0) at dt = 1/120s
+        let dt: CGFloat = 1.0 / 120.0
+        let response: CGFloat = 0.14
+        let omega: CGFloat = (2.0 * .pi) / response
+        let expTerm = exp(-omega * dt)
+        let v0 = scrollSpringVelocityY
+        let c1 = displacement
+        let c2 = v0 + omega * c1
+        let nextDisp = (c1 + c2 * dt) * expTerm
+        let nextVel = (c2 - omega * (c1 + c2 * dt)) * expTerm
+        let nextY = targetY + nextDisp
+
+        if abs(nextDisp) < 0.5 && abs(nextVel) < 8.0 {
+            cancelScrollSpring()
+            clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: targetY))
+            scrollView.reflectScrolledClipView(clipView)
+            return
+        }
+
+        scrollSpringVelocityY = nextVel
+        clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: round(nextY * 2) / 2))
+        scrollView.reflectScrolledClipView(clipView)
+
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.stepScrollSpring()
+            }
+        }
+        scrollSpringWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + dt, execute: work)
     }
 
     private func ensureCaretSublayer() {
@@ -1147,8 +1303,14 @@ import CozyCore
         let caretWidth: CGFloat = 2.0
         if len > 0 {
             let ensureLoc = min(charIdx, len - 1)
-            let ensureRange = ns.lineRange(for: NSRange(location: ensureLoc, length: 0))
-            lm.ensureLayout(forCharacterRange: ensureRange)
+            let lineRange = ns.lineRange(for: NSRange(location: ensureLoc, length: 0))
+            if len <= 100_000 && lineRange.location > 0 {
+                let startLoc = lineRange.location - 1
+                let fullEnsure = ns.lineRange(for: NSRange(location: startLoc, length: NSMaxRange(lineRange) - startLoc))
+                lm.ensureLayout(forCharacterRange: fullEnsure)
+            } else {
+                lm.ensureLayout(forCharacterRange: lineRange)
+            }
         }
 
         let fallbackFont = (typingAttributes[.font] as? NSFont) ?? font ?? Theme.bodyFont()
