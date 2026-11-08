@@ -15,7 +15,7 @@ open '.build-app/Cozy Notes.app'
 
 Use `scripts/build-macos.sh release` for an optimized build. The bundle is locally ad-hoc signed, not notarized for distribution. Rebuilding replaces only the generated bundle under `.build-app/`, never your notes folder.
 
-The app initially uses `~/Documents/Cozy Notes`. **Find → Change folder…** (or **File → Choose Notes Folder…**) selects another collection; **Open folder** opens it in Finder. To launch with an explicit collection:
+The app initially uses `~/Documents/Cozy Notes`. The sidebar menu (`⋯`) or **File → Choose Notes Folder…** selects another collection; **Open Notes Folder** opens it in Finder. To launch with an explicit collection:
 
 ```sh
 open '.build-app/Cozy Notes.app' --args --vault '/path/to/notes'
@@ -23,26 +23,28 @@ open '.build-app/Cozy Notes.app' --args --vault '/path/to/notes'
 
 `COZY_VAULT` also overrides the device-local folder preference. Existing files—including legacy `AGENTS.md`—are not removed. New collections no longer generate agent instructions, and existing `AGENTS.md` files are excluded from notes/search, not from recovery snapshots.
 
-### Capture and Find
+### Workspace and Live Notes
 
-The workspace starts in **Capture**: a writing area, attachments, and **Keep capture**, without search or maintenance controls. **Find** replaces that screen with search and results; a blank query shows the most recently modified sources first.
+The workspace is designed as a tactile commonplace book: an index desk on the left with lifted index slips, and an inset journal folio page on the right with a scholarly vertical margin rule, monospace dateline header, and a centered ~640pt reading column.
 
-The native notebook treatment follows the system's light/dark appearance: warm paper surfaces, serif headings, a coral primary action, and clearly outlined result selection. Capture shows bounded screenshot thumbnails and removable file cards in a horizontally scrollable tray; image previews are downsampled, not decoded at full resolution. Find uses source-type icons without loading image previews for every search result. Custom surfaces are opaque and mode changes are immediate, without added motion or transparency.
+Two curated atmospheres (**Obsidian & Ivory** and **Midnight Ink & Porcelain**) and four long-form writing voices (**Avenir Next + New York**, **Charter Book Serif**, **Iowan Old Style**, and **SF Mono Typewriter**) are built in. The editor uses a three-tier ink luminance hierarchy (luminous heading/bold ink, zero-halation body prose ink, and muted callout ink), element-specific paragraph rhythm (airy prose leading, grouped checklists with hanging indents, and compact code blocks), scholarly `H1`–`H3` left-gutter badges, custom-drawn blockquote ink bars, and monospace reading-time telemetry.
 
-- **Command–1 / Command–2:** switch to Capture / Find. Switching preserves the unsaved capture's text, attachments, and undo history; it does not save or clear the draft.
-- **Command–F:** open Find's results and focus search. Find retains its query, selection, and scroll position when returning from a note.
-- **Command–Return:** keep the capture, or save changes while explicitly editing a note.
-- **Command–N:** keep the current capture draft and pending note edits, then start a fresh capture.
-- Paste an image, drop files, or use **Attach…** in Capture. Attachment cards preview images and show filenames; removing a card detaches it from the draft without deleting the source file.
-- Opening a Markdown result shows a read-only note. **Edit note** enables editing; **Done editing** saves and returns to reading. **← Results** returns to the same search.
-- Existing `.md` and `.markdown` notes autosave after editing. Detected external edits are never silently replaced: **Keep as new note** preserves local edits separately, without touching the Capture draft.
-- Incoming and reorganized files are discovered through filesystem events. Existing-note editing is text-only; capture new attachments as new notes.
-- Closing the workspace, quitting, or changing folders saves pending note edits and the Capture draft; failures keep the workspace open. Unsaved drafts are held in memory, not crash-recovery storage.
-- **Command–Shift–Space:** global quick capture, independent of the workspace mode and without Accessibility permission. Shortcut conflicts are reported. **Escape** tucks it away without clearing its draft; saving closes it and restores focus to the previous application.
+- **Live continuous writing:** typing in the main editor writes and autosaves directly to the active note in place—your note never vanishes after saving, and there is no read-only lock on Markdown notes.
+- **Command–N:** save any pending edits and start a fresh note in the editor.
+- **Command–\\:** toggle the index sidebar to enter or leave distraction-free Focus Mode.
+- **Command–Shift–Y (or click `Aa AVENIR` / `CHARTER` / `IOWAN` / `MONO` in the folio header):** cycle through the four writing voices.
+- **Command–Plus / Command–Minus / Command–0:** scale the editor writing size up, down, or back to default.
+- **Command–Shift–D:** toggle Light / Dark appearance directly inside Cozy Notes.
+- **Command–Shift–T (or click `OBSIDIAN` / `MIDNIGHT` in the folio header):** switch between **Obsidian & Ivory** and **Midnight Ink & Porcelain** atmospheres.
+- **Command–F (or Command–2):** reveal the sidebar and focus the search bar. **Command–1** focuses the note editor.
+- **Command–S / Command–Return:** save the active note immediately (or keep the capture in Quick Capture).
+- **Attachments in any note:** paste an image, drop files, or click **Attach** on either a brand-new note or an existing note. Files are copied into `Attachments/<note-uuid>/`, relative Markdown links are appended, and interactive preview pills appear at the bottom of the editor. Clicking an attachment pill opens the file; clicking `×` removes the link from the note without deleting the file on disk.
+- **Conflict safety:** detected external edits are never silently overwritten; **Keep as new note** preserves local edits as a separate note.
+- **Command–Shift–Space:** global floating Quick Capture, independent of the main workspace and without Accessibility permission. **Escape** tucks it away without clearing its draft; **Command–Return** saves and restores focus to the previous application.
 
 ### Make searchable
 
-Keep the capture first, then open **Find**. A contextual notice offers **Make searchable** for pending sources or **Retry extraction** for eligible failed extractions; it disappears when no processing action is needed. **File → Make Searchable** is also available. Processing is manual and runs off the UI thread on the Mac. Typing into search does not start extraction, and switching back to Capture does not cancel an active job.
+When pending PDFs or images exist in the collection, a compact notice in the sidebar offers **Make searchable** (or **Retry** for eligible failed extractions) and disappears when no action is needed. **File → Make Searchable** is also available. Processing is manual and runs off the UI thread on the Mac.
 
 | Source | Search behavior |
 | --- | --- |
@@ -54,7 +56,7 @@ Keep the capture first, then open **Find**. A contextual notice offers **Make se
 
 Search is case-insensitive and uses the original language. Whitespace-separated terms must all occur in the same text document or PDF page; partial words are allowed. Filename/path matching is a fallback. There is no translation, semantic search, or generated answer pretending to be a match.
 
-Results show source type/title, highlighted text, relative path, readiness, and PDF page where relevant. **Open original**, double-click, or Return opens a result. Markdown opens in Find's read-only note view, with explicit editing available; PDFs, images, and text files use the system's default viewer. PDF page references are displayed, but the viewer is not guaranteed to jump to that page.
+Results show title, highlighted snippet (or clean body preview when browsing), relative date/readiness badge, and PDF page where relevant. Clicking a Markdown note in the sidebar opens it immediately in the editor; double-clicking, pressing Return, or clicking **Open ↗** opens PDFs, images, and text files in the system's default viewer. PDF page references are displayed, but the viewer is not guaranteed to jump to that page.
 
 Pending, partial, unreadable, and unsupported sources remain visible when browsing. A no-match message explains pending extraction. Scanned PDFs are not OCRed; mixed PDFs retain searchable selectable-text pages and identify missing pages. Encrypted/corrupt PDFs, blank or damaged images, and non-UTF-8 text receive explicit statuses. Native OCR can misrecognize text; use the original to verify it.
 

@@ -6,6 +6,13 @@ import CozySearch
 @MainActor
 final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     var onOpenNote: ((URL) -> Void)?
+    var onNewNote: (() -> Void)?
+    var onToggleSidebar: (() -> Void)?
+    var onToggleAppearance: (() -> Void)?
+    var onSwitchAtmosphere: ((Theme.Atmosphere) -> Void)?
+    var onRevealFolder: (() -> Void)?
+    var onChooseFolder: (() -> Void)?
+    var onShowRecovery: (() -> Void)?
     var onStatus: ((String) -> Void)?
     var isProcessing: Bool { busy }
     var isExtracting: Bool { extracting }
@@ -14,22 +21,25 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private let engine: CaptureSearch
     private let queue = DispatchQueue(label: "CozyNotes.capture-search", qos: .userInitiated)
     private let lifetime = SearchCancellation()
-    private let field = NSSearchField()
+    private let searchBar = CozySearchBar()
+    private var field: NSSearchField { searchBar.field }
     private let table = SearchResultsTable()
-    private let status = Theme.label("Loading local sources…", size: 11)
-    private let empty = Theme.label("Loading local sources…")
+    private let status = Theme.label("LOADING…", size: 10.5, color: Theme.subtle)
+    private let empty = Theme.label("Loading…", size: 12.5, color: Theme.muted)
     private let progress = NSProgressIndicator()
     private let processingRow = NSStackView()
-    private let processingNotice = PaperSurface(cornerRadius: 12, color: Theme.accentSoft, bordered: false)
-    private let processingLabel = Theme.label("", size: 12)
-    private let recentLabel = Theme.label("RECENT CAPTURES", size: 11)
+    private let processingNotice = PaperSurface(cornerRadius: 8, color: Theme.accentSoft, bordered: false)
+    private let processingLabel = Theme.label("", size: 11, color: Theme.ink)
     private var renderedQuery: String?
-    private var makeButton: NSButton!
-    private var cancelButton: NSButton!
-    private var openButton: NSButton!
+    private var makeButton: QuietButton!
+    private var cancelButton: QuietButton!
+    private var openButton: QuietButton!
+    private var moreButton: QuietButton!
     private var snapshot: SearchSnapshot?
     private var hits: [SearchHit] = []
     private var stamps: [URL: SearchFileStamp] = [:]
+    private var activeNoteURL: URL?
+    private var suppressSelectionAction = false
     private var scheduledRefresh: DispatchWorkItem?
     private var operation: SearchCancellation?
     private var busy = false
@@ -42,27 +52,54 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         self.vault = vault
         engine = CaptureSearch(vault: vault)
         super.init(frame: .zero)
-        field.placeholderString = "Words, filenames, a half-remembered thought…"
+
+        let sectionStamp = Theme.label("INDEX", size: 10, color: Theme.subtle)
+        sectionStamp.font = Theme.monoFont(10, weight: .semibold)
+
+        let appearanceBtn = QuietButton(symbol: "circle.lefthalf.filled", target: self, action: #selector(toggleAppearanceTapped))
+        appearanceBtn.toolTip = "Switch Light / Dark appearance"
+        appearanceBtn.setAccessibilityLabel("Switch appearance")
+
+        let toggleSidebar = QuietButton(symbol: "sidebar.left", target: self, action: #selector(toggleSidebarTapped))
+        toggleSidebar.toolTip = "Hide or show index (⌘\\)"
+        toggleSidebar.setAccessibilityLabel("Toggle sidebar")
+
+        let newNote = QuietButton(symbol: "square.and.pencil", target: self, action: #selector(newNoteTapped))
+        newNote.tint = Theme.accent
+        newNote.toolTip = "New folio note (⌘N)"
+        newNote.setAccessibilityLabel("New note")
+
+        let headerSpacer = NSView()
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let headerBar = Theme.stack([sectionStamp, headerSpacer, appearanceBtn, toggleSidebar, newNote], spacing: 2)
+
+        field.placeholderString = "Filter notes & clippings…"
         field.delegate = self
         field.target = self
         field.action = #selector(openSelected)
-        field.sendsWholeSearchString = true
-        field.sendsSearchStringImmediately = false
+        field.sendsWholeSearchString = false
+        field.sendsSearchStringImmediately = true
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        field.controlSize = .large
-        field.font = .systemFont(ofSize: 14)
-        field.setAccessibilityLabel("Search captures")
-        makeButton = Theme.button("Make searchable", target: self, action: #selector(makeSearchable))
+        field.setAccessibilityLabel("Search notes and files")
+
+        makeButton = QuietButton(title: "Index", target: self, action: #selector(makeSearchable))
+        makeButton.tint = Theme.accent
+        makeButton.font = .systemFont(ofSize: 11, weight: .semibold)
         makeButton.toolTip = "Extract selectable PDF text and recognize screenshot text locally. Originals are preserved."
-        cancelButton = Theme.button("Cancel", target: self, action: #selector(cancelExtraction))
+
+        cancelButton = QuietButton(title: "Stop", target: self, action: #selector(cancelExtraction))
+        cancelButton.font = .systemFont(ofSize: 11, weight: .medium)
         cancelButton.isHidden = true
-        openButton = Theme.button("Open original", target: self, action: #selector(openSelected))
-        openButton.isEnabled = false
-        let toolbar = Theme.stack([field, openButton], spacing: 10)
-        let heading = Theme.label("Find a little something.", size: 29, color: Theme.ink)
-        heading.font = Theme.displayFont(29)
-        let hint = Theme.label("Search your notes and files, in their original words.", size: 12)
-        hint.lineBreakMode = .byTruncatingTail
+
+        openButton = QuietButton(title: "Open ↗", target: self, action: #selector(openSelected))
+        openButton.font = .systemFont(ofSize: 11, weight: .medium)
+        openButton.toolTip = "Open selected item"
+        openButton.isHidden = true
+
+        moreButton = QuietButton(symbol: "ellipsis.circle", target: self, action: #selector(showMoreMenu(_:)))
+        moreButton.toolTip = "Collection options, folder, and recovery"
+        moreButton.setAccessibilityLabel("Collection options")
+
         processingLabel.lineBreakMode = .byTruncatingTail
         processingLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let processingSpacer = NSView()
@@ -70,68 +107,90 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         processingRow.orientation = .horizontal
         processingRow.alignment = .centerY
         processingRow.distribution = .fill
-        processingRow.spacing = 8
+        processingRow.spacing = 6
         for view in [processingLabel, processingSpacer, makeButton!, cancelButton!] { processingRow.addArrangedSubview(view) }
-        Theme.fill(processingRow, in: processingNotice, inset: 10)
+        Theme.fill(processingRow, in: processingNotice, inset: 8)
         processingNotice.isHidden = true
-        recentLabel.font = .systemFont(ofSize: 10, weight: .semibold)
-        let top = Theme.stack([heading, hint, toolbar, processingNotice, recentLabel], orientation: .vertical, spacing: 10)
-        toolbar.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
-        hint.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
+
+        let top = Theme.stack([searchBar, processingNotice], orientation: .vertical, spacing: 8)
+        searchBar.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
         processingNotice.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
-        field.heightAnchor.constraint(equalToConstant: 36).isActive = true
-        progress.style = .bar
+
+        progress.style = .spinning
+        progress.controlSize = .small
         progress.isIndeterminate = true
         progress.isHidden = true
+        progress.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        progress.heightAnchor.constraint(equalToConstant: 14).isActive = true
+
+        status.font = Theme.monoFont(10, weight: .medium)
         status.lineBreakMode = .byTruncatingMiddle
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let footer = Theme.stack([progress, status], spacing: 8)
-        progress.widthAnchor.constraint(equalToConstant: 85).isActive = true
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = Theme.stack([progress, status, footerSpacer, openButton, moreButton], spacing: 6)
+        let footerDivider = HairlineView()
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("source"))
         table.addTableColumn(column)
         table.headerView = nil
-        table.rowHeight = 120
-        table.intercellSpacing = NSSize(width: 0, height: 8)
-        table.backgroundColor = Theme.canvas
+        table.style = .plain
+        table.rowHeight = 74
+        table.intercellSpacing = NSSize(width: 0, height: 3)
+        table.backgroundColor = .clear
         table.selectionHighlightStyle = .regular
         table.allowsEmptySelection = true
         table.delegate = self
         table.dataSource = self
         table.target = self
+        table.action = #selector(rowClicked)
         table.doubleAction = #selector(openSelected)
         table.onReturn = { [weak self] in self?.openSelected() }
         let scroll = NSScrollView()
+        scroll.verticalScroller = CozyScroller()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
         scroll.drawsBackground = false
+
         empty.alignment = .center
-        empty.maximumNumberOfLines = 3
+        empty.maximumNumberOfLines = 4
         let results = NSView()
         Theme.fill(scroll, in: results)
         empty.translatesAutoresizingMaskIntoConstraints = false
         results.addSubview(empty)
         NSLayoutConstraint.activate([
-            empty.leadingAnchor.constraint(equalTo: results.leadingAnchor, constant: 16),
-            empty.trailingAnchor.constraint(equalTo: results.trailingAnchor, constant: -16),
+            empty.leadingAnchor.constraint(equalTo: results.leadingAnchor, constant: 18),
+            empty.trailingAnchor.constraint(equalTo: results.trailingAnchor, constant: -18),
             empty.centerYAnchor.constraint(equalTo: results.centerYAnchor)
         ])
-        for view in [top, results, footer] {
+
+        for view in [headerBar, top, results, footerDivider, footer] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
         NSLayoutConstraint.activate([
-            top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
-            top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
-            top.topAnchor.constraint(equalTo: topAnchor, constant: 22),
-            field.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
-            results.leadingAnchor.constraint(equalTo: top.leadingAnchor),
-            results.trailingAnchor.constraint(equalTo: top.trailingAnchor),
-            results.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 12),
-            results.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -6),
-            footer.leadingAnchor.constraint(equalTo: top.leadingAnchor),
-            footer.trailingAnchor.constraint(equalTo: top.trailingAnchor),
-            footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8)
+            headerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 78),
+            headerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            headerBar.heightAnchor.constraint(equalToConstant: 28),
+            top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            top.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 6),
+            searchBar.heightAnchor.constraint(equalToConstant: 30),
+            results.leadingAnchor.constraint(equalTo: leadingAnchor),
+            results.trailingAnchor.constraint(equalTo: trailingAnchor),
+            results.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 8),
+            results.bottomAnchor.constraint(equalTo: footerDivider.topAnchor),
+            footerDivider.leadingAnchor.constraint(equalTo: leadingAnchor),
+            footerDivider.trailingAnchor.constraint(equalTo: trailingAnchor),
+            footerDivider.heightAnchor.constraint(equalToConstant: 1),
+            footerDivider.bottomAnchor.constraint(equalTo: footer.topAnchor),
+            footer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+            footer.heightAnchor.constraint(equalToConstant: 30)
         ])
     }
 
@@ -148,6 +207,19 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         field.selectText(nil)
     }
 
+    func selectNote(_ url: URL?) {
+        activeNoteURL = url
+        suppressSelectionAction = true
+        defer { suppressSelectionAction = false }
+        guard let url, let row = hits.firstIndex(where: { $0.source.url == url }) else {
+            table.deselectAll(nil)
+            updateOpenButtonVisibility()
+            return
+        }
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        updateOpenButtonVisibility()
+    }
+
     func refresh() {
         guard !closed else { return }
         refreshRequested = true
@@ -159,7 +231,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
             self.start(extract: false)
         }
         scheduledRefresh = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
 
     func shutdown() {
@@ -171,14 +243,85 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         scheduledRefresh = nil
         generation += 1
         onOpenNote = nil
+        onNewNote = nil
+        onToggleSidebar = nil
+        onRevealFolder = nil
+        onChooseFolder = nil
+        onShowRecovery = nil
         onStatus = nil
         field.isEnabled = false
         makeButton.isEnabled = false
         cancelButton.isEnabled = false
         openButton.isEnabled = false
+        moreButton.isEnabled = false
     }
 
     func controlTextDidChange(_ obj: Notification) { render() }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.moveDown(_:)), !hits.isEmpty {
+            let next = table.selectedRow >= 0 ? min(hits.count - 1, table.selectedRow + 1) : 0
+            table.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+            table.scrollRowToVisible(next)
+            window?.makeFirstResponder(table)
+            return true
+        }
+        return false
+    }
+
+    @objc private func toggleAppearanceTapped() { onToggleAppearance?() }
+    @objc private func toggleSidebarTapped() { onToggleSidebar?() }
+    @objc private func newNoteTapped() { onNewNote?() }
+
+    @objc private func showMoreMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        let newItem = NSMenuItem(title: "New Note", action: #selector(newNoteTapped), keyEquivalent: "")
+        newItem.target = self
+        menu.addItem(newItem)
+
+        let indexItem = NSMenuItem(title: "Make Searchable", action: #selector(makeSearchable), keyEquivalent: "")
+        indexItem.target = self
+        indexItem.isEnabled = !busy
+        menu.addItem(indexItem)
+
+        menu.addItem(.separator())
+        for preset in Theme.Atmosphere.allCases {
+            let item = NSMenuItem(title: preset.title, action: #selector(selectAtmosphere(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = preset.rawValue
+            item.state = Theme.atmosphere == preset ? .on : .off
+            menu.addItem(item)
+        }
+        let flipAppearance = NSMenuItem(title: "Toggle Light / Dark Mode", action: #selector(toggleAppearanceTapped), keyEquivalent: "")
+        flipAppearance.target = self
+        menu.addItem(flipAppearance)
+
+        menu.addItem(.separator())
+
+        let openFolder = NSMenuItem(title: "Open Folder in Finder", action: #selector(revealFolderTapped), keyEquivalent: "")
+        openFolder.target = self
+        menu.addItem(openFolder)
+
+        let changeFolder = NSMenuItem(title: "Change Notes Folder…", action: #selector(chooseFolderTapped), keyEquivalent: "")
+        changeFolder.target = self
+        menu.addItem(changeFolder)
+
+        let recovery = NSMenuItem(title: "Recovery & Checkpoints…", action: #selector(recoveryTapped), keyEquivalent: "")
+        recovery.target = self
+        menu.addItem(recovery)
+
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func selectAtmosphere(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let preset = Theme.Atmosphere(rawValue: raw) else { return }
+        onSwitchAtmosphere?(preset)
+    }
+
+    @objc private func revealFolderTapped() { onRevealFolder?() }
+    @objc private func chooseFolderTapped() { onChooseFolder?() }
+    @objc private func recoveryTapped() { onShowRecovery?() }
 
     private func start(extract: Bool) {
         guard !closed, !busy else { return }
@@ -196,9 +339,8 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         cancelButton.isEnabled = true
         openButton.isEnabled = false
         progress.isHidden = false
-        progress.isIndeterminate = true
         progress.startAnimation(nil)
-        setStatus(extract ? "Making sources searchable on this Mac…" : "Reading local sources…")
+        setStatus(extract ? "Indexing on this Mac…" : "Reading notes…")
         updateProcessingNotice()
         let engine = self.engine
         let vault = self.vault
@@ -211,9 +353,6 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
                     result = try engine.makeSearchable(progress: { done, total, name in
                         DispatchQueue.main.async { [weak self] in
                             guard let self, !self.closed, self.generation == id, !token.isCancelled else { return }
-                            self.progress.isIndeterminate = total <= 0
-                            self.progress.maxValue = Double(max(total, 1))
-                            self.progress.doubleValue = Double(done)
                             self.setStatus("\(done)/\(total) · \(name)")
                         }
                     }, cancelled: { lifetime.isCancelled || token.isCancelled })
@@ -249,9 +388,8 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         progress.stopAnimation(nil)
         progress.isHidden = true
         render()
-        if cancelled { setStatus("Stopped. Completed extractions are preserved; remaining sources can be processed later.") }
-        else if let error { setStatus("Could not read sources: \(error.localizedDescription)") }
-        // FSEvents caused by companion writes collapse into one trailing scan.
+        if cancelled { setStatus("Stopped · Completed extractions saved") }
+        else if let error { setStatus("Read error: \(error.localizedDescription)") }
         if refreshRequested || cancelled { refresh() }
     }
 
@@ -261,14 +399,16 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         guard extracting else { return }
         operation?.cancel()
         cancelButton.isEnabled = false
-        setStatus("Stopping after the current source…")
+        setStatus("Stopping…")
     }
 
     private func render() {
         guard !closed else { return }
         let query = field.stringValue
         let browsing = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let selected = table.selectedRow >= 0 && table.selectedRow < hits.count ? hits[table.selectedRow] : nil
+        let selectedHit = table.selectedRow >= 0 && table.selectedRow < hits.count ? hits[table.selectedRow] : nil
+        let targetURL = selectedHit?.source.url ?? activeNoteURL
+        let targetPage = selectedHit?.page
         let previousOffset = table.enclosingScrollView?.contentView.bounds.origin ?? .zero
         hits = snapshot?.search(query) ?? []
         if browsing {
@@ -278,10 +418,13 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
                 return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
             }
         }
+        suppressSelectionAction = true
         table.reloadData()
-        if let selected, let row = hits.firstIndex(where: { $0.source.url == selected.source.url && $0.page == selected.page }) {
+        if let targetURL,
+           let row = hits.firstIndex(where: { $0.source.url == targetURL && (targetPage == nil || $0.page == targetPage) }) {
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
+        suppressSelectionAction = false
         if let scroll = table.enclosingScrollView {
             let height = hits.isEmpty ? 0 : table.rect(ofRow: hits.count - 1).maxY
             let y = renderedQuery == query ? min(previousOffset.y, max(0, height - scroll.contentView.bounds.height)) : 0
@@ -289,22 +432,32 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
             scroll.reflectScrolledClipView(scroll.contentView)
         }
         renderedQuery = query
-        recentLabel.isHidden = !browsing
         updateProcessingNotice()
         empty.isHidden = !hits.isEmpty
         let pending = snapshot?.pendingCount ?? 0
         if snapshot == nil {
-            empty.stringValue = busy ? "Reading local sources…" : "Sources could not be loaded. Check folder access or choose another folder."
+            empty.stringValue = busy ? "Loading notes…" : "Folder could not be loaded."
         } else if snapshot?.sources.isEmpty == true {
-            empty.stringValue = "No sources yet. Capture a note or add files to this folder."
+            empty.stringValue = "No notes yet.\nStart writing on the right."
         } else {
-            empty.stringValue = "No matches.\(pending > 0 ? " \(pending) sources still need Make searchable; their filenames can already be searched." : " Try other original-language words or a filename.")"
+            empty.stringValue = "No matches.\(pending > 0 ? "\n\(pending) files still need indexing." : "")"
         }
         if !busy, let snapshot {
-            let noun = browsing ? (hits.count == 1 ? "source" : "sources") : (hits.count == 1 ? "result" : "results")
-            setStatus("\(hits.count) \(noun) · \(snapshot.readyCount) ready · \(snapshot.pendingCount) pending · \(snapshot.issueCount) need attention · Local only")
+            let count = hits.count
+            let noun = browsing ? (count == 1 ? "ENTRY" : "ENTRIES") : (count == 1 ? "MATCH" : "MATCHES")
+            var summary = "\(count) \(noun)"
+            if snapshot.pendingCount > 0 { summary += " · \(snapshot.pendingCount) PENDING" }
+            if snapshot.issueCount > 0 { summary += " · \(snapshot.issueCount) ISSUE" }
+            setStatus(summary)
         }
+        updateOpenButtonVisibility()
+    }
+
+    private func updateOpenButtonVisibility() {
+        let row = table.selectedRow
+        let selected = row >= 0 && row < hits.count ? hits[row] : nil
         openButton.isEnabled = !busy && !hits.isEmpty
+        openButton.isHidden = selected == nil || selected?.source.kind == .note
     }
 
     private func updateProcessingNotice() {
@@ -315,10 +468,10 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         } ?? false
         processingNotice.isHidden = !extracting && pending == 0 && issues == 0
         makeButton.isHidden = extracting || (pending == 0 && !retryable)
-        makeButton.title = pending > 0 ? "Make searchable" : "Retry extraction"
-        if extracting { processingLabel.stringValue = "Processing on this Mac. Originals stay unchanged." }
-        else if pending > 0 { processingLabel.stringValue = "\(pending) \(pending == 1 ? "file needs" : "files need") text extraction." }
-        else { processingLabel.stringValue = "\(issues) \(issues == 1 ? "file needs" : "files need") attention. Clear search to review statuses." }
+        makeButton.title = pending > 0 ? "Make searchable" : "Retry"
+        if extracting { processingLabel.stringValue = "Extracting text locally…" }
+        else if pending > 0 { processingLabel.stringValue = "\(pending) \(pending == 1 ? "file needs" : "files need") OCR/text" }
+        else { processingLabel.stringValue = "\(issues) \(issues == 1 ? "file needs" : "files need") attention" }
     }
 
     private func setStatus(_ text: String) {
@@ -338,17 +491,42 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         let id = NSUserInterfaceItemIdentifier("SearchHit")
         let cell = (tableView.makeView(withIdentifier: id, owner: self) as? SearchHitCell) ?? SearchHitCell(frame: .zero)
         cell.identifier = id
-        cell.show(hits[row])
+        let hit = hits[row]
+        cell.show(hit, modifiedAt: stamps[hit.source.url]?.modified)
         return cell
     }
 
-    @objc private func openSelected() {
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        updateOpenButtonVisibility()
+        guard !suppressSelectionAction, !closed, !busy else { return }
+        let row = table.selectedRow
+        guard hits.indices.contains(row) else { return }
+        let hit = hits[row]
+        if hit.source.kind == .note {
+            activateHit(hit, allowExternalViewer: false)
+        }
+    }
+
+    @objc private func rowClicked() {
+        guard !closed, !busy else { return }
+        let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
+        guard hits.indices.contains(row) else { return }
+        let hit = hits[row]
+        if hit.source.kind == .note {
+            activateHit(hit, allowExternalViewer: false)
+        }
+    }
+
+    @objc func openSelected() {
         guard !closed, !busy, !hits.isEmpty else { return }
         let row = table.selectedRow >= 0 ? table.selectedRow : 0
         guard hits.indices.contains(row) else { return }
-        let hit = hits[row]
+        activateHit(hits[row], allowExternalViewer: true)
+    }
+
+    private func activateHit(_ hit: SearchHit, allowExternalViewer: Bool) {
         guard let expected = stamps[hit.source.url] else {
-            setStatus("Source is missing or unreadable: \(hit.source.relativePath). Use Make searchable to refresh.")
+            setStatus("Missing or unreadable: \(hit.source.relativePath)")
             return
         }
         let vault = self.vault
@@ -362,22 +540,21 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
                 guard current == expected else { throw VaultError.conflict(hit.source.relativePath) }
                 DispatchQueue.main.async { [weak self] in
                     guard let self, !self.closed, self.generation == id else { return }
-                    self.openButton.isEnabled = true
+                    self.updateOpenButtonVisibility()
                     if hit.source.kind == .note {
-                        guard let onOpenNote = self.onOpenNote else {
-                            self.setStatus("The note editor is not available.")
-                            return
+                        self.activeNoteURL = hit.source.url
+                        self.onOpenNote?(hit.source.url)
+                    } else if allowExternalViewer {
+                        if !NSWorkspace.shared.open(hit.source.url) {
+                            self.setStatus("No viewer could open \(hit.source.relativePath).")
                         }
-                        onOpenNote(hit.source.url)
-                    } else if !NSWorkspace.shared.open(hit.source.url) {
-                        self.setStatus("No viewer could open \(hit.source.relativePath).")
                     }
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, !self.closed, self.generation == id else { return }
-                    self.openButton.isEnabled = true
-                    self.setStatus("Could not open original: \(error.localizedDescription). Use Make searchable to refresh.")
+                    self.updateOpenButtonVisibility()
+                    self.setStatus("Could not open: \(error.localizedDescription)")
                 }
             }
         }
@@ -415,26 +592,34 @@ private struct SearchFileStamp: Equatable {
 
 @MainActor
 private final class SearchHitRow: NSTableRowView {
+    override var isEmphasized: Bool {
+        get { false }
+        set {}
+    }
+
     override func drawBackground(in dirtyRect: NSRect) {
-        drawCard(selected: false)
+        Theme.border.withAlphaComponent(0.55).setFill()
+        NSRect(x: 18, y: bounds.maxY - 1, width: max(0, bounds.width - 30), height: 1).fill()
     }
 
     override func drawSelection(in dirtyRect: NSRect) {
-        drawCard(selected: true)
-    }
-
-    private func drawCard(selected: Bool) {
-        let rect = bounds.insetBy(dx: 1, dy: 4)
-        let path = NSBezierPath(roundedRect: rect, xRadius: 14, yRadius: 14)
-        (selected ? Theme.accentSoft : Theme.paper).setFill()
+        let rect = bounds.insetBy(dx: 8, dy: 2)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
+        Theme.selectionFill.setFill()
         path.fill()
-        (selected ? Theme.accent : Theme.border).setStroke()
-        path.lineWidth = selected ? 2 : 1
+        Theme.border.setStroke()
+        path.lineWidth = 1
         path.stroke()
-        if selected {
-            Theme.accent.setFill()
-            NSBezierPath(roundedRect: NSRect(x: rect.minX + 5, y: rect.minY + 17, width: 3, height: max(0, rect.height - 34)), xRadius: 1.5, yRadius: 1.5).fill()
-        }
+
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+        Theme.topHighlight.withAlphaComponent(0.6).setFill()
+        NSRect(x: rect.minX + 8, y: rect.maxY - 1.5, width: max(0, rect.width - 16), height: 1).fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        // Artisanal rubrication dot instead of Bear's vertical bar
+        Theme.accent.setFill()
+        NSBezierPath(ovalIn: NSRect(x: rect.minX + 9, y: rect.minY + 14.5, width: 5, height: 5)).fill()
     }
 }
 
@@ -450,81 +635,159 @@ private final class SearchResultsTable: NSTableView {
 @MainActor
 private final class SearchHitCell: NSTableCellView {
     private let title = Theme.label("", size: 14, color: Theme.ink)
-    private let snippet = Theme.label("", size: 12, color: Theme.ink)
-    private let path = Theme.label("", size: 10)
-    private let metadata = Theme.label("", size: 10)
+    private let badge = Theme.label("", size: 10, color: Theme.muted)
+    private let snippet = Theme.label("", size: 12, color: Theme.muted)
     private let icon = NSImageView()
-    private let tile = PaperSurface(cornerRadius: 10, color: Theme.accentSoft, bordered: false)
+    private let titleRow = NSStackView()
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f
+    }()
+    private static let shortDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("MMM d")
+        return f
+    }()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        title.font = .systemFont(ofSize: 14, weight: .semibold)
-        title.lineBreakMode = .byTruncatingMiddle
+        title.font = Theme.displayFont(14, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
         title.maximumNumberOfLines = 1
-        snippet.lineBreakMode = .byTruncatingTail
-        snippet.maximumNumberOfLines = 2
-        path.lineBreakMode = .byTruncatingMiddle
-        metadata.lineBreakMode = .byTruncatingTail
-        metadata.font = .systemFont(ofSize: 10, weight: .medium)
-        icon.contentTintColor = Theme.accent
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        badge.font = Theme.monoFont(10, weight: .medium)
+        badge.alignment = .right
+        badge.setContentHuggingPriority(.required, for: .horizontal)
+        badge.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        icon.contentTintColor = Theme.sage
         icon.imageScaling = .scaleProportionallyDown
         icon.setAccessibilityElement(false)
-        Theme.fill(icon, in: tile, inset: 10)
-        for view in [tile, title, snippet, path, metadata] {
+        icon.widthAnchor.constraint(equalToConstant: 13).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 13).isActive = true
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 5
+        for view in [icon, title, spacer, badge] { titleRow.addArrangedSubview(view) }
+
+        snippet.lineBreakMode = .byTruncatingTail
+        snippet.maximumNumberOfLines = 2
+        snippet.cell?.wraps = true
+
+        for view in [titleRow, snippet] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
         NSLayoutConstraint.activate([
-            tile.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
-            tile.topAnchor.constraint(equalTo: topAnchor, constant: 15),
-            tile.widthAnchor.constraint(equalToConstant: 40),
-            tile.heightAnchor.constraint(equalToConstant: 40),
-            title.leadingAnchor.constraint(equalTo: tile.trailingAnchor, constant: 12),
-            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 13),
-            snippet.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            snippet.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            snippet.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
-            snippet.heightAnchor.constraint(equalToConstant: 32),
-            path.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            path.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            path.topAnchor.constraint(equalTo: snippet.bottomAnchor, constant: 5),
-            metadata.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            metadata.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            metadata.topAnchor.constraint(equalTo: path.bottomAnchor, constant: 3),
-            metadata.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -10)
+            titleRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 27),
+            titleRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            titleRow.topAnchor.constraint(equalTo: topAnchor, constant: 11),
+            snippet.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 27),
+            snippet.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            snippet.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 4),
+            snippet.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -8)
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
 
-    func show(_ hit: SearchHit) {
+    func show(_ hit: SearchHit, modifiedAt: Date?) {
         let source = hit.source
         let kind: String
-        let symbol: String
+        let symbol: String?
         switch source.kind {
-        case .note: kind = "Note"; symbol = "note.text"
+        case .note: kind = "Note"; symbol = nil
         case .text: kind = "Text"; symbol = "doc.text"
         case .pdf: kind = "PDF"; symbol = "doc.richtext"
         case .image: kind = "Image"; symbol = "photo"
         case .unsupported: kind = "File"; symbol = "doc"
         }
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 19, weight: .regular))
-        title.stringValue = source.title
-        let text = NSMutableAttributedString(string: hit.snippet, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.ink])
-        let utf16 = hit.snippet as NSString
-        for range in hit.highlights where range.location != NSNotFound && range.location >= 0 && range.length > 0 && NSMaxRange(range) <= utf16.length {
-            let safeRange = utf16.rangeOfComposedCharacterSequences(for: range)
-            text.addAttributes([.backgroundColor: Theme.accentSoft, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)], range: safeRange)
+        if let symbol {
+            icon.isHidden = false
+            icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+        } else {
+            icon.isHidden = true
         }
-        snippet.attributedStringValue = text
-        path.stringValue = source.relativePath
-        let page = hit.page.map { " · Page \($0)" } ?? ""
-        metadata.stringValue = "\(kind)\(page) · \(source.state.rawValue.capitalized)\(source.detail.isEmpty ? "" : " — \(source.detail)")"
-        path.toolTip = source.relativePath
-        metadata.toolTip = metadata.stringValue
-        toolTip = "\(title.stringValue)\n\(path.stringValue)\n\(metadata.stringValue)\n\(hit.snippet)"
+        title.stringValue = source.title
+
+        if let page = hit.page {
+            badge.stringValue = "P.\(page)"
+            badge.textColor = Theme.accent
+        } else if source.state == .pending {
+            badge.stringValue = "PENDING"
+            badge.textColor = Theme.accent
+        } else if source.state == .unreadable || source.state == .partial {
+            badge.stringValue = "ISSUE"
+            badge.textColor = Theme.accent
+        } else if let modifiedAt {
+            let cal = Calendar.current
+            if cal.isDateInToday(modifiedAt) {
+                badge.stringValue = Self.timeFormatter.string(from: modifiedAt).uppercased()
+            } else if cal.isDateInYesterday(modifiedAt) {
+                badge.stringValue = "YESTERDAY"
+            } else {
+                badge.stringValue = Self.shortDateFormatter.string(from: modifiedAt).uppercased()
+            }
+            badge.textColor = source.kind == .note ? Theme.subtle : Theme.sage
+        } else {
+            badge.stringValue = kind.uppercased()
+            badge.textColor = Theme.subtle
+        }
+
+        if hit.highlights.isEmpty {
+            var preview = hit.snippet
+            if source.kind == .note {
+                preview = Self.stripLeadingTitle(from: preview, title: source.title)
+            }
+            if preview.isEmpty {
+                preview = source.kind == .note ? "No additional text" : source.detail
+            }
+            snippet.attributedStringValue = NSAttributedString(
+                string: preview,
+                attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.muted]
+            )
+        } else {
+            let text = NSMutableAttributedString(
+                string: hit.snippet,
+                attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.ink]
+            )
+            let utf16 = hit.snippet as NSString
+            for range in hit.highlights where range.location != NSNotFound && range.location >= 0 && range.length > 0 && NSMaxRange(range) <= utf16.length {
+                let safeRange = utf16.rangeOfComposedCharacterSequences(for: range)
+                text.addAttributes([
+                    .backgroundColor: Theme.accentSoft,
+                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                    .foregroundColor: Theme.ink
+                ], range: safeRange)
+            }
+            snippet.attributedStringValue = text
+        }
+
+        let pageInfo = hit.page.map { " · Page \($0)" } ?? ""
+        let metaInfo = "\(kind)\(pageInfo) · \(source.state.rawValue.capitalized)\(source.detail.isEmpty ? "" : " — \(source.detail)")"
+        toolTip = "\(title.stringValue)\n\(source.relativePath)\n\(metaInfo)\n\(hit.snippet)"
         setAccessibilityLabel(toolTip)
+    }
+
+    private static func stripLeadingTitle(from snippet: String, title: String) -> String {
+        var cleaned = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        while cleaned.hasPrefix("#") {
+            cleaned = String(cleaned.dropFirst()).trimmingCharacters(in: .whitespaces)
+        }
+        if cleaned.hasPrefix(title) {
+            cleaned = String(cleaned.dropFirst(title.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        cleaned = cleaned.replacingOccurrences(of: "!?\\[([^\\]]*)\\]\\([^\\)]+\\)", with: "$1", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: "\\*\\*([^\\*]+)\\*\\*", with: "$1", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: "`([^`]+)`", with: "$1", options: .regularExpression)
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

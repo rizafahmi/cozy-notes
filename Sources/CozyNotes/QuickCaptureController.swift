@@ -9,31 +9,50 @@ import CozyCore
 
     init(vault: Vault) {
         self.vault = vault
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 600, height: 380),
-                            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.title = "Keep a little something"
+        editor.compactLayout = true
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 360),
+            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Quick Capture"
+        panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.backgroundColor = Theme.paper
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.minSize = NSSize(width: 440, height: 280)
+        panel.minSize = NSSize(width: 440, height: 260)
         super.init(window: panel)
         panel.delegate = self
+
+        let headerLabel = Theme.label("Quick capture", size: 11.5, color: Theme.muted)
+        let header = NSView()
+        headerLabel.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(headerLabel)
+        NSLayoutConstraint.activate([
+            headerLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 68),
+            headerLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            header.heightAnchor.constraint(equalToConstant: 32)
+        ])
+
         let keep = PrimaryButton()
         keep.title = "Keep capture"
         keep.target = self
         keep.action = #selector(save)
         keep.keyEquivalent = "\r"
         keep.keyEquivalentModifierMask = .command
-        let cancel = Theme.button("Close", target: self, action: #selector(hide))
+        let cancel = QuietButton(title: "Tuck away", target: self, action: #selector(hide))
         cancel.toolTip = "Close without clearing your draft (Escape)"
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let footer = Theme.stack([Theme.label("⌘Return to keep · Esc to tuck away", size: 11), spacer, cancel, keep])
-        footer.edgeInsets = NSEdgeInsets(top: 0, left: 22, bottom: 16, right: 18)
-        let layout = Theme.stack([editor, footer], orientation: .vertical, spacing: 0)
+        let hint = Theme.label("⌘Return to keep · Esc to tuck away", size: 11, color: Theme.subtle)
+        let footer = Theme.stack([hint, spacer, cancel, keep], spacing: 10)
+        footer.edgeInsets = NSEdgeInsets(top: 2, left: 22, bottom: 14, right: 18)
+        let layout = Theme.stack([header, editor, footer], orientation: .vertical, spacing: 0)
+        header.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
         editor.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
         footer.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
         if let content = panel.contentView { Theme.fill(layout, in: content) }
