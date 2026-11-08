@@ -251,19 +251,31 @@ import CozyCore
                 guard NSMaxRange(inner) >= visStart, NSMaxRange(inner) <= totalLength else { continue }
                 if isCharacterFolded(inner.location) { continue }
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: inner, actualCharacterRange: nil)
-                let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-                let pill = NSRect(
-                    x: origin.x + raw.minX - 5,
-                    y: origin.y + raw.minY,
-                    width: raw.width + 10,
-                    height: pillHeight
-                )
-                let path = NSBezierPath(roundedRect: pill, xRadius: 5.5, yRadius: 5.5)
-                Theme.inlineCodeFill.setFill()
-                path.fill()
-                Theme.inlineCodeBorder.setStroke()
-                path.lineWidth = 1
-                path.stroke()
+                var gIdx = glyphRange.location
+                let gEnd = NSMaxRange(glyphRange)
+                while gIdx < gEnd {
+                    var lineGlyphRange = NSRange(location: 0, length: 0)
+                    _ = layoutManager.lineFragmentRect(forGlyphAt: gIdx, effectiveRange: &lineGlyphRange)
+                    let subRange = NSIntersectionRange(glyphRange, lineGlyphRange)
+                    if subRange.length > 0 {
+                        let raw = layoutManager.boundingRect(forGlyphRange: subRange, in: textContainer)
+                        if raw.width > 0 {
+                            let pill = NSRect(
+                                x: origin.x + raw.minX - 5,
+                                y: origin.y + raw.minY,
+                                width: raw.width + 10,
+                                height: pillHeight
+                            )
+                            let path = NSBezierPath(roundedRect: pill, xRadius: 5.5, yRadius: 5.5)
+                            Theme.inlineCodeFill.setFill()
+                            path.fill()
+                            Theme.inlineCodeBorder.setStroke()
+                            path.lineWidth = 1
+                            path.stroke()
+                        }
+                    }
+                    gIdx = max(gIdx + 1, NSMaxRange(lineGlyphRange))
+                }
             }
         }
 
