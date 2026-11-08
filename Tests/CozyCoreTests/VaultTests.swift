@@ -264,6 +264,48 @@ final class VaultTests: XCTestCase {
         XCTAssertThrowsError(try fixture.vault.delete(agents, moveToTrash: false))
         XCTAssertTrue(FileManager.default.fileExists(atPath: agents.path))
     }
+
+    func testWikiLinkParsingResolutionAndNoteCreation() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+
+        let roadmap = try fixture.vault.capture(text: "# Product Roadmap\nQ4 milestones and release plan.")
+        let design = try fixture.vault.capture(text: "# Design System\nTypography and color tokens.")
+
+        let sample = "See [[Product Roadmap]] and [[Design System|UI Tokens]], ignore [[]] and [[   ]]."
+        let links = Vault.wikiLinks(in: sample)
+        XCTAssertEqual(links.count, 2)
+        XCTAssertEqual(links[0].target, "Product Roadmap")
+        XCTAssertEqual(links[0].alias, nil)
+        XCTAssertEqual(links[0].displayText, "Product Roadmap")
+        XCTAssertEqual(links[1].target, "Design System")
+        XCTAssertEqual(links[1].alias, "UI Tokens")
+        XCTAssertEqual(links[1].displayText, "UI Tokens")
+
+        // Active query detection while typing [[...
+        let typing = "Link to [[Prod" as NSString
+        let active = try XCTUnwrap(Vault.activeWikiLinkQuery(inNSString: typing, cursorLocation: typing.length))
+        XCTAssertEqual(active.query, "Prod")
+        XCTAssertEqual(active.replacementRange, NSRange(location: 8, length: 6))
+
+        // Resolution by title (case-insensitive) and filename stem
+        XCTAssertEqual(try fixture.vault.resolveNote(matching: "product roadmap")?.url, roadmap.url)
+        XCTAssertEqual(try fixture.vault.resolveNote(matching: "Design System#Colors")?.url, design.url)
+        let stem = roadmap.url.deletingPathExtension().lastPathComponent
+        XCTAssertEqual(try fixture.vault.resolveNote(matching: stem)?.url, roadmap.url)
+
+        // openOrCreateNote resolves existing note without creating a duplicate
+        let existingResult = try fixture.vault.openOrCreateNote(matching: "Product Roadmap")
+        XCTAssertFalse(existingResult.created)
+        XCTAssertEqual(existingResult.record.url, roadmap.url)
+
+        // openOrCreateNote creates a new note initialized with "# <Title>" when missing
+        let createdResult = try fixture.vault.openOrCreateNote(matching: "Architecture RFC")
+        XCTAssertTrue(createdResult.created)
+        XCTAssertEqual(createdResult.record.title, "Architecture RFC")
+        XCTAssertEqual(try fixture.vault.read(createdResult.record.url), "# Architecture RFC\n\n")
+        XCTAssertEqual(try fixture.vault.resolveNote(matching: "Architecture RFC")?.url, createdResult.record.url)
+    }
 }
 
 #if canImport(Testing)
@@ -274,6 +316,11 @@ struct VaultDeleteSuite {
     @Test("Deleting a note checkpoints recovery and removes its attachment folder")
     func deleteNoteAndRecover() throws {
         try VaultTests().testDeleteNoteCreatesRecoveryCheckpointAndRemovesAttachmentFolder()
+    }
+
+    @Test("Wiki-links parse, resolve by title or stem, and create missing notes")
+    func wikiLinksResolveAndCreate() throws {
+        try VaultTests().testWikiLinkParsingResolutionAndNoteCreation()
     }
 }
 #endif

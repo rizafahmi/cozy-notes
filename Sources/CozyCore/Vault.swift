@@ -2,11 +2,48 @@ import Foundation
 import CryptoKit
 import Darwin
 
-public struct NoteRecord {
+public struct NoteRecord: Equatable, Sendable {
     public let url: URL
     public let title: String
     public let modifiedAt: Date
     public let excerpt: String
+
+    public init(url: URL, title: String, modifiedAt: Date, excerpt: String) {
+        self.url = url
+        self.title = title
+        self.modifiedAt = modifiedAt
+        self.excerpt = excerpt
+    }
+}
+
+public struct WikiLink: Equatable, Sendable {
+    public let target: String
+    public let alias: String?
+    public let fullRange: NSRange
+    public let innerRange: NSRange
+    public let targetRange: NSRange
+    public let aliasRange: NSRange?
+
+    public var displayText: String {
+        if let alias, !alias.isEmpty { return alias }
+        return target
+    }
+
+    public init(
+        target: String,
+        alias: String? = nil,
+        fullRange: NSRange,
+        innerRange: NSRange,
+        targetRange: NSRange,
+        aliasRange: NSRange? = nil
+    ) {
+        self.target = target
+        self.alias = alias
+        self.fullRange = fullRange
+        self.innerRange = innerRange
+        self.targetRange = targetRange
+        self.aliasRange = aliasRange
+    }
 }
 
 public struct LinkedAttachment: Equatable {
@@ -301,6 +338,201 @@ public final class Vault: @unchecked Sendable {
                 searchStart = NSMaxRange(lineRange)
             }
             return items
+        }
+    }
+
+    private static let wikiLinkRegex = try! NSRegularExpression(pattern: "\\[\\[([^\\[\\]\\n]+)\\]\\]")
+
+    public static func wikiLinks(in text: String) -> [WikiLink] {
+        wikiLinks(inNSString: text as NSString)
+    }
+
+    public static func wikiLinks(inNSString ns: NSString, range: NSRange? = nil) -> [WikiLink] {
+        let searchRange = range ?? NSRange(location: 0, length: ns.length)
+        guard searchRange.length >= 5,
+              NSMaxRange(searchRange) <= ns.length,
+              ns.range(of: "[[", options: .literal, range: searchRange).location != NSNotFound else {
+            return []
+        }
+        var results: [WikiLink] = []
+        var searchStart = searchRange.location
+        let searchEnd = NSMaxRange(searchRange)
+        while searchStart < searchEnd {
+            let hit = ns.range(of: "[[", options: .literal, range: NSRange(location: searchStart, length: searchEnd - searchStart))
+            guard hit.location != NSNotFound else { break }
+            let lineRange = NSIntersectionRange(ns.lineRange(for: hit), searchRange)
+            let lineStr = ns.substring(with: lineRange)
+            let lineNS = lineStr as NSString
+            for match in wikiLinkRegex.matches(in: lineStr, range: NSRange(location: 0, length: lineNS.length)) where match.numberOfRanges > 1 {
+                let fullRange = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                let innerRange = NSRange(location: lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                let innerStr = lineNS.substring(with: match.range(at: 1))
+                let innerNS = innerStr as NSString
+                let pipeRange = innerNS.range(of: "|", options: .literal)
+                if pipeRange.location != NSNotFound {
+                    let rawTarget = innerNS.substring(to: pipeRange.location).trimmingCharacters(in: .whitespaces)
+                    guard !rawTarget.isEmpty else { continue }
+                    let rawAlias = innerNS.substring(from: NSMaxRange(pipeRange)).trimmingCharacters(in: .whitespaces)
+                    let tRange = NSRange(location: innerRange.location, length: pipeRange.location)
+                    let aRange = NSRange(location: innerRange.location + NSMaxRange(pipeRange), length: innerNS.length - NSMaxRange(pipeRange))
+                    results.append(WikiLink(
+                        target: rawTarget,
+                        alias: rawAlias.isEmpty ? nil : rawAlias,
+                        fullRange: fullRange,
+                        innerRange: innerRange,
+                        targetRange: tRange,
+                        aliasRange: aRange
+                    ))
+                } else {
+                    let rawTarget = innerStr.trimmingCharacters(in: .whitespaces)
+                    guard !rawTarget.isEmpty else { continue }
+                    results.append(WikiLink(
+                        target: rawTarget,
+                        alias: nil,
+                        fullRange: fullRange,
+                        innerRange: innerRange,
+                        targetRange: innerRange,
+                        aliasRange: nil
+                    ))
+                }
+            }
+            searchStart = NSMaxRange(lineRange)
+        }
+        return results
+    }
+
+    public static func wikiLink(in text: String, at location: Int, includeTrailingEdge: Bool = false) -> WikiLink? {
+        wikiLink(inNSString: text as NSString, at: location, includeTrailingEdge: includeTrailingEdge)
+    }
+
+    public static func wikiLink(inNSString ns: NSString, at location: Int, includeTrailingEdge: Bool = false) -> WikiLink? {
+        guard ns.length >= 5, location >= 0, location <= ns.length else { return nil }
+        let probe = min(location, ns.length - 1)
+        let lineRange = ns.lineRange(for: NSRange(location: probe, length: 0))
+        let links = wikiLinks(inNSString: ns, range: lineRange)
+        return links.first { link in
+            if includeTrailingEdge {
+                return location >= link.fullRange.location && location <= NSMaxRange(link.fullRange)
+            } else {
+                return NSLocationInRange(location, link.fullRange)
+            }
+        }
+    }
+
+    /// Detects an active `[[query` being typed at `cursorLocation`.
+    /// Returns the full range to replace when a note is chosen and the current query string.
+    public static func activeWikiLinkQuery(inNSString ns: NSString, cursorLocation: Int) -> (replacementRange: NSRange, query: String)? {
+        guard cursorLocation >= 2, cursorLocation <= ns.length else { return nil }
+        let lineRange = ns.lineRange(for: NSRange(location: min(cursorLocation, max(0, ns.length - 1)), length: 0))
+        guard cursorLocation >= lineRange.location + 2 else { return nil }
+
+        var openLocation: Int?
+        var idx = cursorLocation - 1
+        while idx > lineRange.location {
+            let ch = ns.character(at: idx)
+            if ch == 0x0A || ch == 0x0D || ch == 0x5D {
+                return nil
+            }
+            if ch == 0x5B {
+                if ns.character(at: idx - 1) == 0x5B {
+                    openLocation = idx - 1
+                    break
+                } else {
+                    return nil
+                }
+            }
+            idx -= 1
+        }
+        guard let openStart = openLocation else { return nil }
+        let queryStart = openStart + 2
+        let queryRange = NSRange(location: queryStart, length: cursorLocation - queryStart)
+        let query = ns.substring(with: queryRange)
+        if query.contains("|") || query.contains("\n") || query.contains("\r") {
+            return nil
+        }
+
+        var replaceEnd = cursorLocation
+        let lineEnd = NSMaxRange(lineRange)
+        if cursorLocation + 2 <= lineEnd,
+           ns.character(at: cursorLocation) == 0x5D,
+           ns.character(at: cursorLocation + 1) == 0x5D {
+            replaceEnd = cursorLocation + 2
+        }
+        return (NSRange(location: openStart, length: replaceEnd - openStart), query)
+    }
+
+    public static func normalizedWikiTarget(_ rawTarget: String) -> String {
+        let firstPart = rawTarget.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? rawTarget
+        return firstPart.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public func resolveNote(matching rawTarget: String, in existingNotes: [NoteRecord]? = nil) throws -> NoteRecord? {
+        try synchronized {
+            let cleaned = Self.normalizedWikiTarget(rawTarget)
+            guard !cleaned.isEmpty else { return nil }
+            let candidates = try existingNotes ?? notes()
+            if let match = Self.findMatchingNote(for: cleaned, in: candidates, root: root) {
+                return match
+            }
+            if let hashIndex = cleaned.firstIndex(of: "#") {
+                let beforeHash = String(cleaned[..<hashIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !beforeHash.isEmpty, let match = Self.findMatchingNote(for: beforeHash, in: candidates, root: root) {
+                    return match
+                }
+            }
+            return nil
+        }
+    }
+
+    private static func findMatchingNote(for target: String, in candidates: [NoteRecord], root: URL) -> NoteRecord? {
+        if let exact = candidates.first(where: { $0.title == target }) {
+            return exact
+        }
+        if let ci = candidates.first(where: { $0.title.caseInsensitiveCompare(target) == .orderedSame }) {
+            return ci
+        }
+        let strippedExt: String = {
+            let lower = target.lowercased()
+            if lower.hasSuffix(".markdown") { return String(target.dropLast(9)) }
+            if lower.hasSuffix(".md") { return String(target.dropLast(3)) }
+            return target
+        }()
+        if let stemExact = candidates.first(where: { $0.url.deletingPathExtension().lastPathComponent == strippedExt }) {
+            return stemExact
+        }
+        if let stemCI = candidates.first(where: { $0.url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(strippedExt) == .orderedSame }) {
+            return stemCI
+        }
+        let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        if let relMatch = candidates.first(where: { note in
+            guard note.url.path.hasPrefix(rootPrefix) else { return false }
+            let rel = String(note.url.path.dropFirst(rootPrefix.count))
+            let relNoExt = (rel as NSString).deletingPathExtension
+            return rel.caseInsensitiveCompare(target) == .orderedSame
+                || relNoExt.caseInsensitiveCompare(strippedExt) == .orderedSame
+        }) {
+            return relMatch
+        }
+        return nil
+    }
+
+    public func openOrCreateNote(matching rawTarget: String) throws -> (record: NoteRecord, created: Bool) {
+        try synchronized {
+            var cleaned = Self.normalizedWikiTarget(rawTarget)
+            if let hashIndex = cleaned.firstIndex(of: "#") {
+                let beforeHash = String(cleaned[..<hashIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !beforeHash.isEmpty {
+                    cleaned = beforeHash
+                }
+            }
+            guard !cleaned.isEmpty else {
+                throw VaultError.unsafePath(rawTarget)
+            }
+            if let existing = try resolveNote(matching: cleaned) {
+                return (existing, false)
+            }
+            let created = try capture(text: "# \(cleaned)\n\n")
+            return (created, true)
         }
     }
 
