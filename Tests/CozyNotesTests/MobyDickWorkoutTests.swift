@@ -31,7 +31,25 @@ final class MobyDickWorkoutTests: XCTestCase {
         XCTAssertLessThan(report.step2.resizeAvgMs, 16.0, "Step 2 average resize time should be < 16ms")
         XCTAssertLessThan(report.step3.resizeAvgMs, 16.0, "Step 3 average resize time should be < 16ms")
         XCTAssertLessThan(report.step5.p95KeystrokeMs, 8.0, "Step 5 P95 keystroke latency should be < 8.0ms")
-        XCTAssertEqual(report.repeats.count, max(0, cycles), "Step 6 should complete repeated workout cycles")
+        XCTAssertGreaterThan(report.outlineFolding.headingCount, 100, "Moby Dick should contain >100 headings")
+        XCTAssertTrue(report.outlineFolding.upstreamEditShiftsFoldCorrectly, "Upstream edits must shift downstream folded section ranges")
+        XCTAssertTrue(report.outlineFolding.intactAfterCycle, "Outline fold cycle must restore document intact")
+        XCTAssertLessThan(report.outlineFolding.foldSingleMs, 25.0, "Single chapter fold should be < 25ms")
+        XCTAssertLessThan(report.outlineFolding.unfoldSingleMs, 25.0, "Single chapter unfold should be < 25ms")
+        XCTAssertLessThan(report.outlineFolding.totalCycleMs, 100.0, "Full outline fold cycle (Overview -> Headings -> Show All) should be < 100ms")
+        XCTAssertGreaterThan(report.inNoteFind.matchCount, 100, "In-Note Find should locate matches across Moby Dick")
+        XCTAssertLessThan(report.inNoteFind.searchQueryMs, 50.0, "In-Note Find search across 1.2M chars should be < 50ms")
+        XCTAssertLessThan(report.inNoteFind.nextAvgMs, 16.0, "In-Note Find next match navigation should be < 16ms")
+        XCTAssertLessThan(report.inNoteFind.prevAvgMs, 16.0, "In-Note Find previous match navigation should be < 16ms")
+        XCTAssertTrue(report.syntaxTyping.wikiAutocompleteTriggered, "Typing [[Cetology]] in Moby Dick must trigger wiki autocomplete")
+        XCTAssertTrue(report.syntaxTyping.wikiLinkParsed, "Typing [[Cetology]] in Moby Dick must parse WikiLink item")
+        XCTAssertTrue(report.syntaxTyping.bulletParsed, "Typing checklist item in Moby Dick must parse bullet item")
+        XCTAssertTrue(report.syntaxTyping.intactAfterUndo, "Undoing syntax typing must leave Moby Dick intact")
+        XCTAssertLessThan(report.syntaxTyping.p95KeystrokeMs, 12.0, "Syntax & [[WikiLink]] P95 keystroke latency should be < 12ms")
+        XCTAssertTrue(report.comparisonWindow.companionSynced, "Saving in main workspace must sync 1.2M-char note to comparison window")
+        XCTAssertTrue(report.comparisonWindow.intactAfterRestore, "Comparison window sync workout must leave Moby Dick intact")
+        XCTAssertLessThan(report.comparisonWindow.openWindowMs, 200.0, "Opening 1.2M-char comparison window should be < 200ms")
+        XCTAssertEqual(report.repeats.count, max(0, cycles), "Step 10 should complete repeated workout cycles")
         for cycle in report.repeats {
             XCTAssertTrue(cycle.step4.intactAfterRedo, "Cycle #\(cycle.cycleIndex) must leave Moby Dick intact")
             XCTAssertLessThan(cycle.step2.resizeAvgMs, 16.0)
@@ -49,7 +67,7 @@ final class MobyDickWorkoutTests: XCTestCase {
 #if canImport(Testing)
 @Suite("Moby Dick Workout", .serialized)
 struct MobyDickWorkoutSuite {
-    @Test("Full Moby Dick Workout (Steps 1–6)")
+    @Test("Full Moby Dick Workout (Steps 1–10)")
     @MainActor
     func mobyDickWorkout() throws {
         _ = NSApplication.shared
@@ -69,6 +87,24 @@ struct MobyDickWorkoutSuite {
         #expect(report.step2.resizeAvgMs < 16.0)
         #expect(report.step3.resizeAvgMs < 16.0)
         #expect(report.step5.p95KeystrokeMs < 8.0)
+        #expect(report.outlineFolding.headingCount > 100)
+        #expect(report.outlineFolding.upstreamEditShiftsFoldCorrectly)
+        #expect(report.outlineFolding.intactAfterCycle)
+        #expect(report.outlineFolding.foldSingleMs < 25.0)
+        #expect(report.outlineFolding.unfoldSingleMs < 25.0)
+        #expect(report.outlineFolding.totalCycleMs < 100.0)
+        #expect(report.inNoteFind.matchCount > 100)
+        #expect(report.inNoteFind.searchQueryMs < 50.0)
+        #expect(report.inNoteFind.nextAvgMs < 16.0)
+        #expect(report.inNoteFind.prevAvgMs < 16.0)
+        #expect(report.syntaxTyping.wikiAutocompleteTriggered)
+        #expect(report.syntaxTyping.wikiLinkParsed)
+        #expect(report.syntaxTyping.bulletParsed)
+        #expect(report.syntaxTyping.intactAfterUndo)
+        #expect(report.syntaxTyping.p95KeystrokeMs < 12.0)
+        #expect(report.comparisonWindow.companionSynced)
+        #expect(report.comparisonWindow.intactAfterRestore)
+        #expect(report.comparisonWindow.openWindowMs < 200.0)
         #expect(report.repeats.count == max(0, cycles))
         for cycle in report.repeats {
             #expect(cycle.step4.intactAfterRedo)
@@ -612,10 +648,23 @@ struct MobyDickWorkoutSuite {
         #expect(textView.outlineFoldMode == .showAll)
         #expect(textView.foldedSections.isEmpty)
 
-        // 3. Auto-unfold on edit: folding a section and editing inside/on it automatically unfolds
-        textView.toggleFold(forHeadingAt: h2Sub.range.location)
+        // 3. Upstream edit while a later heading is folded shifts the folded section's range in lockstep
+        textView.toggleFold(forHeadingAt: h1PartTwo.range.location)
         #expect(textView.foldedSections.count == 1)
-        textView.insertText("!", replacementRange: NSRange(location: NSMaxRange(h2Sub.range), length: 0))
+        let insertLoc = NSMaxRange(h1PartOne.range)
+        textView.insertText(" — Expanded", replacementRange: NSRange(location: insertLoc, length: 0))
+        let updatedPartTwo = textView.headingGutterItems[2]
+        #expect(textView.foldedSections.count == 1)
+        #expect(textView.foldedSections[0].headingLocation == updatedPartTwo.range.location)
+        #expect(textView.foldedSections[0].headingRange == updatedPartTwo.range)
+        textView.toggleFold(forHeadingAt: updatedPartTwo.range.location)
+        #expect(textView.foldedSections.isEmpty)
+
+        // 4. Auto-unfold on edit: folding a section and editing inside/on it automatically unfolds
+        let currentSub = textView.headingGutterItems[1]
+        textView.toggleFold(forHeadingAt: currentSub.range.location)
+        #expect(textView.foldedSections.count == 1)
+        textView.insertText("!", replacementRange: NSRange(location: NSMaxRange(currentSub.range), length: 0))
         #expect(textView.foldedSections.isEmpty, "Editing a folded heading automatically unfolds its section")
     }
 
