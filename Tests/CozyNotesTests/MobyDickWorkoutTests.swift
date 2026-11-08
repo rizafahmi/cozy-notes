@@ -108,5 +108,102 @@ struct MobyDickWorkoutSuite {
         #expect(editor.textView.fencedBlocks.count == 1)
         #expect(editor.wordCount.stringValue.contains("WORDS"))
     }
+
+    @Test("Cut, Copy, Paste, Select All, Undo, and Redo keyboard shortcuts work via menu bar and key equivalents")
+    @MainActor
+    func clipboardKeyboardShortcuts() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+
+        let um = try #require(editor.textView.undoManager)
+        let prevGroupsByEvent = um.groupsByEvent
+        um.groupsByEvent = false
+        defer {
+            um.groupsByEvent = prevGroupsByEvent
+            window.orderOut(nil)
+        }
+
+        func keyEvent(_ chars: String, modifiers: NSEvent.ModifierFlags = .command, keyCode: UInt16 = 0) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: modifiers,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber,
+                context: nil,
+                characters: chars,
+                charactersIgnoringModifiers: chars.lowercased(),
+                isARepeat: false,
+                keyCode: keyCode
+            ))
+        }
+
+        editor.text = "Hello Cozy World"
+        editor.textView.setSelectedRange(NSRange(location: 6, length: 4)) // "Cozy"
+
+        // ⌘C copies "Cozy"
+        #expect(window.performKeyEquivalent(with: try keyEvent("c", keyCode: 8)))
+        #expect(NSPasteboard.general.string(forType: .string) == "Cozy")
+
+        // ⌘X cuts "Cozy "
+        editor.textView.setSelectedRange(NSRange(location: 6, length: 5))
+        um.beginUndoGrouping()
+        #expect(window.performKeyEquivalent(with: try keyEvent("x", keyCode: 7)))
+        um.endUndoGrouping()
+        #expect(editor.text == "Hello World")
+        #expect(NSPasteboard.general.string(forType: .string) == "Cozy ")
+
+        // ⌘V pastes "Cozy " at the end
+        editor.textView.setSelectedRange(NSRange(location: 11, length: 0))
+        um.beginUndoGrouping()
+        #expect(window.performKeyEquivalent(with: try keyEvent("v", keyCode: 9)))
+        um.endUndoGrouping()
+        #expect(editor.text == "Hello WorldCozy ")
+
+        // ⌘Z undoes paste, then ⌘Z undoes cut
+        #expect(window.performKeyEquivalent(with: try keyEvent("z", keyCode: 6)))
+        #expect(editor.text == "Hello World")
+        #expect(window.performKeyEquivalent(with: try keyEvent("z", keyCode: 6)))
+        #expect(editor.text == "Hello Cozy World")
+
+        // ⇧⌘Z redoes cut and paste
+        #expect(window.performKeyEquivalent(with: try keyEvent("Z", modifiers: [.command, .shift], keyCode: 6)))
+        #expect(editor.text == "Hello World")
+        #expect(window.performKeyEquivalent(with: try keyEvent("Z", modifiers: [.command, .shift], keyCode: 6)))
+        #expect(editor.text == "Hello WorldCozy ")
+
+        // ⌘A selects all
+        #expect(window.performKeyEquivalent(with: try keyEvent("a", keyCode: 0)))
+        #expect(editor.textView.selectedRange() == NSRange(location: 0, length: 16))
+
+        // Verify Edit menu items exist in NSApp.mainMenu with standard key equivalents
+        let editMenu = try #require(mainMenu.item(withTitle: "Edit")?.submenu)
+        #expect(editMenu.item(withTitle: "Cut")?.keyEquivalent == "x")
+        #expect(editMenu.item(withTitle: "Copy")?.keyEquivalent == "c")
+        #expect(editMenu.item(withTitle: "Paste")?.keyEquivalent == "v")
+        #expect(editMenu.item(withTitle: "Select All")?.keyEquivalent == "a")
+
+        // Verify short strings with identical endpoints/midpoints still copy fresh content
+        editor.text = "cat! cut!"
+        editor.textView.setSelectedRange(NSRange(location: 0, length: 4))
+        #expect(window.performKeyEquivalent(with: try keyEvent("c", keyCode: 8)))
+        #expect(NSPasteboard.general.string(forType: .string) == "cat!")
+        editor.textView.setSelectedRange(NSRange(location: 5, length: 4))
+        #expect(window.performKeyEquivalent(with: try keyEvent("c", keyCode: 8)))
+        #expect(NSPasteboard.general.string(forType: .string) == "cut!")
+    }
 }
 #endif

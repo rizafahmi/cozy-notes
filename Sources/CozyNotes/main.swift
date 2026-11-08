@@ -99,7 +99,7 @@ import CozyCore
         workspace?.shutdown()
         return .terminateNow
     }
-    private func buildMenus() {
+    func buildMenus() {
         let bar = NSMenu()
         let appItem = NSMenuItem()
         bar.addItem(appItem)
@@ -154,6 +154,7 @@ import CozyCore
         add("Focus Sidebar", action: #selector(findMode), key: "2", to: view)
         add("Search Notes & Files", action: #selector(search), key: "f", to: view)
         add("Show Workspace", action: #selector(showWorkspace), key: "", to: view)
+        NSApp.mainMenu = bar
     }
     private func add(_ title: String, action: Selector, key: String, modifiers: NSEvent.ModifierFlags = .command, to menu: NSMenu) {
         let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)

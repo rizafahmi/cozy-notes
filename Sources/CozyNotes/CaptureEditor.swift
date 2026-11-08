@@ -365,17 +365,54 @@ import CozyCore
         }
     }
 
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard window?.firstResponder === self, event.type == .keyDown else {
+            return super.performKeyEquivalent(with: event)
+        }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == .command {
+            switch key {
+            case "x":
+                guard isEditable else { return false }
+                cut(self)
+                return true
+            case "c":
+                copy(self)
+                return true
+            case "v":
+                guard isEditable else { return false }
+                paste(self)
+                return true
+            case "a":
+                selectAll(self)
+                return true
+            case "z":
+                guard isEditable, let um = undoManager, um.canUndo else { return false }
+                um.undo()
+                return true
+            default:
+                break
+            }
+        } else if flags == [.command, .shift], key == "z" {
+            guard isEditable, let um = undoManager, um.canRedo else { return false }
+            um.redo()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     override func copy(_ sender: Any?) {
         autoreleasepool {
             let sel = selectedRange()
             guard sel.length > 0, let ns = textStorage?.mutableString, NSMaxRange(sel) <= ns.length else { return }
             let pb = NSPasteboard.general
             let sig = CaptureEditor.sampleSignature(of: ns, range: sel)
-            if pb.changeCount == lastClipboardChangeCount && sel.length == lastClipboardLength && sig == lastClipboardSig {
+            if sel.length > 4096 && pb.changeCount == lastClipboardChangeCount && sel.length == lastClipboardLength && sig == lastClipboardSig {
                 return
             }
             let str: String
-            if sel.location == 0 && sel.length == ns.length && sel.length == cachedFullTextLength && sig == cachedFullTextSig {
+            if sel.length > 4096 && sel.location == 0 && sel.length == ns.length && sel.length == cachedFullTextLength && sig == cachedFullTextSig {
                 str = cachedFullText
             } else {
                 str = ns.substring(with: sel)
@@ -429,7 +466,7 @@ import CozyCore
             let previousString: String
             if safeRange.length == 0 {
                 previousString = ""
-            } else if safeRange.location == 0 && safeRange.length == ns.length && safeRange.length == cachedFullTextLength && CaptureEditor.sampleSignature(of: ns, range: safeRange) == cachedFullTextSig {
+            } else if safeRange.length > 4096 && safeRange.location == 0 && safeRange.length == ns.length && safeRange.length == cachedFullTextLength && CaptureEditor.sampleSignature(of: ns, range: safeRange) == cachedFullTextSig {
                 previousString = cachedFullText
             } else {
                 previousString = ns.substring(with: safeRange)
@@ -941,6 +978,9 @@ import CozyCore
                 renderWordCountLabel()
                 isFormatting = true
                 if let storage = textView.textStorage {
+                    if NSMaxRange(previousSelection) > newLen {
+                        textView.setSelectedRange(NSRange(location: clampedLocation, length: 0))
+                    }
                     textView.undoManager?.disableUndoRegistration()
                     storage.beginEditing()
                     storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: newValue)
@@ -950,6 +990,7 @@ import CozyCore
                 } else {
                     textView.string = newValue
                 }
+                applyEditorChromeAttributes()
                 isFormatting = false
                 textView.undoManager?.removeAllActions()
                 textView.setSelectedRange(NSRange(location: clampedLocation, length: 0))
@@ -1504,6 +1545,28 @@ import CozyCore
         return true
     }
 
+    private func applyEditorChromeAttributes() {
+        let proseSize = Theme.baseProseSize
+        let baseFont = Theme.bodyFont(proseSize)
+        let tracking = Theme.proseTracking
+        let bodyParagraph = NSMutableParagraphStyle()
+        bodyParagraph.lineSpacing = 8.0
+        bodyParagraph.paragraphSpacing = 11.5
+        let baseAttrs: [NSAttributedString.Key: Any] = [
+            .font: baseFont,
+            .foregroundColor: Theme.ink,
+            .paragraphStyle: bodyParagraph,
+            .kern: tracking
+        ]
+        textView.selectedTextAttributes = [
+            .backgroundColor: Theme.selectionHighlight,
+            .foregroundColor: Theme.headingInk
+        ]
+        textView.insertionPointColor = Theme.accent
+        textView.refreshCaretAppearance()
+        textView.typingAttributes = baseAttrs
+    }
+
     private func formatMarkdown() {
         guard !isFormatting, let storage = textView.textStorage else { return }
         isFormatting = true
@@ -1514,6 +1577,7 @@ import CozyCore
         applyFullMarkdownAttributes(to: storage, cursor: cursor, scanHint: nil)
         storage.endEditing()
         textView.undoManager?.enableUndoRegistration()
+        applyEditorChromeAttributes()
     }
 
     private func applyFullMarkdownAttributes(to storage: NSTextStorage, cursor: NSRange, scanHint: DocumentScanResult?) {
@@ -1534,15 +1598,6 @@ import CozyCore
             .paragraphStyle: bodyParagraph,
             .kern: tracking
         ]
-
-        textView.selectedTextAttributes = [
-            .backgroundColor: Theme.selectionHighlight,
-            .foregroundColor: Theme.headingInk
-        ]
-        textView.insertionPointColor = Theme.accent
-        textView.refreshCaretAppearance()
-        textView.typingAttributes = baseAttrs
-
         guard totalLen > 0 else {
             textView.blockquoteRanges = []
             textView.headingGutterItems = []
