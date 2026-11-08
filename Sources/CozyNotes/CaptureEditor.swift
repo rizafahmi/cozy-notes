@@ -100,7 +100,7 @@ import CozyCore
         let mayHaveLink: Bool
     }
     var pendingEdit: EditRecord?
-    private var isEditingText = false
+    var isEditingText = false
     var cachedFullText: String = ""
     var cachedFullTextLength: Int = 0
     var cachedFullTextSig: Int = 0
@@ -136,6 +136,12 @@ import CozyCore
     private var windowFocusObservers: [NSObjectProtocol] = []
     var suppressCaretUpdates = false
     override func setFrameSize(_ newSize: NSSize) {
+        if minimumOverscrollHeight > 0 {
+            let maxOverscroll = newSize.height + (enclosingScrollView?.contentView.bounds.height ?? 0) * 0.4
+            if minimumOverscrollHeight > maxOverscroll {
+                minimumOverscrollHeight = maxOverscroll
+            }
+        }
         let clampedHeight = max(newSize.height, minimumOverscrollHeight)
         super.setFrameSize(NSSize(width: newSize.width, height: clampedHeight))
     }
@@ -206,8 +212,8 @@ import CozyCore
             let pillHeight = ceil(codeFont.ascender - codeFont.descender) + 5
             for inner in inlineCodeRanges {
                 if inner.location > visEnd { break }
-                if isCharacterFolded(inner.location) { continue }
                 guard NSMaxRange(inner) >= visStart, NSMaxRange(inner) <= totalLength else { continue }
+                if isCharacterFolded(inner.location) { continue }
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: inner, actualCharacterRange: nil)
                 let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
                 let pill = NSRect(
@@ -228,8 +234,8 @@ import CozyCore
         if !wikiLinkItems.isEmpty {
             for item in wikiLinkItems {
                 if item.fullRange.location > visEnd { break }
-                if isCharacterFolded(item.fullRange.location) { continue }
                 guard NSMaxRange(item.fullRange) >= visStart, NSMaxRange(item.fullRange) <= totalLength else { continue }
+                if isCharacterFolded(item.fullRange.location) { continue }
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: item.fullRange, actualCharacterRange: nil)
                 layoutManager.enumerateEnclosingRects(
                     forGlyphRange: glyphRange,
@@ -253,10 +259,21 @@ import CozyCore
         }
 
         if !inNoteFindRanges.isEmpty {
-            for (idx, matchRange) in inNoteFindRanges.enumerated() {
+            var lo = 0
+            var hi = inNoteFindRanges.count
+            while lo < hi {
+                let mid = (lo + hi) >> 1
+                if NSMaxRange(inNoteFindRanges[mid]) < visStart {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            for idx in lo..<inNoteFindRanges.count {
+                let matchRange = inNoteFindRanges[idx]
                 if matchRange.location > visEnd { break }
+                guard NSMaxRange(matchRange) <= totalLength else { continue }
                 if isCharacterFolded(matchRange.location) { continue }
-                guard NSMaxRange(matchRange) >= visStart, NSMaxRange(matchRange) <= totalLength else { continue }
                 let isActiveMatch = (idx == activeInNoteFindIndex)
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: matchRange, actualCharacterRange: nil)
                 let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
@@ -285,8 +302,8 @@ import CozyCore
 
         for range in blockquoteRanges {
             if range.location > visEnd { break }
-            if isCharacterFolded(range.location) { continue }
             guard NSMaxRange(range) >= visStart, NSMaxRange(range) <= totalLength else { continue }
+            if isCharacterFolded(range.location) { continue }
             let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             var box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
             box.origin.x = origin.x
@@ -318,13 +335,24 @@ import CozyCore
                 .font: Theme.monoFont(9.5, weight: .semibold),
                 .foregroundColor: Theme.muted
             ]
-            for item in headingGutterItems {
+            var hLo = 0
+            var hHi = headingGutterItems.count
+            while hLo < hHi {
+                let mid = (hLo + hHi) >> 1
+                if NSMaxRange(headingGutterItems[mid].range) < visStart {
+                    hLo = mid + 1
+                } else {
+                    hHi = mid
+                }
+            }
+            for hIdx in hLo..<headingGutterItems.count {
+                let item = headingGutterItems[hIdx]
                 if item.range.location > visEnd { break }
+                guard NSMaxRange(item.range) <= totalLength else { continue }
                 if isCharacterFolded(item.range.location) { continue }
-                guard NSMaxRange(item.range) >= visStart, NSMaxRange(item.range) <= totalLength else { continue }
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: item.range, actualCharacterRange: nil)
                 let box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-                let activeFold = foldedSections.first { $0.headingLocation == item.range.location }
+                let activeFold = foldedSection(forHeadingAt: item.range.location)
                 let isFolded = activeFold != nil
                 if origin.x >= 56 {
                     let badgeLabel = "\(isFolded ? "▸" : "▾") \(item.label)" as NSString
@@ -368,10 +396,10 @@ import CozyCore
         if !bulletItems.isEmpty {
             for item in bulletItems {
                 if item.lineRange.location > visEnd { break }
-                if isCharacterFolded(item.lineRange.location) { continue }
                 guard NSMaxRange(item.lineRange) >= visStart,
                       NSMaxRange(item.lineRange) <= totalLength,
                       NSMaxRange(item.markerRange) <= totalLength else { continue }
+                if isCharacterFolded(item.lineRange.location) { continue }
                 if item.level > 0 {
                     let lineGlyphs = layoutManager.glyphRange(forCharacterRange: item.lineRange, actualCharacterRange: nil)
                     let lineBox = layoutManager.boundingRect(forGlyphRange: lineGlyphs, in: textContainer)
@@ -443,13 +471,20 @@ import CozyCore
         )
     }
 
+    override var shouldDrawInsertionPoint: Bool {
+        false
+    }
+
+    override func updateInsertionPointStateAndRestartTimer(_ restartFlag: Bool) {
+        // Suppress AppKit's insertion-point layout queries and timer; caretLayer manages the caret.
+    }
+
     override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
         // Suppress AppKit's teleporting insertion bar and NSTextInsertionIndicator; caretLayer renders the spring-animated caret.
     }
 
     @objc(_drawInsertionPointInRect:color:)
     func _drawInsertionPoint(in rect: NSRect, color: NSColor) {}
-
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         for token in windowFocusObservers { NotificationCenter.default.removeObserver(token) }
@@ -948,19 +983,69 @@ import CozyCore
         forGlyphRange glyphRange: NSRange
     ) -> Int {
         MainActor.assumeIsolated {
-            guard !foldedSections.isEmpty, glyphRange.length > 0 else { return 0 }
+            guard !foldedSections.isEmpty, glyphRange.length > 0, let ns = textStorage?.mutableString else { return 0 }
+            let totalLen = ns.length
             let firstChar = charIndexes[0]
             let lastChar = charIndexes[glyphRange.length - 1]
-            let spanRange = NSRange(location: min(firstChar, lastChar), length: abs(lastChar - firstChar) + 1)
-            let overlaps = foldedSections.contains { NSIntersectionRange($0.foldedCharRange, spanRange).length > 0 }
-            guard overlaps else { return 0 }
+            let minChar = min(firstChar, lastChar)
+            let maxChar = max(firstChar, lastChar)
 
+            var lo = 0
+            var hi = foldedSections.count
+            while lo < hi {
+                let mid = (lo + hi) >> 1
+                if NSMaxRange(foldedSections[mid].foldedCharRange) <= minChar {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            guard lo < foldedSections.count,
+                  foldedSections[lo].foldedCharRange.location <= maxChar else {
+                return 0
+            }
+
+            let firstFold = foldedSections[lo].foldedCharRange
+            if minChar >= firstFold.location && maxChar < NSMaxRange(firstFold) {
+                var mutableProps = [NSLayoutManager.GlyphProperty](repeating: .null, count: glyphRange.length)
+                for i in 0..<glyphRange.length {
+                    let c = charIndexes[i]
+                    if c < totalLen && ns.character(at: c) > 0x20 {
+                        mutableProps[i] = .controlCharacter
+                        break
+                    }
+                }
+                layoutManager.setGlyphs(
+                    glyphs,
+                    properties: &mutableProps,
+                    characterIndexes: charIndexes,
+                    font: aFont,
+                    forGlyphRange: glyphRange
+                )
+                return glyphRange.length
+            }
             var mutableProps = Array(UnsafeBufferPointer(start: props, count: glyphRange.length))
             var didModify = false
+            var cursor = lo
+            let count = foldedSections.count
             for i in 0..<glyphRange.length {
-                if isCharacterFolded(charIndexes[i]) {
-                    mutableProps[i] = .null
-                    didModify = true
+                let c = charIndexes[i]
+                while cursor < count && NSMaxRange(foldedSections[cursor].foldedCharRange) <= c {
+                    cursor += 1
+                }
+                if cursor < count {
+                    let r = foldedSections[cursor].foldedCharRange
+                    if c >= r.location && c < NSMaxRange(r) {
+                        if c == r.location && c < totalLen && ns.character(at: c) > 0x20 {
+                            mutableProps[i] = .controlCharacter
+                        } else {
+                            mutableProps[i] = .null
+                        }
+                        didModify = true
+                    } else if c < r.location && cursor > lo && isCharacterFolded(c) {
+                        mutableProps[i] = .null
+                        didModify = true
+                    }
                 }
             }
             guard didModify else { return 0 }
@@ -976,7 +1061,39 @@ import CozyCore
     }
 
     func isCharacterFolded(_ charIndex: Int) -> Bool {
-        !foldedSections.isEmpty && foldedSections.contains { NSLocationInRange(charIndex, $0.foldedCharRange) }
+        guard !foldedSections.isEmpty else { return false }
+        var lo = 0
+        var hi = foldedSections.count - 1
+        while lo <= hi {
+            let mid = (lo + hi) >> 1
+            let r = foldedSections[mid].foldedCharRange
+            if charIndex < r.location {
+                hi = mid - 1
+            } else if charIndex >= NSMaxRange(r) {
+                lo = mid + 1
+            } else {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func foldedSection(forHeadingAt headingLocation: Int) -> FoldedSection? {
+        guard !foldedSections.isEmpty else { return nil }
+        var lo = 0
+        var hi = foldedSections.count - 1
+        while lo <= hi {
+            let mid = (lo + hi) >> 1
+            let loc = foldedSections[mid].headingLocation
+            if headingLocation < loc {
+                hi = mid - 1
+            } else if headingLocation > loc {
+                lo = mid + 1
+            } else {
+                return foldedSections[mid]
+            }
+        }
+        return nil
     }
 
     private func headingIndex(atOrEnclosing location: Int, requireSameLine: Bool) -> Int? {
@@ -1012,12 +1129,9 @@ import CozyCore
         let foldStart = foldEnd == totalLen ? NSMaxRange(item.range) : NSMaxRange(headingLineRange)
         guard foldEnd > foldStart else { return nil }
         let foldedRange = NSRange(location: foldStart, length: foldEnd - foldStart)
-        let bodySlice = ns.substring(with: NSRange(
-            location: min(NSMaxRange(headingLineRange), foldEnd),
-            length: max(0, foldEnd - min(NSMaxRange(headingLineRange), foldEnd))
-        ))
-        let trimmed = bodySlice.hasSuffix("\n") ? String(bodySlice.dropLast()) : bodySlice
-        let lineCount = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: "\n").count
+        let sliceStart = min(NSMaxRange(headingLineRange), foldEnd)
+        let sliceRange = NSRange(location: sliceStart, length: max(0, foldEnd - sliceStart))
+        let lineCount = Self.countFoldedLines(in: ns, range: sliceRange)
         guard lineCount > 0 else { return nil }
         return FoldedSection(
             headingLocation: item.range.location,
@@ -1028,15 +1142,109 @@ import CozyCore
         )
     }
 
+    private static func countFoldedLines(in ns: NSString, range: NSRange) -> Int {
+        guard range.length > 0, NSMaxRange(range) <= ns.length else { return 0 }
+        var effectiveLen = range.length
+        if ns.character(at: range.location + effectiveLen - 1) == 0x0A {
+            effectiveLen -= 1
+        }
+        guard effectiveLen > 0 else { return 0 }
+        let cfStr = ns as CFString
+        let chunkCap = 16384
+        let allocSize = min(chunkCap, effectiveLen)
+        let buf = UnsafeMutablePointer<UniChar>.allocate(capacity: allocSize)
+        defer { buf.deallocate() }
+        var lines = 1
+        var offset = range.location
+        let end = range.location + effectiveLen
+        while offset < end {
+            let count = min(allocSize, end - offset)
+            CFStringGetCharacters(cfStr, CFRange(location: offset, length: count), buf)
+            var i = 0
+            while i < count {
+                if buf[i] == 0x0A {
+                    lines &+= 1
+                }
+                i &+= 1
+            }
+            offset &+= count
+        }
+        return lines
+    }
+
+    private static func symmetricDifferenceRanges(
+        from oldFolds: [FoldedSection],
+        to newFolds: [FoldedSection]
+    ) -> [NSRange] {
+        if oldFolds.isEmpty { return newFolds.map(\.foldedCharRange) }
+        if newFolds.isEmpty { return oldFolds.map(\.foldedCharRange) }
+        var coords: [Int] = []
+        coords.reserveCapacity((oldFolds.count + newFolds.count) * 2)
+        for s in oldFolds where s.foldedCharRange.length > 0 {
+            coords.append(s.foldedCharRange.location)
+            coords.append(NSMaxRange(s.foldedCharRange))
+        }
+        for s in newFolds where s.foldedCharRange.length > 0 {
+            coords.append(s.foldedCharRange.location)
+            coords.append(NSMaxRange(s.foldedCharRange))
+        }
+        guard coords.count >= 2 else { return [] }
+        coords.sort()
+
+        var oldIdx = 0
+        var newIdx = 0
+        var diff: [NSRange] = []
+        for i in 0..<(coords.count - 1) {
+            let start = coords[i]
+            let end = coords[i + 1]
+            guard end > start else { continue }
+            while oldIdx < oldFolds.count && NSMaxRange(oldFolds[oldIdx].foldedCharRange) <= start {
+                oldIdx += 1
+            }
+            while newIdx < newFolds.count && NSMaxRange(newFolds[newIdx].foldedCharRange) <= start {
+                newIdx += 1
+            }
+            let inOld = oldIdx < oldFolds.count
+                && start >= oldFolds[oldIdx].foldedCharRange.location
+                && end <= NSMaxRange(oldFolds[oldIdx].foldedCharRange)
+            let inNew = newIdx < newFolds.count
+                && start >= newFolds[newIdx].foldedCharRange.location
+                && end <= NSMaxRange(newFolds[newIdx].foldedCharRange)
+            if inOld != inNew {
+                if let last = diff.last, NSMaxRange(last) == start {
+                    diff[diff.count - 1] = NSRange(location: last.location, length: end - last.location)
+                } else {
+                    diff.append(NSRange(location: start, length: end - start))
+                }
+            }
+        }
+        return diff
+    }
+
+    func shiftFoldedSections(from startLocation: Int, by delta: Int) {
+        guard delta != 0, !foldedSections.isEmpty else { return }
+        for i in foldedSections.indices where foldedSections[i].headingLocation >= startLocation {
+            let s = foldedSections[i]
+            foldedSections[i] = FoldedSection(
+                headingLocation: s.headingLocation + delta,
+                headingRange: NSRange(location: s.headingRange.location + delta, length: s.headingRange.length),
+                headingLevel: s.headingLevel,
+                foldedCharRange: NSRange(location: s.foldedCharRange.location + delta, length: s.foldedCharRange.length),
+                hiddenLineCount: s.hiddenLineCount
+            )
+        }
+    }
+
     func toggleFold(forHeadingAt headingLocation: Int) {
         guard let idx = headingGutterItems.firstIndex(where: { $0.range.location == headingLocation }) else { return }
         let item = headingGutterItems[idx]
         if let existingIdx = foldedSections.firstIndex(where: { $0.headingLocation == headingLocation }) {
-            foldedSections.remove(at: existingIdx)
+            let removed = foldedSections.remove(at: existingIdx)
             outlineFoldMode = .showAll
-            invalidateFoldLayout()
+            invalidateFoldLayout(forChangedRanges: [removed.foldedCharRange])
             onFoldStatusChange?("Unfolded \(item.label)")
         } else if let section = computeFoldedSection(forHeadingIndex: idx, bodyOnly: false) {
+            let oldFolds = foldedSections
             foldedSections.removeAll { NSLocationInRange($0.headingLocation, section.foldedCharRange) }
             foldedSections.append(section)
             foldedSections.sort { $0.headingLocation < $1.headingLocation }
@@ -1045,7 +1253,8 @@ import CozyCore
             if NSLocationInRange(sel.location, section.foldedCharRange) || NSIntersectionRange(sel, section.foldedCharRange).length > 0 {
                 setSelectedRange(NSRange(location: NSMaxRange(item.range), length: 0))
             }
-            invalidateFoldLayout()
+            let diff = Self.symmetricDifferenceRanges(from: oldFolds, to: foldedSections)
+            invalidateFoldLayout(forChangedRanges: diff)
             onFoldStatusChange?("Folded \(item.label) (\(section.hiddenLineCount) \(section.hiddenLineCount == 1 ? "line" : "lines"))")
         }
     }
@@ -1060,17 +1269,17 @@ import CozyCore
         if let idx = headingIndex(atOrEnclosing: loc, requireSameLine: false) {
             let hLoc = headingGutterItems[idx].range.location
             if let foldIdx = foldedSections.firstIndex(where: { $0.headingLocation == hLoc }) {
-                foldedSections.remove(at: foldIdx)
+                let removed = foldedSections.remove(at: foldIdx)
                 outlineFoldMode = .showAll
-                invalidateFoldLayout()
+                invalidateFoldLayout(forChangedRanges: [removed.foldedCharRange])
                 onFoldStatusChange?("Unfolded \(headingGutterItems[idx].label)")
                 return
             }
         }
         if let enclosingIdx = foldedSections.firstIndex(where: { NSLocationInRange(loc, $0.foldedCharRange) }) {
-            foldedSections.remove(at: enclosingIdx)
+            let removed = foldedSections.remove(at: enclosingIdx)
             outlineFoldMode = .showAll
-            invalidateFoldLayout()
+            invalidateFoldLayout(forChangedRanges: [removed.foldedCharRange])
             onFoldStatusChange?("Unfolded section")
         }
     }
@@ -1087,10 +1296,11 @@ import CozyCore
                     nextFolds.append(section)
                 }
             }
+            let oldFolds = foldedSections
             foldedSections = nextFolds
             outlineFoldMode = nextFolds.isEmpty ? .showAll : .overview
             clampSelectionOutsideFolds()
-            invalidateFoldLayout()
+            invalidateFoldLayout(forChangedRanges: Self.symmetricDifferenceRanges(from: oldFolds, to: nextFolds))
             onFoldStatusChange?(outlineFoldMode == .overview ? "Outline: Overview" : "Outline: Show All")
 
         case .overview:
@@ -1100,10 +1310,11 @@ import CozyCore
                     nextFolds.append(section)
                 }
             }
+            let oldFolds = foldedSections
             foldedSections = nextFolds
             outlineFoldMode = .headingsOnly
             clampSelectionOutsideFolds()
-            invalidateFoldLayout()
+            invalidateFoldLayout(forChangedRanges: Self.symmetricDifferenceRanges(from: oldFolds, to: nextFolds))
             onFoldStatusChange?("Outline: Headings Only")
 
         case .headingsOnly:
@@ -1113,33 +1324,40 @@ import CozyCore
 
     @objc func unfoldAllHeadings(_ sender: Any?) {
         guard !foldedSections.isEmpty || outlineFoldMode != .showAll else { return }
+        let oldFolds = foldedSections
         foldedSections.removeAll()
         outlineFoldMode = .showAll
-        invalidateFoldLayout()
+        invalidateFoldLayout(forChangedRanges: oldFolds.map(\.foldedCharRange))
         onFoldStatusChange?("Outline: Show All")
     }
 
     func clearAllFolds() {
         guard !foldedSections.isEmpty || outlineFoldMode != .showAll else { return }
+        let oldFolds = foldedSections
         foldedSections.removeAll()
         outlineFoldMode = .showAll
-        invalidateFoldLayout()
+        invalidateFoldLayout(forChangedRanges: oldFolds.map(\.foldedCharRange))
     }
 
-    private func unfoldSectionsIntersecting(_ editRange: NSRange) {
+    func unfoldSectionsIntersecting(_ editRange: NSRange) {
+        var removedRanges: [NSRange] = []
         let beforeCount = foldedSections.count
         foldedSections.removeAll { section in
             let expanded = NSRange(
                 location: section.headingRange.location,
                 length: NSMaxRange(section.foldedCharRange) - section.headingRange.location
             )
-            return NSIntersectionRange(expanded, editRange).length > 0
+            let hits = NSIntersectionRange(expanded, editRange).length > 0
                 || NSLocationInRange(editRange.location, expanded)
                 || editRange.location == NSMaxRange(expanded)
+            if hits {
+                removedRanges.append(section.foldedCharRange)
+            }
+            return hits
         }
         if foldedSections.count != beforeCount {
             outlineFoldMode = .showAll
-            invalidateFoldLayout()
+            invalidateFoldLayout(forChangedRanges: removedRanges)
         }
     }
 
@@ -1150,12 +1368,42 @@ import CozyCore
         }
     }
 
-    private func invalidateFoldLayout() {
+    private func invalidateFoldLayout(forChangedRanges ranges: [NSRange]) {
         guard let lm = layoutManager, let tc = textContainer, let storage = textStorage else { return }
-        let fullRange = NSRange(location: 0, length: storage.length)
-        lm.invalidateGlyphs(forCharacterRange: fullRange, changeInLength: 0, actualCharacterRange: nil)
-        lm.invalidateLayout(forCharacterRange: fullRange, actualCharacterRange: nil)
-        lm.ensureLayout(for: tc)
+        let totalLen = storage.length
+        guard totalLen > 0, !ranges.isEmpty else { return }
+        var minStart = totalLen
+        var maxEnd = 0
+        for r in ranges {
+            let loc = min(max(0, r.location), totalLen)
+            let end = min(totalLen, NSMaxRange(r))
+            guard end > loc else { continue }
+            if loc < minStart { minStart = loc }
+            if end > maxEnd { maxEnd = end }
+        }
+        guard maxEnd > minStart else { return }
+        let span = NSRange(location: minStart, length: maxEnd - minStart)
+        lm.invalidateGlyphs(forCharacterRange: span, changeInLength: 0, actualCharacterRange: nil)
+        lm.invalidateLayout(forCharacterRange: span, actualCharacterRange: nil)
+        if totalLen <= 65_536 {
+            lm.ensureLayout(for: tc)
+        } else if let scrollView = enclosingScrollView {
+            let clipView = scrollView.contentView
+            if !foldedSections.isEmpty {
+                let selLoc = min(selectedRange().location, totalLen)
+                let selGlyphs = lm.glyphRange(forCharacterRange: NSRange(location: selLoc, length: 0), actualCharacterRange: nil)
+                let selRect = lm.boundingRect(forGlyphRange: selGlyphs, in: tc)
+                let selY = selRect.minY + textContainerOrigin.y
+                if selY < clipView.bounds.minY || selY > clipView.bounds.maxY {
+                    let targetY = max(0, selY - clipView.bounds.height * 0.25)
+                    clipView.scroll(to: NSPoint(x: 0, y: targetY))
+                    scrollView.reflectScrolledClipView(clipView)
+                }
+            }
+            lm.ensureLayout(forBoundingRect: clipView.bounds, in: tc)
+        } else {
+            lm.ensureLayout(for: tc)
+        }
         minimumOverscrollHeight = 0
         updateCaret(animated: false)
         setNeedsDisplay(visibleRect, avoidAdditionalLayout: true)
@@ -1679,9 +1927,15 @@ import CozyCore
         lastEditWasLarge = false
         isEditingText = false
         super.didChangeText()
-        updateCaret(animated: true)
-        if !wasLarge && !suppressCaretUpdates {
-            ensureCaretVisible(animated: true, useTypewriterStep: true)
+        if wasLarge, (textStorage?.length ?? 0) > 65_536 {
+            cancelCaretBlink()
+            caretLayer.isHidden = true
+            hasCaretOrigin = false
+        } else {
+            updateCaret(animated: true)
+            if !wasLarge && !suppressCaretUpdates {
+                ensureCaretVisible(animated: true, useTypewriterStep: true)
+            }
         }
     }
 
@@ -1752,7 +2006,17 @@ import CozyCore
         let visHeight = clipView.bounds.height
         guard visHeight > 60 else { return }
 
-        let caret = currentCaretRect()
+        let caret: NSRect
+        if !caretLayer.isHidden && hasCaretOrigin && caretLayer.bounds.height > 0 {
+            caret = NSRect(
+                x: caretLayer.position.x - caretLayer.bounds.width * 0.5,
+                y: caretLayer.position.y - caretLayer.bounds.height * 0.5,
+                width: caretLayer.bounds.width,
+                height: caretLayer.bounds.height
+            )
+        } else {
+            caret = currentCaretRect()
+        }
         guard caret.height > 0 else { return }
 
         let currentY = scrollSpringTargetY ?? clipView.bounds.origin.y
@@ -2683,8 +2947,22 @@ import CozyCore
         textView.textStorage?.mutableString ?? ("" as NSString)
     }
 
+    func cacheFullText(_ value: String) {
+        let ns = value as NSString
+        textView.cachedFullText = value
+        textView.cachedFullTextLength = ns.length
+        textView.cachedFullTextSig = Self.sampleSignature(of: ns)
+    }
+
     var text: String {
-        get { textView.string }
+        get {
+            let ns = nsText
+            let len = ns.length
+            if len > 4096 && len == textView.cachedFullTextLength && Self.sampleSignature(of: ns) == textView.cachedFullTextSig {
+                return textView.cachedFullText
+            }
+            return textView.string
+        }
         set {
             autoreleasepool {
                 let previousSelection = textView.selectedRange()
@@ -2762,6 +3040,9 @@ import CozyCore
             if let edit, !edit.requiresFullFormat {
                 didTouchAttributes = formatIncrementalEdit(edit)
             } else {
+                if let edit, edit.delta != 0 {
+                    textView.shiftFoldedSections(from: NSMaxRange(edit.affectedRange), by: edit.delta)
+                }
                 formatMarkdown()
                 didTouchAttributes = true
             }
@@ -2788,7 +3069,7 @@ import CozyCore
         }
     }
     func textViewDidChangeSelection(_ notification: Notification) {
-        guard !isFormatting, let storage = textView.textStorage else { return }
+        guard !isFormatting, !textView.isEditingText, let storage = textView.textStorage else { return }
         let ns = storage.mutableString as NSString
         let sel = textView.selectedRange()
         if isWikiAutocompleteVisible {
@@ -3061,6 +3342,9 @@ import CozyCore
         let idx = textView.activeInNoteFindIndex
         guard textView.inNoteFindRanges.indices.contains(idx) else { return }
         let matchRange = textView.inNoteFindRanges[idx]
+        if textView.isCharacterFolded(matchRange.location) {
+            textView.unfoldSectionsIntersecting(matchRange)
+        }
         inNoteFindBar.countLabel.stringValue = "\(idx + 1) OF \(textView.inNoteFindRanges.count)"
         textView.setSelectedRange(matchRange)
         textView.scrollRangeToVisible(matchRange)
@@ -3600,6 +3884,7 @@ import CozyCore
                         kind: item.kind
                     )
                 }
+                textView.shiftFoldedSections(from: shiftStart, by: delta)
             }
             lastCursorLine = ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, newLen), length: 0))
             return false
@@ -3708,6 +3993,9 @@ import CozyCore
         }
         if !insertedBullets { updatedBullets.append(contentsOf: newBullets) }
         textView.bulletItems = updatedBullets
+        if delta != 0 {
+            textView.shiftFoldedSections(from: oldEnd, by: delta)
+        }
 
         lastCursorLine = ns.lineRange(for: NSRange(location: min(cursor.location, newLen), length: 0))
         return true
