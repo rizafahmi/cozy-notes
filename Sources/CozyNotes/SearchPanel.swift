@@ -215,6 +215,25 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         field.selectText(nil)
     }
 
+    func freshSnapshotAndModifiedDates() -> (snapshot: SearchSnapshot?, dates: [URL: Date]) {
+        if let fresh = try? engine.scan() {
+            var dates: [URL: Date] = [:]
+            for source in fresh.sources {
+                if let existing = stamps[source.url]?.modified {
+                    dates[source.url] = existing
+                } else if let mod = (try? source.url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
+                    dates[source.url] = mod
+                }
+            }
+            return (fresh, dates)
+        }
+        var dates: [URL: Date] = [:]
+        for (url, stamp) in stamps {
+            dates[url] = stamp.modified
+        }
+        return (snapshot, dates)
+    }
+
     func selectNote(_ url: URL?) {
         activeNoteURL = url
         suppressSelectionAction = true
@@ -872,5 +891,334 @@ private final class SearchHitCell: NSTableCellView {
         cleaned = cleaned.replacingOccurrences(of: "\\*\\*([^\\*]+)\\*\\*", with: "$1", options: .regularExpression)
         cleaned = cleaned.replacingOccurrences(of: "`([^`]+)`", with: "$1", options: .regularExpression)
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+@MainActor
+final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    let searchField = NSSearchField()
+    var onOpenNote: ((URL) -> Void)?
+    var onOpenExternal: ((URL) -> Void)?
+    var onDismiss: (() -> Void)?
+    var onShowSidebarSearch: (() -> Void)?
+
+    private let card = PaperSurface(cornerRadius: 14, color: Theme.paper, bordered: true)
+    private let icon = Theme.symbol("magnifyingglass", size: 15, color: Theme.accent)
+    private let table = NSTableView()
+    private let statusLabel = Theme.label("", size: 10, color: Theme.subtle)
+    private let emptyLabel = Theme.label("", size: 13, color: Theme.muted)
+    private(set) var hits: [SearchHit] = []
+    private var snapshot: SearchSnapshot?
+    private var modifiedDates: [URL: Date] = [:]
+
+    var selectedIndex: Int { table.selectedRow }
+    var query: String {
+        get { searchField.stringValue }
+        set {
+            searchField.stringValue = newValue
+            updateResults()
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.zPosition = 2000
+        setAccessibilityLabel("Global note search")
+
+        card.wantsLayer = true
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.28)
+        shadow.shadowOffset = NSSize(width: 0, height: -6)
+        shadow.shadowBlurRadius = 22
+        card.shadow = shadow
+
+        searchField.isBordered = false
+        searchField.isBezeled = false
+        searchField.drawsBackground = false
+        searchField.focusRingType = .none
+        searchField.font = .systemFont(ofSize: 15, weight: .medium)
+        searchField.textColor = Theme.ink
+        searchField.placeholderString = "Jump to any note, PDF, or screenshot…"
+        searchField.delegate = self
+        searchField.sendsWholeSearchString = false
+        searchField.sendsSearchStringImmediately = true
+        searchField.setAccessibilityLabel("Global note search query")
+        if let cell = searchField.cell as? NSSearchFieldCell {
+            cell.searchButtonCell = nil
+        }
+
+        let escBadge = Theme.label("ESC", size: 9.5, color: Theme.subtle)
+        escBadge.font = Theme.monoFont(9.5, weight: .semibold)
+        escBadge.setContentHuggingPriority(.required, for: .horizontal)
+
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        let topBar = NSView()
+        for v in [icon, searchField, escBadge] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            topBar.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 18),
+            icon.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 18),
+            searchField.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            searchField.trailingAnchor.constraint(equalTo: escBadge.leadingAnchor, constant: -10),
+            searchField.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            escBadge.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -18),
+            escBadge.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            topBar.heightAnchor.constraint(equalToConstant: 48)
+        ])
+
+        let topDivider = HairlineView()
+        let bottomDivider = HairlineView()
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("quickSwitcherSource"))
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.style = .plain
+        table.rowHeight = 72
+        table.intercellSpacing = NSSize(width: 0, height: 2)
+        table.backgroundColor = .clear
+        table.selectionHighlightStyle = .regular
+        table.allowsEmptySelection = true
+        table.delegate = self
+        table.dataSource = self
+        table.target = self
+        table.action = #selector(rowClicked)
+        table.doubleAction = #selector(rowClicked)
+
+        let scroll = NSScrollView()
+        scroll.verticalScroller = CozyScroller()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.drawsBackground = false
+
+        emptyLabel.alignment = .center
+        emptyLabel.maximumNumberOfLines = 2
+        let resultsContainer = NSView()
+        Theme.fill(scroll, in: resultsContainer)
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        resultsContainer.addSubview(emptyLabel)
+        NSLayoutConstraint.activate([
+            emptyLabel.leadingAnchor.constraint(equalTo: resultsContainer.leadingAnchor, constant: 24),
+            emptyLabel.trailingAnchor.constraint(equalTo: resultsContainer.trailingAnchor, constant: -24),
+            emptyLabel.centerYAnchor.constraint(equalTo: resultsContainer.centerYAnchor)
+        ])
+
+        let hintLabel = Theme.label("↑↓ navigate  ·  ↵ open  ·  esc dismiss", size: 10, color: Theme.subtle)
+        hintLabel.font = Theme.monoFont(10, weight: .medium)
+        statusLabel.font = Theme.monoFont(10, weight: .semibold)
+        statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footerBar = Theme.stack([hintLabel, footerSpacer, statusLabel], spacing: 8)
+
+        for v in [topBar, topDivider, resultsContainer, bottomDivider, footerBar] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            card.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            topBar.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            topBar.topAnchor.constraint(equalTo: card.topAnchor),
+            topDivider.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            topDivider.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            topDivider.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+            topDivider.heightAnchor.constraint(equalToConstant: 1),
+            resultsContainer.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            resultsContainer.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            resultsContainer.topAnchor.constraint(equalTo: topDivider.bottomAnchor, constant: 4),
+            resultsContainer.bottomAnchor.constraint(equalTo: bottomDivider.topAnchor, constant: -4),
+            bottomDivider.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            bottomDivider.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            bottomDivider.bottomAnchor.constraint(equalTo: footerBar.topAnchor),
+            bottomDivider.heightAnchor.constraint(equalToConstant: 1),
+            footerBar.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
+            footerBar.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -18),
+            footerBar.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            footerBar.heightAnchor.constraint(equalToConstant: 30)
+        ])
+
+        card.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(card)
+        let widthConstraint = card.widthAnchor.constraint(equalToConstant: 580)
+        widthConstraint.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            card.centerXAnchor.constraint(equalTo: centerXAnchor),
+            card.topAnchor.constraint(equalTo: topAnchor, constant: 64),
+            widthConstraint,
+            card.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 32),
+            card.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -32),
+            card.heightAnchor.constraint(equalToConstant: 416)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.withAlphaComponent(0.24).setFill()
+        bounds.fill()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        searchField.textColor = Theme.ink
+        icon.contentTintColor = Theme.accent
+        needsDisplay = true
+        card.needsDisplay = true
+        table.reloadData()
+    }
+
+    func present(snapshot: SearchSnapshot?, modifiedDates: [URL: Date], initialQuery: String = "") {
+        self.snapshot = snapshot
+        self.modifiedDates = modifiedDates
+        searchField.stringValue = initialQuery
+        updateResults()
+        isHidden = false
+        window?.makeFirstResponder(searchField)
+        searchField.selectText(nil)
+    }
+
+    func dismiss() {
+        guard !isHidden else { return }
+        isHidden = true
+        onDismiss?()
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        updateResults()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        switch commandSelector {
+        case #selector(NSResponder.moveDown(_:)):
+            guard !hits.isEmpty else { return true }
+            let next = table.selectedRow >= 0 ? min(hits.count - 1, table.selectedRow + 1) : 0
+            table.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+            table.scrollRowToVisible(next)
+            return true
+        case #selector(NSResponder.moveUp(_:)):
+            guard !hits.isEmpty else { return true }
+            let prev = table.selectedRow > 0 ? table.selectedRow - 1 : 0
+            table.selectRowIndexes(IndexSet(integer: prev), byExtendingSelection: false)
+            table.scrollRowToVisible(prev)
+            return true
+        case #selector(NSResponder.insertNewline(_:)),
+             #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+            confirmSelection()
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            dismiss()
+            return true
+        default:
+            return false
+        }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard !isHidden, event.type == .keyDown else {
+            return super.performKeyEquivalent(with: event)
+        }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == .command {
+            if key == "p" || key == "o" {
+                dismiss()
+                return true
+            }
+            if key == "f" {
+                isHidden = true
+                onShowSidebarSearch?()
+                return true
+            }
+        } else if flags == [.command, .shift], key == "f" {
+            dismiss()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        if !card.frame.contains(pt) {
+            dismiss()
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    @discardableResult
+    func confirmSelection(at explicitRow: Int? = nil) -> Bool {
+        guard !hits.isEmpty else { return false }
+        let row = explicitRow ?? (table.selectedRow >= 0 ? table.selectedRow : 0)
+        guard hits.indices.contains(row) else { return false }
+        let hit = hits[row]
+        isHidden = true
+        if hit.source.kind == .note {
+            onOpenNote?(hit.source.url)
+        } else {
+            onOpenExternal?(hit.source.url)
+        }
+        return true
+    }
+
+    @objc private func rowClicked() {
+        let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
+        guard hits.indices.contains(row) else { return }
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        confirmSelection(at: row)
+    }
+
+    private func updateResults() {
+        let q = searchField.stringValue
+        let browsing = q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        var nextHits = snapshot?.search(q) ?? []
+        if browsing {
+            nextHits.sort {
+                let left = modifiedDates[$0.source.url] ?? .distantPast
+                let right = modifiedDates[$1.source.url] ?? .distantPast
+                return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
+            }
+        }
+        hits = nextHits
+        table.reloadData()
+        if !hits.isEmpty {
+            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            table.scrollRowToVisible(0)
+        } else {
+            table.deselectAll(nil)
+        }
+        emptyLabel.isHidden = !hits.isEmpty
+        if snapshot == nil {
+            emptyLabel.stringValue = "Loading notes…"
+        } else if snapshot?.sources.isEmpty == true {
+            emptyLabel.stringValue = "No notes in this workspace yet."
+        } else {
+            emptyLabel.stringValue = "No matching notes or files."
+        }
+        let count = hits.count
+        let noun = browsing ? (count == 1 ? "ITEM" : "ITEMS") : (count == 1 ? "MATCH" : "MATCHES")
+        statusLabel.stringValue = "\(count) \(noun)"
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        hits.count
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        SearchHitRow()
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard hits.indices.contains(row) else { return nil }
+        let id = NSUserInterfaceItemIdentifier("QuickSwitcherHit")
+        let cell = (tableView.makeView(withIdentifier: id, owner: self) as? SearchHitCell) ?? SearchHitCell(frame: .zero)
+        cell.identifier = id
+        let hit = hits[row]
+        cell.show(hit, modifiedAt: modifiedDates[hit.source.url])
+        return cell
     }
 }
