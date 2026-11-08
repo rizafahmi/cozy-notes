@@ -311,8 +311,53 @@ final class VaultTests: XCTestCase {
 #if canImport(Testing)
 import Testing
 
-@Suite("Vault Delete")
-struct VaultDeleteSuite {
+@Suite("Vault Core")
+struct VaultCoreSuite {
+    @Test("Capture preserves attachment bytes and encodes Markdown paths")
+    func capturePreservesAttachmentBytes() throws {
+        try VaultTests().testCapturePreservesAttachmentBytesAndEncodesMarkdownPaths()
+    }
+
+    @Test("Attachment filename sanitization and failed capture rollback")
+    func attachmentSanitizationAndRollback() throws {
+        try VaultTests().testAttachmentFilenameSanitizationAndFailedCaptureRollback()
+    }
+
+    @Test("Optimistic save rejects external edit and deletion")
+    func optimisticSaveRejectsConflict() throws {
+        try VaultTests().testOptimisticSaveRejectsExternalEditAndDeletion()
+    }
+
+    @Test("Restore recovers changed and deleted originals but keeps new files")
+    func restoreRecoversOriginals() throws {
+        try VaultTests().testRestoreRecoversChangedAndDeletedOriginalsButKeepsNewFiles()
+    }
+
+    @Test("Symlink escapes are neither read, written, nor snapshotted")
+    func symlinkEscapesRejected() throws {
+        try VaultTests().testSymlinkEscapesAreNeitherReadWrittenNorSnapshotted()
+    }
+
+    @Test("Initialization preserves instructions and discovery finds reorganized notes")
+    func initializationPreservesInstructions() throws {
+        try VaultTests().testInitializationPreservesInstructionsAndDiscoveryFindsReorganizedNotes()
+    }
+
+    @Test("Capture preserves Markdown code fences and whitespace")
+    func capturePreservesCodeFences() throws {
+        try VaultTests().testCapturePreservesMarkdownCodeFencesAndWhitespace()
+    }
+
+    @Test("Case-variant attachment names preserve both originals")
+    func caseVariantAttachments() throws {
+        try VaultTests().testCaseVariantAttachmentNamesPreserveBothOriginals()
+    }
+
+    @Test("Attach to existing note deduplicates and resolves linked attachments")
+    func attachToExistingNote() throws {
+        try VaultTests().testAttachToExistingNoteDeduplicatesAndResolvesLinkedAttachments()
+    }
+
     @Test("Deleting a note checkpoints recovery and removes its attachment folder")
     func deleteNoteAndRecover() throws {
         try VaultTests().testDeleteNoteCreatesRecoveryCheckpointAndRemovesAttachmentFolder()

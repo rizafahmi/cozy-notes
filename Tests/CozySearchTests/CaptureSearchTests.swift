@@ -171,3 +171,45 @@ final class CaptureSearchTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.companion("cancel.pdf").path))
     }
 }
+
+#if canImport(Testing)
+import Testing
+
+@Suite("Capture Search")
+struct CaptureSearchSuite {
+    @Test("AND case, original language, and grapheme-safe highlights")
+    func andCaseAndGraphemeHighlights() throws {
+        try CaptureSearchTests().testANDCaseOriginalLanguageAndGraphemeSafeHighlights()
+    }
+
+    @Test("Captured notes use content titles rather than storage identifiers")
+    func capturedNotesUseContentTitles() throws {
+        try CaptureSearchTests().testCapturedNotesUseContentTitlesRatherThanStorageIdentifiers()
+    }
+
+    @Test("Changed and deleted originals invalidate companions across restart")
+    func changedOriginalsInvalidateCompanions() throws {
+        try CaptureSearchTests().testChangedAndDeletedOriginalsInvalidateCompanionsAcrossRestart()
+    }
+
+    @Test("Original preservation, companion edits, and create collisions")
+    func originalPreservationAndCompanionEdits() throws {
+        try CaptureSearchTests().testOriginalPreservationCompanionEditsAndCreateCollisions()
+    }
+
+    @Test("PDF page references, partial, scanned, and corrupt statuses")
+    func pdfPageReferencesAndStatuses() throws {
+        try CaptureSearchTests().testPDFPageReferencesPartialScannedAndCorruptStatuses()
+    }
+
+    @Test("Symlink and hidden sources are not traversed and unsupported rows remain visible")
+    func symlinkHiddenAndUnsupportedRows() throws {
+        try CaptureSearchTests().testSymlinkAndHiddenSourcesAreNotTraversedAndUnsupportedRowsRemainVisible()
+    }
+
+    @Test("Cancellation before commit creates no companion")
+    func cancellationBeforeCommit() throws {
+        try CaptureSearchTests().testCancellationBeforeCommitCreatesNoCompanion()
+    }
+}
+#endif
