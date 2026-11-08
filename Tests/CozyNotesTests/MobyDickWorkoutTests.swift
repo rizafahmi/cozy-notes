@@ -838,6 +838,43 @@ struct MobyDickWorkoutSuite {
         #expect(workspace.quickSwitcher.hits.first?.source.url == bodyMatchNote.url)
         #expect(workspace.quickSwitcher.confirmSelection())
         #expect(workspace.noteURL == bodyMatchNote.url)
+
+        // 5. Pressing ⌘F opens In-Note Find inside the active editor document without expanding the sidebar
+        workspace.editor.text = "# Daily Log\nAtlas first match and Atlas second match."
+        workspace.editor.textView.setSelectedRange(NSRange(location: 0, length: 0))
+        let cmdF = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            characters: "f",
+            charactersIgnoringModifiers: "f",
+            isARepeat: false,
+            keyCode: 3
+        ))
+        #expect(workspace.editor.textView.performKeyEquivalent(with: cmdF))
+        #expect(workspace.editor.isInNoteFindVisible)
+        #expect(workspace.isSidebarCollapsed)
+
+        workspace.editor.inNoteFindQuery = "Atlas"
+        #expect(workspace.editor.inNoteFindMatchCount == 2)
+        #expect(workspace.editor.activeInNoteFindMatchIndex == 0)
+        let firstMatchRange = workspace.editor.textView.selectedRange()
+        #expect(firstMatchRange.length == 5)
+
+        workspace.editor.findNextInNote()
+        #expect(workspace.editor.activeInNoteFindMatchIndex == 1)
+        #expect(workspace.editor.textView.selectedRange().location > firstMatchRange.location)
+
+        workspace.editor.findPreviousInNote()
+        #expect(workspace.editor.activeInNoteFindMatchIndex == 0)
+        #expect(workspace.editor.textView.selectedRange() == firstMatchRange)
+
+        workspace.editor.hideInNoteFind()
+        #expect(!workspace.editor.isInNoteFindVisible)
+        #expect(workspace.editor.inNoteFindMatchCount == 0)
     }
 }
 #endif

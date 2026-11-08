@@ -91,7 +91,9 @@ import CozyCore
         }
     }
     @objc private func deleteNote() { workspace?.deleteCurrentNote() }
-    @objc private func search() { workspace?.focusSearch(); workspace?.showAndFocus() }
+    @objc private func search() { workspace?.showAndFocus(); workspace?.showInNoteFind() }
+    @objc private func findNext() { workspace?.showAndFocus(); workspace?.findNextInNote() }
+    @objc private func findPrevious() { workspace?.showAndFocus(); workspace?.findPreviousInNote() }
     @objc private func quickSwitcher() { workspace?.showAndFocus(); workspace?.toggleQuickSwitcher() }
     @objc private func makeSearchable() { workspace?.makeSearchable() }
     @objc private func recovery() { workspace?.showRecovery() }
@@ -156,6 +158,10 @@ import CozyCore
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        edit.addItem(.separator())
+        add("Find in Note…", action: #selector(search), key: "f", to: edit)
+        add("Find Next", action: #selector(findNext), key: "g", to: edit)
+        add("Find Previous", action: #selector(findPrevious), key: "g", modifiers: [.command, .shift], to: edit)
         let formatItem = NSMenuItem()
         formatItem.title = "Format"
         let format = NSMenu(title: "Format")
@@ -203,8 +209,7 @@ import CozyCore
         view.addItem(.separator())
         add("Focus Editor", action: #selector(captureMode), key: "1", to: view)
         add("Focus Sidebar", action: #selector(findMode), key: "2", to: view)
-        add("Search Notes & Files", action: #selector(search), key: "f", to: view)
-        add("Quick Open…", action: #selector(quickSwitcher), key: "p", to: view)
+        add("Quick Open / Global Search…", action: #selector(quickSwitcher), key: "p", to: view)
         add("Global Note Search…", action: #selector(quickSwitcher), key: "f", modifiers: [.command, .shift], to: view)
         add("Show Workspace", action: #selector(showWorkspace), key: "", to: view)
         NSApp.mainMenu = bar

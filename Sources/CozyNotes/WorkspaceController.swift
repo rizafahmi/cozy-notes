@@ -207,7 +207,7 @@ import CozyCore
             self?.editor.focus()
         }
         quickSwitcher.onDismiss = { [weak self] in self?.editor.focus() }
-        quickSwitcher.onShowSidebarSearch = { [weak self] in self?.showFind() }
+        quickSwitcher.onShowSidebarSearch = { [weak self] in self?.showInNoteFind() }
         searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         searchPanel.onNewNote = { [weak self] in self?.newCapture() }
         searchPanel.onDeleteNote = { [weak self] url in self?.confirmAndDeleteNote(url) }
@@ -217,6 +217,7 @@ import CozyCore
         searchPanel.onRevealFolder = { [weak self] in self?.revealFolder() }
         searchPanel.onChooseFolder = { [weak self] in self?.chooseFolder() }
         searchPanel.onShowRecovery = { [weak self] in self?.showRecovery() }
+        searchPanel.onShowGlobalSearch = { [weak self] in self?.showQuickSwitcher() }
     }
 
     private func syncFolioMargins(_ inset: CGFloat) {
@@ -335,7 +336,20 @@ import CozyCore
     @objc func showFind() {
         dismissQuickSwitcher()
         if isSidebarCollapsed { setSidebarCollapsed(false) }
-        searchPanel.focusSearch()
+        searchPanel.focusSidebar()
+    }
+
+    @objc func showInNoteFind() {
+        dismissQuickSwitcher()
+        editor.showInNoteFind()
+    }
+
+    @objc func findNextInNote() {
+        editor.findNextInNote()
+    }
+
+    @objc func findPreviousInNote() {
+        editor.findPreviousInNote()
     }
 
     func showAndFocus() {
@@ -528,7 +542,7 @@ import CozyCore
     }
 
     @objc func focusSearch() {
-        showFind()
+        showInNoteFind()
     }
 
     @objc func makeSearchable() {
