@@ -147,6 +147,14 @@ import CozyCore
     @objc private func recovery() { workspace?.showRecovery() }
     @objc private func showWorkspace() { workspace?.showAndFocus() }
     @objc private func toggleSidebar() { workspace?.toggleSidebar(); workspace?.showWindow(nil) }
+    @objc private func toggleOutline() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            noteWin.toggleOutline()
+        } else {
+            workspace?.toggleOutline()
+            workspace?.showWindow(nil)
+        }
+    }
     @objc private func toggleAppearance() { workspace?.toggleAppearance(); workspace?.showWindow(nil) }
     @objc private func cycleAtmosphere() { workspace?.cycleAtmosphere(); workspace?.showWindow(nil) }
     @objc private func cycleVoice() { workspace?.cycleVoice(); workspace?.showWindow(nil) }
@@ -249,6 +257,7 @@ import CozyCore
         viewItem.submenu = view
         bar.addItem(viewItem)
         add("Toggle Sidebar", action: #selector(toggleSidebar), key: "\\", to: view)
+        add("Toggle Document Outline", action: #selector(toggleOutline), key: "\\", modifiers: [.command, .option], to: view)
         add("Toggle Light / Dark Mode", action: #selector(toggleAppearance), key: "d", modifiers: [.command, .shift], to: view)
         add("Switch Atmosphere (Obsidian / Midnight)", action: #selector(cycleAtmosphere), key: "t", modifiers: [.command, .shift], to: view)
         add("Cycle Writing Font (Avenir / Charter / Iowan / Mono)", action: #selector(cycleVoice), key: "y", modifiers: [.command, .shift], to: view)

@@ -1032,5 +1032,156 @@ struct MobyDickWorkoutSuite {
         #expect(workspace.noteWindows.count == 2)
         #expect(!workspace.noteWindows.contains { $0 === winB })
     }
+
+    @Test("Document Outline rail excludes fenced code comments, tracks active heading, jumps/unfolds sections, and External Edit Review Banner handles Reload, Overwrite, and Keep Copy")
+    @MainActor
+    func documentOutlineAndExternalEditReviewBanner() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+        let viewMenu = try #require(mainMenu.item(withTitle: "View")?.submenu)
+        #expect(viewMenu.item(withTitle: "Toggle Document Outline") != nil)
+
+        let tempRoot = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("CozyHarnessCompanionTests-\(UUID().uuidString)", isDirectory: true)
+        let vaultRoot = tempRoot.appendingPathComponent("RepoVault", isDirectory: true)
+        let historyRoot = tempRoot.appendingPathComponent("History", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let vault = try Vault(root: vaultRoot, historyRoot: historyRoot)
+        let planURL = vaultRoot.appendingPathComponent("PLAN.md")
+        let initialPlan = """
+        # Architecture Plan
+        Initial overview paragraph.
+
+        ```sh
+        # This shell comment inside a code fence is NOT a heading
+        - Nor is this a bullet item
+        echo "hello"
+        ```
+
+        ## Storage Layer
+        Details about storage invariants.
+
+        ### Atomic Writes
+        Temp file + rename details.
+        """
+        try initialPlan.write(to: planURL, atomically: true, encoding: .utf8)
+
+        let workspace = WorkspaceController(vault: vault)
+        workspace.showWindow(nil)
+        defer {
+            workspace.shutdown()
+            workspace.window?.orderOut(nil)
+        }
+
+        workspace.openNote(planURL)
+        #expect(workspace.noteURL == planURL)
+        #expect(!workspace.editor.isOutlineVisible)
+
+        // 1. Toggle Document Outline and verify fenced code comments are excluded from headings
+        workspace.toggleOutline()
+        #expect(workspace.editor.isOutlineVisible)
+        let items = workspace.editor.outlineItems
+        #expect(items.map(\.title) == ["Architecture Plan", "Storage Layer", "Atomic Writes"])
+        #expect(items.map(\.level) == [1, 2, 3])
+
+        // Incremental typing inside an existing ``` code fence must not add a heading to the outline
+        let fenceRange = (workspace.editor.text as NSString).range(of: "echo \"hello\"")
+        #expect(fenceRange.location != NSNotFound)
+        workspace.editor.textView.setSelectedRange(NSRange(location: fenceRange.location, length: 0))
+        workspace.editor.textView.insertText("# Incremental comment inside fence\n", replacementRange: NSRange(location: fenceRange.location, length: 0))
+        #expect(workspace.editor.outlineItems.map(\.title) == ["Architecture Plan", "Storage Layer", "Atomic Writes"])
+        #expect(workspace.persistCurrent())
+        let savedAfterFenceEdit = workspace.editor.text
+
+        // 2. Fold "Storage Layer" from the outline, then click "Atomic Writes" to jump & auto-unfold
+        workspace.editor.toggleFoldForOutlineItem(at: 1)
+        #expect(workspace.editor.outlineItems[1].isFolded)
+        workspace.editor.jumpToHeading(at: 2)
+        #expect(!workspace.editor.outlineItems[1].isFolded, "Jumping to a child heading inside a folded section must unfold it")
+        #expect(workspace.editor.activeOutlineIndex == 2)
+
+        // 3. External agent modifies PLAN.md on disk while editor is clean -> Review Banner appears,
+        //    and clean buffer does NOT block persistCurrent() / window close!
+        let agentUpdatedPlan = savedAfterFenceEdit + "\n## Verification Suite\nAdded by coding agent.\n"
+        try agentUpdatedPlan.write(to: planURL, atomically: true, encoding: .utf8)
+        workspace.refreshNoteIfClean()
+
+        #expect(workspace.hasExternalDiskChange)
+        #expect(!workspace.noteDirty)
+        #expect(!workspace.reviewBanner.isHidden)
+        #expect(workspace.persistCurrent(), "Clean buffer with external change banner must not block window close or quit")
+        #expect(workspace.editor.text == savedAfterFenceEdit, "Editor text must not be silently replaced before user clicks Reload Disk")
+
+        // Click Reload Disk -> loads agent version and highlights changed lines
+        workspace.reloadFromDisk()
+        #expect(!workspace.hasExternalDiskChange)
+        #expect(workspace.reviewBanner.isHidden)
+        #expect(workspace.editor.text == agentUpdatedPlan)
+        #expect(!workspace.editor.textView.externalChangeRanges.isEmpty)
+        #expect(workspace.editor.outlineItems.map(\.title).contains("Verification Suite"))
+
+        // 4. Local edit + concurrent external edit -> CAS-guarded Overwrite Disk rejects unseen v3, then succeeds once reviewed
+        let endLoc = workspace.editor.nsText.length
+        workspace.editor.textView.setSelectedRange(NSRange(location: endLoc, length: 0))
+        workspace.editor.textView.insertText("\n### Local User Decision\nKeep this.\n", replacementRange: NSRange(location: endLoc, length: 0))
+        let concurrentAgentV2 = agentUpdatedPlan + "\n### Concurrent Agent Draft v2\n"
+        try concurrentAgentV2.write(to: planURL, atomically: true, encoding: .utf8)
+        workspace.refreshNoteIfClean()
+
+        #expect(workspace.hasExternalDiskChange)
+        #expect(workspace.noteConflicted)
+        #expect(!workspace.reviewBanner.isHidden)
+
+        // Agent writes an unseen v3 after the banner appeared -> Overwrite Disk must NOT destroy v3 unseen
+        let unseenAgentV3 = agentUpdatedPlan + "\n### Unseen Agent Draft v3\n"
+        try unseenAgentV3.write(to: planURL, atomically: true, encoding: .utf8)
+        workspace.overwriteDiskWithCurrent()
+        #expect(workspace.hasExternalDiskChange, "Overwrite must catch unseen v3 conflict and refresh banner")
+        #expect(try vault.read(planURL) == unseenAgentV3, "Unseen v3 on disk must be preserved")
+
+        // Clicking Overwrite Disk now (against refreshed v3 baseline) succeeds
+        workspace.overwriteDiskWithCurrent()
+        #expect(!workspace.hasExternalDiskChange)
+        #expect(!workspace.noteConflicted)
+        #expect(workspace.reviewBanner.isHidden)
+        let afterOverwriteText = try vault.read(planURL)
+        #expect(afterOverwriteText.contains("### Local User Decision"))
+
+        // 5. Keep Copy creates a new Inbox note with local edits while leaving PLAN.md with the agent's text
+        let endLoc2 = workspace.editor.nsText.length
+        workspace.editor.textView.setSelectedRange(NSRange(location: endLoc2, length: 0))
+        workspace.editor.textView.insertText("\n### Forked Local Thought\nSave to Inbox.\n", replacementRange: NSRange(location: endLoc2, length: 0))
+        let agentFinalPlan = afterOverwriteText + "\n## Agent Final Section\nPreserved on PLAN.md.\n"
+        try agentFinalPlan.write(to: planURL, atomically: true, encoding: .utf8)
+        workspace.refreshNoteIfClean()
+        #expect(workspace.hasExternalDiskChange)
+
+        workspace.resolveConflictAsNewNote()
+        #expect(!workspace.hasExternalDiskChange)
+        #expect(!workspace.noteConflicted)
+        #expect(workspace.noteURL != planURL)
+        #expect(workspace.noteURL?.path.contains("/Inbox/") == true)
+        #expect(workspace.editor.text.contains("### Forked Local Thought"))
+        #expect(try vault.read(planURL) == agentFinalPlan, "PLAN.md on disk must retain the agent's version")
+
+        // 6. Secondary NoteWindowController external-change banner flow
+        let noteWin = try #require(workspace.openNoteInNewWindow(planURL))
+        #expect(noteWin.noteURL == planURL)
+        #expect(!noteWin.hasExternalDiskChange)
+        let agentCompanionUpdate = agentFinalPlan + "\n### Companion Window Agent Update\n"
+        try agentCompanionUpdate.write(to: planURL, atomically: true, encoding: .utf8)
+        noteWin.refreshNoteIfClean()
+        #expect(noteWin.hasExternalDiskChange)
+        #expect(!noteWin.reviewBanner.isHidden)
+        #expect(noteWin.persistCurrent(), "Clean secondary window with external change banner must allow closing")
+        noteWin.reloadFromDisk()
+        #expect(!noteWin.hasExternalDiskChange)
+        #expect(noteWin.reviewBanner.isHidden)
+        #expect(noteWin.editor.text == agentCompanionUpdate)
+        #expect(!noteWin.editor.textView.externalChangeRanges.isEmpty)
+    }
 }
 #endif

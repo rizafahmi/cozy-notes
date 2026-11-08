@@ -1,6 +1,66 @@
 import AppKit
 import CozyCore
 
+@MainActor final class ExternalEditReviewBanner: NSView {
+    let messageLabel = Theme.label("Modified on disk by external process", size: 11.5, color: Theme.ink)
+    let reloadButton = QuietButton(title: "Reload Disk", symbol: "arrow.clockwise", target: nil, action: nil)
+    let overwriteButton = QuietButton(title: "Overwrite Disk", symbol: "arrow.up.doc", target: nil, action: nil)
+    let keepCopyButton = QuietButton(title: "Keep Copy", symbol: "doc.on.doc", target: nil, action: nil)
+    var onReloadDisk: (() -> Void)?
+    var onOverwriteDisk: (() -> Void)?
+    var onKeepCopy: (() -> Void)?
+
+    private let card = PaperSurface(cornerRadius: 8, color: Theme.accentSoft, bordered: true)
+    private let icon = Theme.symbol("arrow.triangle.2.circlepath", size: 12, color: Theme.accent)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("External file change review banner")
+        messageLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
+        messageLabel.lineBreakMode = .byTruncatingTail
+        messageLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        reloadButton.tint = Theme.accent
+        reloadButton.font = .systemFont(ofSize: 11, weight: .semibold)
+        reloadButton.target = self
+        reloadButton.action = #selector(reloadTapped)
+        reloadButton.toolTip = "Load the new version from disk, preserve scroll position, and highlight changed lines"
+        reloadButton.setAccessibilityLabel("Reload Disk")
+
+        overwriteButton.font = .systemFont(ofSize: 11, weight: .medium)
+        overwriteButton.target = self
+        overwriteButton.action = #selector(overwriteTapped)
+        overwriteButton.toolTip = "Overwrite the file on disk with your current editor text"
+        overwriteButton.setAccessibilityLabel("Overwrite Disk")
+
+        keepCopyButton.font = .systemFont(ofSize: 11, weight: .medium)
+        keepCopyButton.target = self
+        keepCopyButton.action = #selector(keepCopyTapped)
+        keepCopyButton.toolTip = "Save your current editor text as a new note in Inbox"
+        keepCopyButton.setAccessibilityLabel("Keep Copy")
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let row = Theme.stack([icon, messageLabel, spacer, reloadButton, overwriteButton, keepCopyButton], spacing: 6)
+        Theme.fill(row, in: card, inset: 6)
+        Theme.fill(card, in: self)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func configure(hasLocalEdits: Bool) {
+        if hasLocalEdits {
+            messageLabel.stringValue = "Modified on disk while editing · Reload disk, overwrite disk, or keep a copy"
+        } else {
+            messageLabel.stringValue = "Modified on disk · Reload to view & highlight external changes"
+        }
+    }
+
+    @objc private func reloadTapped() { onReloadDisk?() }
+    @objc private func overwriteTapped() { onOverwriteDisk?() }
+    @objc private func keepCopyTapped() { onKeepCopy?() }
+}
+
 @MainActor final class WorkspaceController: NSWindowController, NSWindowDelegate {
     let vault: Vault
     let editor = CaptureEditor(frame: .zero)
@@ -13,10 +73,12 @@ import CozyCore
     private let contextLabel = Theme.label("", size: 10.5, color: Theme.muted)
     private let voiceButton = QuietButton(title: "AVENIR", symbol: "textformat", target: nil, action: nil)
     private let atmosphereButton = QuietButton(title: "OBSIDIAN", symbol: "sparkles", target: nil, action: nil)
+    let outlineButton = QuietButton(symbol: "list.bullet.indent", target: nil, action: nil)
     let openInNewWindowButton = QuietButton(symbol: "rectangle.on.rectangle", target: nil, action: nil)
     let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
     let deleteButton = QuietButton(symbol: "trash", target: nil, action: nil)
     private let conflictSaveButton = PrimaryButton()
+    let reviewBanner = ExternalEditReviewBanner(frame: .zero)
     private let headerRule = HairlineView()
     private var sidebarWidthConstraint: NSLayoutConstraint?
     private var folioLeadingConstraint: NSLayoutConstraint?
@@ -25,7 +87,10 @@ import CozyCore
     private var headerTrailingConstraint: NSLayoutConstraint?
     private var ruleLeadingConstraint: NSLayoutConstraint?
     private var ruleTrailingConstraint: NSLayoutConstraint?
-
+    private var bannerLeadingConstraint: NSLayoutConstraint?
+    private var bannerTrailingConstraint: NSLayoutConstraint?
+    private var bannerTopConstraint: NSLayoutConstraint?
+    private var bannerHeightConstraint: NSLayoutConstraint?
     private(set) var isSidebarCollapsed = false
     private(set) var noteURL: URL? {
         didSet {
@@ -45,8 +110,10 @@ import CozyCore
     private var noteBaselineUTF16Length = 0
     private var noteBaselineSig = 0
     private var cachedNoteStamp: String?
-    private var noteDirty = false
-    private var noteConflicted = false
+    private(set) var noteDirty = false
+    private(set) var noteConflicted = false
+    private(set) var hasExternalDiskChange = false
+    private var pendingExternalDiskText: String?
     private var noteAvailable = true
     private var autosave: Timer?
     private var watcher: VaultWatcher?
@@ -130,6 +197,10 @@ import CozyCore
         atmosphereButton.action = #selector(cycleAtmosphere)
         atmosphereButton.font = Theme.monoFont(10, weight: .semibold)
         atmosphereButton.toolTip = "Switch journal atmosphere (Obsidian / Midnight)"
+        outlineButton.target = self
+        outlineButton.action = #selector(toggleOutline)
+        outlineButton.toolTip = "Toggle Document Outline (⌥⌘\\)"
+        outlineButton.setAccessibilityLabel("Toggle Document Outline")
         openInNewWindowButton.target = self
         openInNewWindowButton.action = #selector(openCurrentNoteInNewWindow)
         openInNewWindowButton.toolTip = "Open note in new window (⌥⌘O)"
@@ -148,11 +219,16 @@ import CozyCore
         conflictSaveButton.action = #selector(resolveConflictAsNewNote)
         conflictSaveButton.isHidden = true
 
+        reviewBanner.isHidden = true
+        reviewBanner.onReloadDisk = { [weak self] in self?.reloadFromDisk() }
+        reviewBanner.onOverwriteDisk = { [weak self] in self?.overwriteDiskWithCurrent() }
+        reviewBanner.onKeepCopy = { [weak self] in self?.resolveConflictAsNewNote() }
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, openInNewWindowButton, revealButton, deleteButton], spacing: 6)
+        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, outlineButton, openInNewWindowButton, revealButton, deleteButton], spacing: 6)
 
-        for view in [editorHeader, headerRule, editor] {
+        for view in [editorHeader, headerRule, reviewBanner, editor] {
             view.translatesAutoresizingMaskIntoConstraints = false
             folioSurface.addSubview(view)
         }
@@ -160,10 +236,18 @@ import CozyCore
         let headerTrail = editorHeader.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -40)
         let ruleLead = headerRule.leadingAnchor.constraint(equalTo: folioSurface.leadingAnchor, constant: 40)
         let ruleTrail = headerRule.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -40)
+        let bannerLead = reviewBanner.leadingAnchor.constraint(equalTo: folioSurface.leadingAnchor, constant: 40)
+        let bannerTrail = reviewBanner.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -40)
+        let bannerTop = reviewBanner.topAnchor.constraint(equalTo: headerRule.bottomAnchor, constant: 0)
+        let bannerHeight = reviewBanner.heightAnchor.constraint(equalToConstant: 0)
         headerLeadingConstraint = headerLead
         headerTrailingConstraint = headerTrail
         ruleLeadingConstraint = ruleLead
         ruleTrailingConstraint = ruleTrail
+        bannerLeadingConstraint = bannerLead
+        bannerTrailingConstraint = bannerTrail
+        bannerTopConstraint = bannerTop
+        bannerHeightConstraint = bannerHeight
 
         NSLayoutConstraint.activate([
             headerLead,
@@ -174,9 +258,13 @@ import CozyCore
             ruleTrail,
             headerRule.topAnchor.constraint(equalTo: editorHeader.bottomAnchor, constant: 8),
             headerRule.heightAnchor.constraint(equalToConstant: 1),
+            bannerLead,
+            bannerTrail,
+            bannerTop,
+            bannerHeight,
             editor.leadingAnchor.constraint(equalTo: folioSurface.leadingAnchor, constant: 2),
             editor.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -4),
-            editor.topAnchor.constraint(equalTo: headerRule.bottomAnchor),
+            editor.topAnchor.constraint(equalTo: reviewBanner.bottomAnchor),
             editor.bottomAnchor.constraint(equalTo: folioSurface.bottomAnchor, constant: -2)
         ])
 
@@ -219,6 +307,7 @@ import CozyCore
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in _ = self?.openWikiLinkInNewWindow(link) }
         editor.onOpenCurrentNoteInNewWindow = { [weak self] in self?.openCurrentNoteInNewWindow() }
         editor.onQuickSwitcher = { [weak self] in self?.toggleQuickSwitcher() }
+        editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
         quickSwitcher.onOpenNote = { [weak self] url in self?.openNote(url) }
         quickSwitcher.onOpenNoteInNewWindow = { [weak self] url in _ = self?.openNoteInNewWindow(url) }
         quickSwitcher.onOpenExternal = { [weak self] url in
@@ -250,7 +339,14 @@ import CozyCore
             headerTrailingConstraint?.constant = -inset
             ruleLeadingConstraint?.constant = inset
             ruleTrailingConstraint?.constant = -inset
+            bannerLeadingConstraint?.constant = inset
+            bannerTrailingConstraint?.constant = -inset
         }
+    }
+
+    @objc func toggleOutline() {
+        editor.toggleOutline()
+        updateEditorChrome()
     }
 
     @objc func toggleAppearance() {
@@ -419,7 +515,7 @@ import CozyCore
             noteDirty = editor.hasContent
         }
         updateEditorChrome()
-        guard noteDirty, !noteConflicted else { return }
+        guard noteDirty, !noteConflicted, !hasExternalDiskChange else { return }
         if editor.status.stringValue != "Editing…" {
             editor.status.stringValue = "Editing…"
         }
@@ -465,9 +561,10 @@ import CozyCore
         } catch {
             if let existingURL = noteURL, case VaultError.conflict = error {
                 noteConflicted = true
-                editor.status.stringValue = "Changed externally · Keep your edits as a new note."
+                hasExternalDiskChange = true
+                pendingExternalDiskText = try? vault.read(existingURL)
+                editor.status.stringValue = "Changed externally · Review banner above to Reload, Overwrite, or Keep Copy."
                 updateEditorChrome()
-                _ = existingURL
             }
             showError(error, in: window)
         }
@@ -491,9 +588,9 @@ import CozyCore
 
     @discardableResult func persistCurrent() -> Bool {
         autosave?.invalidate()
-        guard !noteConflicted else { return false }
         if let existingURL = noteURL {
             guard noteDirty else { return true }
+            guard !noteConflicted, !hasExternalDiskChange else { return false }
             do {
                 var savedText = editor.text
                 savedText.makeContiguousUTF8()
@@ -510,9 +607,10 @@ import CozyCore
                 return true
             } catch {
                 noteConflicted = true
-                editor.status.stringValue = "Changed externally · Click 'Keep as new note' to preserve your edits."
+                hasExternalDiskChange = true
+                pendingExternalDiskText = try? vault.read(existingURL)
+                editor.status.stringValue = "Changed externally · Review banner above to Reload, Overwrite, or Keep Copy."
                 updateEditorChrome()
-                showError(error, in: window)
                 return false
             }
         } else {
@@ -525,6 +623,8 @@ import CozyCore
                 noteBaseline = saved
                 noteDirty = false
                 noteConflicted = false
+                hasExternalDiskChange = false
+                pendingExternalDiskText = nil
                 noteAvailable = true
                 editor.clearPendingAttachments()
                 if !pending.isEmpty {
@@ -552,7 +652,69 @@ import CozyCore
         }
     }
 
-    @objc private func resolveConflictAsNewNote() {
+    @objc func reloadFromDisk() {
+        autosave?.invalidate()
+        guard let existingURL = noteURL else { return }
+        do {
+            let diskText = try vault.read(existingURL)
+            let previousBaseline = noteBaseline
+            let changedCount = editor.applyExternalReload(diskText, previousText: previousBaseline, highlightChanges: true)
+            noteBaseline = diskText
+            noteDirty = false
+            noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
+            noteAvailable = true
+            cachedNoteStamp = nil
+            editor.linkedAttachments = vault.linkedAttachments(in: diskText, relativeTo: existingURL)
+            editor.status.stringValue = changedCount > 0
+                ? "Reloaded from disk · \(changedCount) changed \(changedCount == 1 ? "section" : "sections") highlighted"
+                : "Reloaded from disk"
+            syncSavedNoteToCompanions(existingURL, content: diskText)
+            updateEditorChrome()
+            searchPanel.refresh()
+            editor.focus()
+        } catch {
+            showError(error, in: window)
+        }
+    }
+
+    @objc func overwriteDiskWithCurrent() {
+        autosave?.invalidate()
+        guard let existingURL = noteURL else { return }
+        do {
+            var savedText = editor.text
+            savedText.makeContiguousUTF8()
+            let expected = pendingExternalDiskText ?? noteBaseline
+            try vault.save(savedText, to: existingURL, expectedContent: expected)
+            noteBaseline = savedText
+            editor.cacheFullText(savedText)
+            noteDirty = false
+            noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
+            noteAvailable = true
+            cachedNoteStamp = nil
+            editor.clearExternalChangeHighlights()
+            editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: existingURL)
+            editor.status.stringValue = "Overwrote disk with current editor version"
+            syncSavedNoteToCompanions(existingURL, content: savedText)
+            updateEditorChrome()
+            searchPanel.refresh()
+            editor.focus()
+        } catch VaultError.conflict {
+            pendingExternalDiskText = try? vault.read(existingURL)
+            hasExternalDiskChange = true
+            noteConflicted = true
+            editor.status.stringValue = "Disk changed again since banner appeared · Review updated file before overwriting."
+            updateEditorChrome()
+        } catch {
+            showError(error, in: window)
+        }
+    }
+
+    @objc func resolveConflictAsNewNote() {
+        autosave?.invalidate()
         do {
             let note = try vault.capture(text: editor.text, attachments: editor.attachments)
             let saved = try vault.read(note.url)
@@ -560,8 +722,11 @@ import CozyCore
             noteBaseline = saved
             noteDirty = false
             noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
             noteAvailable = true
             editor.clearPendingAttachments()
+            editor.clearExternalChangeHighlights()
             editor.text = saved
             editor.linkedAttachments = vault.linkedAttachments(in: saved, relativeTo: note.url)
             editor.status.stringValue = "Kept as a new note"
@@ -578,6 +743,8 @@ import CozyCore
         noteBaseline = ""
         noteDirty = false
         noteConflicted = false
+        hasExternalDiskChange = false
+        pendingExternalDiskText = nil
         noteAvailable = true
         editor.reset()
         searchPanel.selectNote(nil)
@@ -710,6 +877,8 @@ import CozyCore
     private func handleCompanionNoteSaved(_ url: URL, content: String, from sender: NoteWindowController?) {
         if noteURL == url && !noteDirty && !noteConflicted && content != noteBaseline {
             noteBaseline = content
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
             cachedNoteStamp = nil
             editor.text = content
             editor.linkedAttachments = vault.linkedAttachments(in: content, relativeTo: url)
@@ -747,6 +916,8 @@ import CozyCore
             noteBaseline = text
             noteDirty = false
             noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
             noteAvailable = true
             cachedNoteStamp = nil
             editor.clearPendingAttachments()
@@ -759,14 +930,32 @@ import CozyCore
         } catch { showError(error, in: window) }
     }
 
-    private func refreshNoteIfClean() {
-        guard let noteURL, !noteDirty, !noteConflicted else { return }
+    func refreshNoteIfClean() {
+        guard let noteURL else { return }
         do {
             let text = try vault.read(noteURL)
             if text != noteBaseline {
-                noteBaseline = text
-                editor.text = text
-                editor.linkedAttachments = vault.linkedAttachments(in: text, relativeTo: noteURL)
+                if editor.text == text {
+                    noteBaseline = text
+                    noteDirty = false
+                    noteConflicted = false
+                    hasExternalDiskChange = false
+                    pendingExternalDiskText = nil
+                    cachedNoteStamp = nil
+                } else {
+                    autosave?.invalidate()
+                    pendingExternalDiskText = text
+                    hasExternalDiskChange = true
+                    if noteDirty {
+                        noteConflicted = true
+                        editor.status.stringValue = "Changed externally while editing · Review banner above to Reload, Overwrite, or Keep Copy."
+                    } else {
+                        editor.status.stringValue = "Changed externally on disk · Click 'Reload Disk' to load & highlight changes."
+                    }
+                }
+            } else if hasExternalDiskChange && !noteConflicted {
+                hasExternalDiskChange = false
+                pendingExternalDiskText = nil
             }
             if !noteAvailable { editor.status.stringValue = "" }
             noteAvailable = true
@@ -778,7 +967,18 @@ import CozyCore
     }
 
     private func updateEditorChrome() {
+        let showBanner = hasExternalDiskChange || noteConflicted
+        if reviewBanner.isHidden == showBanner {
+            reviewBanner.isHidden = !showBanner
+            bannerTopConstraint?.constant = showBanner ? 8 : 0
+            bannerHeightConstraint?.constant = showBanner ? 38 : 0
+        }
+        if showBanner {
+            reviewBanner.configure(hasLocalEdits: noteDirty || noteConflicted)
+        }
         if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
+        let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted
+        if outlineButton.tint != desiredOutlineTint { outlineButton.tint = desiredOutlineTint }
         let hideNoteActions = noteURL == nil
         if openInNewWindowButton.isHidden != hideNoteActions { openInNewWindowButton.isHidden = hideNoteActions }
         if revealButton.isHidden != hideNoteActions { revealButton.isHidden = hideNoteActions }
@@ -788,6 +988,7 @@ import CozyCore
         let atmoBadge = Theme.atmosphere.shortBadge
         if atmosphereButton.title != atmoBadge { atmosphereButton.title = atmoBadge }
         if let noteURL {
+            let relPath = String(noteURL.path.dropFirst(vault.root.path.count + 1))
             let stamp: String
             if let cached = cachedNoteStamp {
                 stamp = cached
@@ -796,9 +997,18 @@ import CozyCore
                 let formatted = Self.headerDateFormatter.string(from: modified).uppercased()
                 cachedNoteStamp = formatted
                 stamp = formatted
-                contextLabel.toolTip = String(noteURL.path.dropFirst(vault.root.path.count + 1))
+                contextLabel.toolTip = relPath
             }
-            let nextContext = noteDirty ? "\(stamp)  ·  UNSAVED" : stamp
+            let prefix = !relPath.hasPrefix("Inbox/") ? "\(relPath.uppercased())  ·  " : ""
+            let stateSuffix: String
+            if hasExternalDiskChange {
+                stateSuffix = "  ·  DISK UPDATED"
+            } else if noteDirty {
+                stateSuffix = "  ·  UNSAVED"
+            } else {
+                stateSuffix = ""
+            }
+            let nextContext = "\(prefix)\(stamp)\(stateSuffix)"
             if contextLabel.stringValue != nextContext { contextLabel.stringValue = nextContext }
         } else {
             let stamp = Self.headerDateFormatter.string(from: Date()).uppercased()
@@ -863,6 +1073,8 @@ import CozyCore
                 noteBaseline = ""
                 noteDirty = false
                 noteConflicted = false
+                hasExternalDiskChange = false
+                pendingExternalDiskText = nil
                 noteAvailable = true
                 editor.reset()
                 editor.status.stringValue = "Moved to Trash"
@@ -929,6 +1141,8 @@ import CozyCore
                         self.noteBaseline = reloaded
                         self.noteDirty = false
                         self.noteConflicted = false
+                        self.hasExternalDiskChange = false
+                        self.pendingExternalDiskText = nil
                         self.noteAvailable = true
                         self.editor.text = reloaded
                         self.editor.linkedAttachments = self.vault.linkedAttachments(in: reloaded, relativeTo: activeURL)
@@ -969,16 +1183,21 @@ import CozyCore
     private let folioSurface = FolioPageSurface()
     private let sealDot = PaperSurface(cornerRadius: 3.5, color: Theme.sage, bordered: false)
     private let contextLabel = Theme.label("", size: 10.5, color: Theme.muted)
+    let outlineButton = QuietButton(symbol: "list.bullet.indent", target: nil, action: nil)
     let focusInWorkspaceButton = QuietButton(symbol: "sidebar.left", target: nil, action: nil)
     let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
     let deleteButton = QuietButton(symbol: "trash", target: nil, action: nil)
     private let conflictSaveButton = PrimaryButton()
+    let reviewBanner = ExternalEditReviewBanner(frame: .zero)
     private let headerRule = HairlineView()
     private var headerLeadingConstraint: NSLayoutConstraint?
     private var headerTrailingConstraint: NSLayoutConstraint?
     private var ruleLeadingConstraint: NSLayoutConstraint?
     private var ruleTrailingConstraint: NSLayoutConstraint?
-
+    private var bannerLeadingConstraint: NSLayoutConstraint?
+    private var bannerTrailingConstraint: NSLayoutConstraint?
+    private var bannerTopConstraint: NSLayoutConstraint?
+    private var bannerHeightConstraint: NSLayoutConstraint?
     private(set) var noteURL: URL? {
         didSet {
             if noteURL != oldValue { cachedNoteStamp = nil }
@@ -999,6 +1218,8 @@ import CozyCore
     private var cachedNoteStamp: String?
     private(set) var noteDirty = false
     private(set) var noteConflicted = false
+    private(set) var hasExternalDiskChange = false
+    private var pendingExternalDiskText: String?
     private var noteAvailable = true
     private var autosave: Timer?
     private var isClosingAfterDeletion = false
@@ -1052,6 +1273,11 @@ import CozyCore
         contextLabel.lineBreakMode = .byTruncatingMiddle
         contextLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        outlineButton.target = self
+        outlineButton.action = #selector(toggleOutline)
+        outlineButton.toolTip = "Toggle Document Outline (⌥⌘\\)"
+        outlineButton.setAccessibilityLabel("Toggle Document Outline")
+
         focusInWorkspaceButton.target = self
         focusInWorkspaceButton.action = #selector(openInMainWorkspaceTapped)
         focusInWorkspaceButton.toolTip = "Focus this note in main workspace"
@@ -1072,11 +1298,16 @@ import CozyCore
         conflictSaveButton.action = #selector(resolveConflictAsNewNote)
         conflictSaveButton.isHidden = true
 
+        reviewBanner.isHidden = true
+        reviewBanner.onReloadDisk = { [weak self] in self?.reloadFromDisk() }
+        reviewBanner.onOverwriteDisk = { [weak self] in self?.overwriteDiskWithCurrent() }
+        reviewBanner.onKeepCopy = { [weak self] in self?.resolveConflictAsNewNote() }
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let editorHeader = Theme.stack([sealDot, contextLabel, spacer, conflictSaveButton, focusInWorkspaceButton, revealButton, deleteButton], spacing: 6)
+        let editorHeader = Theme.stack([sealDot, contextLabel, spacer, conflictSaveButton, outlineButton, focusInWorkspaceButton, revealButton, deleteButton], spacing: 6)
 
-        for view in [editorHeader, headerRule, editor] {
+        for view in [editorHeader, headerRule, reviewBanner, editor] {
             view.translatesAutoresizingMaskIntoConstraints = false
             folioSurface.addSubview(view)
         }
@@ -1084,10 +1315,18 @@ import CozyCore
         let headerTrail = editorHeader.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -40)
         let ruleLead = headerRule.leadingAnchor.constraint(equalTo: folioSurface.leadingAnchor, constant: 40)
         let ruleTrail = headerRule.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -40)
+        let bannerLead = reviewBanner.leadingAnchor.constraint(equalTo: folioSurface.leadingAnchor, constant: 40)
+        let bannerTrail = reviewBanner.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -40)
+        let bannerTop = reviewBanner.topAnchor.constraint(equalTo: headerRule.bottomAnchor, constant: 0)
+        let bannerHeight = reviewBanner.heightAnchor.constraint(equalToConstant: 0)
         headerLeadingConstraint = headerLead
         headerTrailingConstraint = headerTrail
         ruleLeadingConstraint = ruleLead
         ruleTrailingConstraint = ruleTrail
+        bannerLeadingConstraint = bannerLead
+        bannerTrailingConstraint = bannerTrail
+        bannerTopConstraint = bannerTop
+        bannerHeightConstraint = bannerHeight
 
         folioSurface.translatesAutoresizingMaskIntoConstraints = false
         desk.addSubview(folioSurface)
@@ -1101,9 +1340,13 @@ import CozyCore
             ruleTrail,
             headerRule.topAnchor.constraint(equalTo: editorHeader.bottomAnchor, constant: 8),
             headerRule.heightAnchor.constraint(equalToConstant: 1),
+            bannerLead,
+            bannerTrail,
+            bannerTop,
+            bannerHeight,
             editor.leadingAnchor.constraint(equalTo: folioSurface.leadingAnchor, constant: 2),
             editor.trailingAnchor.constraint(equalTo: folioSurface.trailingAnchor, constant: -4),
-            editor.topAnchor.constraint(equalTo: headerRule.bottomAnchor),
+            editor.topAnchor.constraint(equalTo: reviewBanner.bottomAnchor),
             editor.bottomAnchor.constraint(equalTo: folioSurface.bottomAnchor, constant: -2),
             folioSurface.leadingAnchor.constraint(equalTo: desk.leadingAnchor, constant: 18),
             folioSurface.trailingAnchor.constraint(equalTo: desk.trailingAnchor, constant: -18),
@@ -1122,6 +1365,12 @@ import CozyCore
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
         editor.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
+        editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
+    }
+
+    @objc func toggleOutline() {
+        editor.toggleOutline()
+        updateEditorChrome()
     }
 
     private func syncFolioMargins(_ inset: CGFloat) {
@@ -1132,6 +1381,8 @@ import CozyCore
             headerTrailingConstraint?.constant = -inset
             ruleLeadingConstraint?.constant = inset
             ruleTrailingConstraint?.constant = -inset
+            bannerLeadingConstraint?.constant = lead
+            bannerTrailingConstraint?.constant = -inset
         }
     }
 
@@ -1154,6 +1405,8 @@ import CozyCore
             noteBaseline = text
             noteDirty = false
             noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
             noteAvailable = true
             cachedNoteStamp = nil
             editor.clearPendingAttachments()
@@ -1208,7 +1461,7 @@ import CozyCore
             noteDirty = editor.hasContent
         }
         updateEditorChrome()
-        guard noteDirty, !noteConflicted else { return }
+        guard noteDirty, !noteConflicted, !hasExternalDiskChange else { return }
         if editor.status.stringValue != "Editing…" {
             editor.status.stringValue = "Editing…"
         }
@@ -1220,9 +1473,9 @@ import CozyCore
     @discardableResult
     func persistCurrent() -> Bool {
         autosave?.invalidate()
-        guard !noteConflicted else { return false }
         guard let existingURL = noteURL else { return true }
         guard noteDirty else { return true }
+        guard !noteConflicted, !hasExternalDiskChange else { return false }
         do {
             var savedText = editor.text
             savedText.makeContiguousUTF8()
@@ -1238,9 +1491,10 @@ import CozyCore
             return true
         } catch {
             noteConflicted = true
-            editor.status.stringValue = "Changed externally · Click 'Keep as new note' to preserve your edits."
+            hasExternalDiskChange = true
+            pendingExternalDiskText = try? vault.read(existingURL)
+            editor.status.stringValue = "Changed externally · Review banner above to Reload, Overwrite, or Keep Copy."
             updateEditorChrome()
-            showError(error, in: window)
             return false
         }
     }
@@ -1254,7 +1508,66 @@ import CozyCore
         }
     }
 
-    @objc private func resolveConflictAsNewNote() {
+    @objc func reloadFromDisk() {
+        autosave?.invalidate()
+        guard let existingURL = noteURL else { return }
+        do {
+            let diskText = try vault.read(existingURL)
+            let changedCount = editor.applyExternalReload(diskText, previousText: noteBaseline, highlightChanges: true)
+            noteBaseline = diskText
+            noteDirty = false
+            noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
+            noteAvailable = true
+            cachedNoteStamp = nil
+            editor.linkedAttachments = vault.linkedAttachments(in: diskText, relativeTo: existingURL)
+            editor.status.stringValue = changedCount > 0
+                ? "Reloaded from disk · \(changedCount) changed \(changedCount == 1 ? "section" : "sections") highlighted"
+                : "Reloaded from disk"
+            updateEditorChrome()
+            onDidSaveNote?(existingURL, diskText)
+            editor.focus()
+        } catch {
+            showError(error, in: window)
+        }
+    }
+
+    @objc func overwriteDiskWithCurrent() {
+        autosave?.invalidate()
+        guard let existingURL = noteURL else { return }
+        do {
+            var savedText = editor.text
+            savedText.makeContiguousUTF8()
+            let expected = pendingExternalDiskText ?? noteBaseline
+            try vault.save(savedText, to: existingURL, expectedContent: expected)
+            noteBaseline = savedText
+            editor.cacheFullText(savedText)
+            noteDirty = false
+            noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
+            noteAvailable = true
+            cachedNoteStamp = nil
+            editor.clearExternalChangeHighlights()
+            editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: existingURL)
+            editor.status.stringValue = "Overwrote disk with current editor version"
+            updateEditorChrome()
+            onDidSaveNote?(existingURL, savedText)
+            editor.focus()
+        } catch VaultError.conflict {
+            pendingExternalDiskText = try? vault.read(existingURL)
+            hasExternalDiskChange = true
+            noteConflicted = true
+            editor.status.stringValue = "Disk changed again since banner appeared · Review updated file before overwriting."
+            updateEditorChrome()
+        } catch {
+            showError(error, in: window)
+        }
+    }
+
+    @objc func resolveConflictAsNewNote() {
+        autosave?.invalidate()
         do {
             let note = try vault.capture(text: editor.text, attachments: editor.attachments)
             let saved = try vault.read(note.url)
@@ -1262,8 +1575,11 @@ import CozyCore
             noteBaseline = saved
             noteDirty = false
             noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
             noteAvailable = true
             editor.clearPendingAttachments()
+            editor.clearExternalChangeHighlights()
             editor.text = saved
             editor.linkedAttachments = vault.linkedAttachments(in: saved, relativeTo: note.url)
             editor.status.stringValue = "Kept as a new note"
@@ -1296,7 +1612,9 @@ import CozyCore
         } catch {
             if case VaultError.conflict = error {
                 noteConflicted = true
-                editor.status.stringValue = "Changed externally · Keep your edits as a new note."
+                hasExternalDiskChange = true
+                pendingExternalDiskText = try? vault.read(existingURL)
+                editor.status.stringValue = "Changed externally · Review banner above to Reload, Overwrite, or Keep Copy."
                 updateEditorChrome()
             }
             showError(error, in: window)
@@ -1322,6 +1640,8 @@ import CozyCore
     func applyExternalSave(url: URL, content: String) {
         guard noteURL == url, !noteDirty, !noteConflicted, content != noteBaseline else { return }
         noteBaseline = content
+        hasExternalDiskChange = false
+        pendingExternalDiskText = nil
         cachedNoteStamp = nil
         noteAvailable = true
         editor.text = content
@@ -1330,14 +1650,31 @@ import CozyCore
     }
 
     func refreshNoteIfClean() {
-        guard let noteURL, !noteDirty, !noteConflicted else { return }
+        guard let noteURL else { return }
         do {
             let text = try vault.read(noteURL)
             if text != noteBaseline {
-                noteBaseline = text
-                cachedNoteStamp = nil
-                editor.text = text
-                editor.linkedAttachments = vault.linkedAttachments(in: text, relativeTo: noteURL)
+                if editor.text == text {
+                    noteBaseline = text
+                    noteDirty = false
+                    noteConflicted = false
+                    hasExternalDiskChange = false
+                    pendingExternalDiskText = nil
+                    cachedNoteStamp = nil
+                } else {
+                    autosave?.invalidate()
+                    pendingExternalDiskText = text
+                    hasExternalDiskChange = true
+                    if noteDirty {
+                        noteConflicted = true
+                        editor.status.stringValue = "Changed externally while editing · Review banner above to Reload, Overwrite, or Keep Copy."
+                    } else {
+                        editor.status.stringValue = "Changed externally on disk · Click 'Reload Disk' to load & highlight changes."
+                    }
+                }
+            } else if hasExternalDiskChange && !noteConflicted {
+                hasExternalDiskChange = false
+                pendingExternalDiskText = nil
             }
             if !noteAvailable { editor.status.stringValue = "" }
             noteAvailable = true
@@ -1353,6 +1690,8 @@ import CozyCore
         noteBaseline = reloaded
         noteDirty = false
         noteConflicted = false
+        hasExternalDiskChange = false
+        pendingExternalDiskText = nil
         noteAvailable = true
         cachedNoteStamp = nil
         editor.text = reloaded
@@ -1374,12 +1713,24 @@ import CozyCore
     }
 
     private func updateEditorChrome() {
+        let showBanner = hasExternalDiskChange || noteConflicted
+        if reviewBanner.isHidden == showBanner {
+            reviewBanner.isHidden = !showBanner
+            bannerTopConstraint?.constant = showBanner ? 8 : 0
+            bannerHeightConstraint?.constant = showBanner ? 38 : 0
+        }
+        if showBanner {
+            reviewBanner.configure(hasLocalEdits: noteDirty || noteConflicted)
+        }
         if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
+        let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted
+        if outlineButton.tint != desiredOutlineTint { outlineButton.tint = desiredOutlineTint }
         let hideNoteActions = noteURL == nil
         if focusInWorkspaceButton.isHidden != hideNoteActions { focusInWorkspaceButton.isHidden = hideNoteActions }
         if revealButton.isHidden != hideNoteActions { revealButton.isHidden = hideNoteActions }
         if deleteButton.isHidden != hideNoteActions { deleteButton.isHidden = hideNoteActions }
         if let noteURL {
+            let relPath = String(noteURL.path.dropFirst(vault.root.path.count + 1))
             let stamp: String
             if let cached = cachedNoteStamp {
                 stamp = cached
@@ -1388,9 +1739,18 @@ import CozyCore
                 let formatted = Self.headerDateFormatter.string(from: modified).uppercased()
                 cachedNoteStamp = formatted
                 stamp = formatted
-                contextLabel.toolTip = String(noteURL.path.dropFirst(vault.root.path.count + 1))
+                contextLabel.toolTip = relPath
             }
-            let nextContext = noteDirty ? "\(stamp)  ·  UNSAVED" : stamp
+            let prefix = !relPath.hasPrefix("Inbox/") ? "\(relPath.uppercased())  ·  " : ""
+            let stateSuffix: String
+            if hasExternalDiskChange {
+                stateSuffix = "  ·  DISK UPDATED"
+            } else if noteDirty {
+                stateSuffix = "  ·  UNSAVED"
+            } else {
+                stateSuffix = ""
+            }
+            let nextContext = "\(prefix)\(stamp)\(stateSuffix)"
             if contextLabel.stringValue != nextContext { contextLabel.stringValue = nextContext }
             window?.representedURL = noteURL
             let title = (try? vault.notes().first(where: { $0.url == noteURL })?.title)
