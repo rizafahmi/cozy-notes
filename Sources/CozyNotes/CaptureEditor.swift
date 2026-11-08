@@ -30,6 +30,7 @@ import CozyCore
     var onOpenWikiLink: ((WikiLink) -> Void)?
     var onInsertWikiLinkShortcut: (() -> Void)?
     var onWikiAutocompleteCommand: ((Selector) -> Bool)?
+    var onQuickSwitcher: (() -> Void)?
     var placeholder = "Begin a note, paste a clipping, or drop a file…" { didSet { needsDisplay = true } }
     struct FencedBlock {
         let fullRange: NSRange
@@ -586,11 +587,16 @@ import CozyCore
                 guard isEditable else { return false }
                 outdentListLevel(self)
                 return true
+            case "p":
+                onQuickSwitcher?()
+                return true
             case "o":
                 if let link = wikiLinkAtCursor() {
                     onOpenWikiLink?(link)
                     return true
                 }
+                onQuickSwitcher?()
+                return true
             case "\r", "\n":
                 if let link = wikiLinkAtCursor() {
                     onOpenWikiLink?(link)
@@ -628,6 +634,9 @@ import CozyCore
             case "l":
                 guard isEditable else { return false }
                 toggleChecklist(self)
+                return true
+            case "f":
+                onQuickSwitcher?()
                 return true
             default:
                 break
@@ -2204,6 +2213,7 @@ import CozyCore
     var onRemoveLinkedAttachment: ((LinkedAttachment) -> Void)?
     var onHorizontalInsetChange: ((CGFloat) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
+    var onQuickSwitcher: (() -> Void)?
     var noteRecordsProvider: (() -> [NoteRecord])?
     var currentNoteURLProvider: (() -> URL?)?
     var compactLayout = false { didSet { needsLayout = true } }
@@ -2301,6 +2311,7 @@ import CozyCore
         textView.onFoldStatusChange = { [weak self] msg in self?.status.stringValue = msg }
         textView.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
         textView.onInsertWikiLinkShortcut = { [weak self] in self?.handleInsertWikiLinkShortcut() }
+        textView.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
         textView.onWikiAutocompleteCommand = { [weak self] selector in
             self?.handleWikiAutocompleteCommand(selector) ?? false
         }

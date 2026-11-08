@@ -755,5 +755,89 @@ struct MobyDickWorkoutSuite {
         #expect(textView.performKeyEquivalent(with: optCmdReturn))
         #expect(workspace.noteURL == secondNote.url)
     }
+
+    @Test("Global Note Search Quick Switcher (⌘P / ⇧⌘F / ⌘O) works in Focus Mode, boosts title matches across all vault items, and opens selected note")
+    @MainActor
+    func globalNoteSearchQuickSwitcher() throws {
+        _ = NSApplication.shared
+        let tempRoot = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("CozyQuickSwitcherTests-\(UUID().uuidString)", isDirectory: true)
+        let vaultRoot = tempRoot.appendingPathComponent("Vault", isDirectory: true)
+        let historyRoot = tempRoot.appendingPathComponent("History", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let vault = try Vault(root: vaultRoot, historyRoot: historyRoot)
+        // Create a note that mentions "Atlas" only in the body first (alphabetically earlier path)
+        let bodyMatchNote = try vault.capture(text: "# Daily Log\nReviewed the Atlas specification today.")
+        Thread.sleep(forTimeInterval: 0.01)
+        // Create a note whose title is "Atlas Architecture"
+        let titleMatchNote = try vault.capture(text: "# Atlas Architecture\nCore system boundaries.")
+        // Also add a non-note text file in the vault to verify all vault items are included
+        let clipURL = vaultRoot.appendingPathComponent("atlas-notes.txt")
+        try "Plain text clipping for Atlas.".write(to: clipURL, atomically: true, encoding: .utf8)
+
+        let workspace = WorkspaceController(vault: vault)
+        workspace.showWindow(nil)
+        defer {
+            workspace.shutdown()
+            workspace.window?.orderOut(nil)
+        }
+
+        workspace.openNote(bodyMatchNote.url)
+        // Collapse sidebar into Focus Mode (⌘\)
+        workspace.toggleSidebar()
+        #expect(workspace.isSidebarCollapsed)
+        #expect(!workspace.isQuickSwitcherVisible)
+
+        // 1. Summon Quick Switcher via ⌘P while sidebar remains collapsed
+        let cmdP = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            characters: "p",
+            charactersIgnoringModifiers: "p",
+            isARepeat: false,
+            keyCode: 35
+        ))
+        #expect(workspace.editor.textView.performKeyEquivalent(with: cmdP))
+        #expect(workspace.isQuickSwitcherVisible)
+        #expect(workspace.isSidebarCollapsed, "Quick Switcher must not force sidebar open in Focus Mode")
+        #expect(workspace.quickSwitcher.hits.count == 3)
+
+        // 2. Typing "Atlas" ranks the title match ("Atlas Architecture") ahead of body/filename matches
+        workspace.quickSwitcher.query = "Atlas"
+        #expect(workspace.quickSwitcher.hits.count == 3)
+        #expect(workspace.quickSwitcher.hits[0].source.url == titleMatchNote.url)
+        #expect(workspace.quickSwitcher.selectedIndex == 0)
+
+        // 3. Confirming selection opens "Atlas Architecture" and dismisses the Quick Switcher
+        #expect(workspace.quickSwitcher.confirmSelection())
+        #expect(!workspace.isQuickSwitcherVisible)
+        #expect(workspace.noteURL == titleMatchNote.url)
+        #expect(workspace.isSidebarCollapsed)
+
+        // 4. Summoning via ⇧⌘F and navigating down with ↓ opens the second result
+        let shiftCmdF = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .shift],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            characters: "F",
+            charactersIgnoringModifiers: "f",
+            isARepeat: false,
+            keyCode: 3
+        ))
+        #expect(workspace.editor.textView.performKeyEquivalent(with: shiftCmdF))
+        #expect(workspace.isQuickSwitcherVisible)
+        workspace.quickSwitcher.query = "Daily"
+        #expect(workspace.quickSwitcher.hits.first?.source.url == bodyMatchNote.url)
+        #expect(workspace.quickSwitcher.confirmSelection())
+        #expect(workspace.noteURL == bodyMatchNote.url)
+    }
 }
 #endif

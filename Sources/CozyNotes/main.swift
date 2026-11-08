@@ -92,6 +92,7 @@ import CozyCore
     }
     @objc private func deleteNote() { workspace?.deleteCurrentNote() }
     @objc private func search() { workspace?.focusSearch(); workspace?.showAndFocus() }
+    @objc private func quickSwitcher() { workspace?.showAndFocus(); workspace?.toggleQuickSwitcher() }
     @objc private func makeSearchable() { workspace?.makeSearchable() }
     @objc private func recovery() { workspace?.showRecovery() }
     @objc private func showWorkspace() { workspace?.showAndFocus() }
@@ -203,6 +204,8 @@ import CozyCore
         add("Focus Editor", action: #selector(captureMode), key: "1", to: view)
         add("Focus Sidebar", action: #selector(findMode), key: "2", to: view)
         add("Search Notes & Files", action: #selector(search), key: "f", to: view)
+        add("Quick Open…", action: #selector(quickSwitcher), key: "p", to: view)
+        add("Global Note Search…", action: #selector(quickSwitcher), key: "f", modifiers: [.command, .shift], to: view)
         add("Show Workspace", action: #selector(showWorkspace), key: "", to: view)
         NSApp.mainMenu = bar
     }

@@ -5,6 +5,7 @@ import CozyCore
     let vault: Vault
     let editor = CaptureEditor(frame: .zero)
     private let searchPanel: SearchPanel
+    let quickSwitcher = QuickSwitcherOverlay(frame: .zero)
     private let sidebarContainer = NSView()
     private let folioSurface = FolioPageSurface()
     private let collapsedControls = NSStackView()
@@ -163,7 +164,8 @@ import CozyCore
             editor.bottomAnchor.constraint(equalTo: folioSurface.bottomAnchor, constant: -2)
         ])
 
-        for view in [sidebarContainer, folioSurface] {
+        quickSwitcher.isHidden = true
+        for view in [sidebarContainer, folioSurface, quickSwitcher] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -180,7 +182,11 @@ import CozyCore
             folioLead,
             folioSurface.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
             folioSurface.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
-            folioSurface.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8)
+            folioSurface.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
+            quickSwitcher.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            quickSwitcher.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            quickSwitcher.topAnchor.constraint(equalTo: content.topAnchor),
+            quickSwitcher.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
     }
 
@@ -192,6 +198,16 @@ import CozyCore
         editor.noteRecordsProvider = { [weak self] in (try? self?.vault.notes()) ?? [] }
         editor.currentNoteURLProvider = { [weak self] in self?.noteURL }
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
+        editor.onQuickSwitcher = { [weak self] in self?.toggleQuickSwitcher() }
+        quickSwitcher.onOpenNote = { [weak self] url in self?.openNote(url) }
+        quickSwitcher.onOpenExternal = { [weak self] url in
+            if !NSWorkspace.shared.open(url) {
+                self?.editor.status.stringValue = "No viewer could open \(url.lastPathComponent)."
+            }
+            self?.editor.focus()
+        }
+        quickSwitcher.onDismiss = { [weak self] in self?.editor.focus() }
+        quickSwitcher.onShowSidebarSearch = { [weak self] in self?.showFind() }
         searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         searchPanel.onNewNote = { [weak self] in self?.newCapture() }
         searchPanel.onDeleteNote = { [weak self] url in self?.confirmAndDeleteNote(url) }
@@ -265,6 +281,7 @@ import CozyCore
         editor.refreshTypography()
         updateEditorChrome()
         window?.contentView?.needsDisplay = true
+        quickSwitcher.needsDisplay = true
         folioSurface.needsDisplay = true
         searchPanel.needsDisplay = true
         searchPanel.refresh()
@@ -291,7 +308,32 @@ import CozyCore
         editor.focus()
     }
 
+    var isQuickSwitcherVisible: Bool {
+        !quickSwitcher.isHidden
+    }
+
+    @objc func toggleQuickSwitcher() {
+        if isQuickSwitcherVisible {
+            dismissQuickSwitcher()
+        } else {
+            showQuickSwitcher()
+        }
+    }
+
+    @objc func showQuickSwitcher() {
+        _ = persistCurrent()
+        editor.hideWikiAutocomplete()
+        let (snap, dates) = searchPanel.freshSnapshotAndModifiedDates()
+        quickSwitcher.present(snapshot: snap, modifiedDates: dates)
+    }
+
+    func dismissQuickSwitcher() {
+        guard !quickSwitcher.isHidden else { return }
+        quickSwitcher.dismiss()
+    }
+
     @objc func showFind() {
+        dismissQuickSwitcher()
         if isSidebarCollapsed { setSidebarCollapsed(false) }
         searchPanel.focusSearch()
     }
