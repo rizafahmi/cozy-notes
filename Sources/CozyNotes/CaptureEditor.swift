@@ -31,6 +31,9 @@ import CozyCore
     var onInsertWikiLinkShortcut: (() -> Void)?
     var onWikiAutocompleteCommand: ((Selector) -> Bool)?
     var onQuickSwitcher: (() -> Void)?
+    var onShowInNoteFind: (() -> Void)?
+    var onFindNextInNote: (() -> Void)?
+    var onFindPreviousInNote: (() -> Void)?
     var placeholder = "Begin a note, paste a clipping, or drop a file…" { didSet { needsDisplay = true } }
     struct FencedBlock {
         let fullRange: NSRange
@@ -74,6 +77,8 @@ import CozyCore
     var fencedBlocks: [FencedBlock] = []
     var inlineCodeRanges: [NSRange] = []
     var wikiLinkItems: [WikiLink] = []
+    var inNoteFindRanges: [NSRange] = []
+    var activeInNoteFindIndex: Int = -1
     var headingGutterItems: [HeadingGutter] = []
     var bulletItems: [BulletItem] = []
     private(set) var foldedSections: [FoldedSection] = []
@@ -148,7 +153,7 @@ import CozyCore
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty else { return }
+        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty else { return }
         guard let layoutManager = layoutManager, let textContainer = textContainer, let storage = textStorage else { return }
         let totalLength = storage.length
         guard totalLength > 0 else { return }
@@ -239,6 +244,37 @@ import CozyCore
                     Theme.accentSoft.withAlphaComponent(0.65).setFill()
                     path.fill()
                     Theme.accent.withAlphaComponent(0.28).setStroke()
+                    path.lineWidth = 1
+                    path.stroke()
+                }
+            }
+        }
+
+        if !inNoteFindRanges.isEmpty {
+            for (idx, matchRange) in inNoteFindRanges.enumerated() {
+                if matchRange.location > visEnd { break }
+                if isCharacterFolded(matchRange.location) { continue }
+                guard NSMaxRange(matchRange) >= visStart, NSMaxRange(matchRange) <= totalLength else { continue }
+                let isActiveMatch = (idx == activeInNoteFindIndex)
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: matchRange, actualCharacterRange: nil)
+                let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                let highlightRect = NSRect(
+                    x: origin.x + raw.minX - 2,
+                    y: origin.y + raw.minY + 1,
+                    width: max(4, raw.width + 4),
+                    height: max(14, raw.height - 4)
+                )
+                let path = NSBezierPath(roundedRect: highlightRect, xRadius: 4, yRadius: 4)
+                if isActiveMatch {
+                    Theme.accent.withAlphaComponent(0.28).setFill()
+                    path.fill()
+                    Theme.accent.setStroke()
+                    path.lineWidth = 1.5
+                    path.stroke()
+                } else {
+                    Theme.accentSoft.withAlphaComponent(0.85).setFill()
+                    path.fill()
+                    Theme.accent.withAlphaComponent(0.35).setStroke()
                     path.lineWidth = 1
                     path.stroke()
                 }
@@ -590,6 +626,12 @@ import CozyCore
             case "p":
                 onQuickSwitcher?()
                 return true
+            case "f":
+                onShowInNoteFind?()
+                return true
+            case "g":
+                onFindNextInNote?()
+                return true
             case "o":
                 if let link = wikiLinkAtCursor() {
                     onOpenWikiLink?(link)
@@ -637,6 +679,9 @@ import CozyCore
                 return true
             case "f":
                 onQuickSwitcher?()
+                return true
+            case "g":
+                onFindPreviousInNote?()
                 return true
             default:
                 break
@@ -2204,6 +2249,120 @@ import CozyCore
     }
 }
 
+@MainActor final class InNoteFindBar: NSView, NSSearchFieldDelegate {
+    let searchBar = CozySearchBar()
+    let countLabel = Theme.label("", size: 10, color: Theme.subtle)
+    var onQueryChange: ((String) -> Void)?
+    var onNext: (() -> Void)?
+    var onPrevious: (() -> Void)?
+    var onClose: (() -> Void)?
+
+    var query: String {
+        get { searchBar.field.stringValue }
+        set { searchBar.field.stringValue = newValue }
+    }
+
+    private let surface = PaperSurface(cornerRadius: 10, color: Theme.elevated, bordered: true)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.zPosition = 950
+        setAccessibilityLabel("Find in note")
+
+        surface.wantsLayer = true
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.16)
+        shadow.shadowOffset = NSSize(width: 0, height: -3)
+        shadow.shadowBlurRadius = 10
+        surface.shadow = shadow
+
+        searchBar.field.placeholderString = "Find in note…"
+        searchBar.field.delegate = self
+        searchBar.field.sendsWholeSearchString = false
+        searchBar.field.sendsSearchStringImmediately = true
+        searchBar.field.setAccessibilityLabel("Find in note text")
+        searchBar.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
+        searchBar.heightAnchor.constraint(equalToConstant: 28).isActive = true
+
+        countLabel.font = Theme.monoFont(10, weight: .semibold)
+        countLabel.alignment = .right
+        countLabel.setContentHuggingPriority(.required, for: .horizontal)
+        countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let prevBtn = QuietButton(symbol: "chevron.up", target: self, action: #selector(prevTapped))
+        prevBtn.toolTip = "Previous match (⇧⌘G)"
+        prevBtn.setAccessibilityLabel("Previous match")
+
+        let nextBtn = QuietButton(symbol: "chevron.down", target: self, action: #selector(nextTapped))
+        nextBtn.toolTip = "Next match (⌘G)"
+        nextBtn.setAccessibilityLabel("Next match")
+
+        let closeBtn = QuietButton(symbol: "xmark", target: self, action: #selector(closeTapped))
+        closeBtn.toolTip = "Close find bar (Esc)"
+        closeBtn.setAccessibilityLabel("Close find bar")
+
+        let row = Theme.stack([searchBar, countLabel, prevBtn, nextBtn, closeBtn], spacing: 4)
+        Theme.fill(row, in: surface, inset: 6)
+        Theme.fill(surface, in: self)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func focusField() {
+        window?.makeFirstResponder(searchBar.field)
+        searchBar.field.selectText(nil)
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        onQueryChange?(searchBar.field.stringValue)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        switch commandSelector {
+        case #selector(NSResponder.insertNewline(_:)),
+             #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+            if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
+                onPrevious?()
+            } else {
+                onNext?()
+            }
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            onClose?()
+            return true
+        default:
+            return false
+        }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard !isHidden, event.type == .keyDown else {
+            return super.performKeyEquivalent(with: event)
+        }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == .command {
+            if key == "f" {
+                focusField()
+                return true
+            }
+            if key == "g" {
+                onNext?()
+                return true
+            }
+        } else if flags == [.command, .shift], key == "g" {
+            onPrevious?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    @objc private func prevTapped() { onPrevious?() }
+    @objc private func nextTapped() { onNext?() }
+    @objc private func closeTapped() { onClose?() }
+}
+
 @MainActor final class CaptureEditor: NSView, NSTextViewDelegate {
     let textView = MarkdownTextView()
     let status = Theme.label("", size: 11, color: Theme.muted)
@@ -2249,6 +2408,17 @@ import CozyCore
     private var isFormatting = false
     private var lastCursorLine = NSRange(location: NSNotFound, length: 0)
     private let wikiCompletionView = WikiLinkCompletionView(frame: .zero)
+    let inNoteFindBar = InNoteFindBar(frame: .zero)
+    var isInNoteFindVisible: Bool { !inNoteFindBar.isHidden }
+    var inNoteFindQuery: String {
+        get { inNoteFindBar.query }
+        set {
+            inNoteFindBar.query = newValue
+            updateInNoteFindMatches(scrollToMatch: true)
+        }
+    }
+    var inNoteFindMatchCount: Int { textView.inNoteFindRanges.count }
+    var activeInNoteFindMatchIndex: Int { textView.activeInNoteFindIndex }
     private var activeWikiReplacementRange: NSRange?
     private var activeWikiOpenLocation: Int?
     private var dismissedWikiOpenLocation: Int?
@@ -2312,6 +2482,14 @@ import CozyCore
         textView.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
         textView.onInsertWikiLinkShortcut = { [weak self] in self?.handleInsertWikiLinkShortcut() }
         textView.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
+        textView.onShowInNoteFind = { [weak self] in self?.showInNoteFind() }
+        textView.onFindNextInNote = { [weak self] in self?.findNextInNote() }
+        textView.onFindPreviousInNote = { [weak self] in self?.findPreviousInNote() }
+        inNoteFindBar.isHidden = true
+        inNoteFindBar.onQueryChange = { [weak self] _ in self?.updateInNoteFindMatches(scrollToMatch: true) }
+        inNoteFindBar.onNext = { [weak self] in self?.findNextInNote() }
+        inNoteFindBar.onPrevious = { [weak self] in self?.findPreviousInNote() }
+        inNoteFindBar.onClose = { [weak self] in self?.hideInNoteFind() }
         textView.onWikiAutocompleteCommand = { [weak self] selector in
             self?.handleWikiAutocompleteCommand(selector) ?? false
         }
@@ -2354,7 +2532,7 @@ import CozyCore
         footer.spacing = 10
         for item in [add, status, spacer, wordCount] { footer.addArrangedSubview(item) }
 
-        for view in [scroll, attachmentScroll, footerRule, footer] {
+        for view in [scroll, attachmentScroll, footerRule, footer, inNoteFindBar] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
@@ -2388,6 +2566,11 @@ import CozyCore
             footLead,
             footTrail,
             footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            inNoteFindBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            inNoteFindBar.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            inNoteFindBar.leadingAnchor.constraint(greaterThanOrEqualTo: footer.leadingAnchor),
+            inNoteFindBar.widthAnchor.constraint(lessThanOrEqualToConstant: 380),
+            inNoteFindBar.heightAnchor.constraint(equalToConstant: 40),
             footer.heightAnchor.constraint(equalToConstant: 26)
         ])
         formatMarkdown()
@@ -2511,6 +2694,9 @@ import CozyCore
                 textView.suppressCaretUpdates = false
                 textView.updateCaret(animated: false)
                 textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+                if isInNoteFindVisible {
+                    updateInNoteFindMatches(scrollToMatch: false)
+                }
             }
         }
     }
@@ -2531,6 +2717,7 @@ import CozyCore
     }
     func reset() {
         hideWikiAutocomplete()
+        hideInNoteFind()
         text = ""
         linkedAttachments = []
         clearPendingAttachments()
@@ -2563,6 +2750,9 @@ import CozyCore
                 textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
             }
             updateWikiAutocompleteAfterEdit(force: false)
+            if isInNoteFindVisible {
+                updateInNoteFindMatches(scrollToMatch: false)
+            }
             onChange?()
         }
     }
@@ -2744,6 +2934,106 @@ import CozyCore
 
     func invalidateNoteRecordsCache() {
         cachedAutocompleteNotes = nil
+    }
+
+    @objc func showInNoteFind() {
+        let sel = textView.selectedRange()
+        if sel.length > 0 && sel.length <= 80, NSMaxRange(sel) <= nsText.length {
+            let sub = nsText.substring(with: sel)
+            if !sub.contains("\n") && !sub.contains("\r") {
+                inNoteFindBar.query = sub
+            }
+        }
+        inNoteFindBar.isHidden = false
+        updateInNoteFindMatches(scrollToMatch: true)
+        inNoteFindBar.focusField()
+    }
+
+    @objc func hideInNoteFind() {
+        guard !inNoteFindBar.isHidden else { return }
+        inNoteFindBar.isHidden = true
+        textView.inNoteFindRanges = []
+        textView.activeInNoteFindIndex = -1
+        inNoteFindBar.countLabel.stringValue = ""
+        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        window?.makeFirstResponder(textView)
+    }
+
+    @objc func findNextInNote() {
+        if inNoteFindBar.isHidden {
+            showInNoteFind()
+            return
+        }
+        let count = textView.inNoteFindRanges.count
+        guard count > 0 else { return }
+        textView.activeInNoteFindIndex = (textView.activeInNoteFindIndex + 1) % count
+        revealActiveInNoteFindMatch()
+    }
+
+    @objc func findPreviousInNote() {
+        if inNoteFindBar.isHidden {
+            showInNoteFind()
+            return
+        }
+        let count = textView.inNoteFindRanges.count
+        guard count > 0 else { return }
+        textView.activeInNoteFindIndex = (textView.activeInNoteFindIndex - 1 + count) % count
+        revealActiveInNoteFindMatch()
+    }
+
+    private func updateInNoteFindMatches(scrollToMatch: Bool) {
+        let q = inNoteFindBar.query
+        let ns = nsText
+        guard !q.isEmpty, ns.length > 0 else {
+            textView.inNoteFindRanges = []
+            textView.activeInNoteFindIndex = -1
+            inNoteFindBar.countLabel.stringValue = ""
+            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            return
+        }
+        var ranges: [NSRange] = []
+        var searchStart = 0
+        let totalLen = ns.length
+        let maxMatches = 2000
+        while searchStart < totalLen && ranges.count < maxMatches {
+            let hit = ns.range(
+                of: q,
+                options: [.caseInsensitive],
+                range: NSRange(location: searchStart, length: totalLen - searchStart)
+            )
+            guard hit.location != NSNotFound && hit.length > 0 else { break }
+            ranges.append(hit)
+            searchStart = NSMaxRange(hit)
+        }
+        textView.inNoteFindRanges = ranges
+        guard !ranges.isEmpty else {
+            textView.activeInNoteFindIndex = -1
+            inNoteFindBar.countLabel.stringValue = "0 MATCHES"
+            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            return
+        }
+        let cursorLoc = textView.selectedRange().location
+        if let idx = ranges.firstIndex(where: { $0.location >= cursorLoc }) {
+            textView.activeInNoteFindIndex = idx
+        } else {
+            textView.activeInNoteFindIndex = 0
+        }
+        inNoteFindBar.countLabel.stringValue = "\(textView.activeInNoteFindIndex + 1) OF \(ranges.count)"
+        if scrollToMatch {
+            revealActiveInNoteFindMatch()
+        } else {
+            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        }
+    }
+
+    private func revealActiveInNoteFindMatch() {
+        let idx = textView.activeInNoteFindIndex
+        guard textView.inNoteFindRanges.indices.contains(idx) else { return }
+        let matchRange = textView.inNoteFindRanges[idx]
+        inNoteFindBar.countLabel.stringValue = "\(idx + 1) OF \(textView.inNoteFindRanges.count)"
+        textView.setSelectedRange(matchRange)
+        textView.scrollRangeToVisible(matchRange)
+        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
     }
 
     func hideWikiAutocomplete() {
