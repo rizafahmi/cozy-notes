@@ -1183,5 +1183,63 @@ struct MobyDickWorkoutSuite {
         #expect(noteWin.editor.text == agentCompanionUpdate)
         #expect(!noteWin.editor.textView.externalChangeRanges.isEmpty)
     }
+
+    @Test("Opening a project folder in a new workspace window keeps both the notes vault and project workspace open, deduplicates folders, and routes menu actions to the active workspace")
+    @MainActor
+    func multipleWorkspaceWindowsForVaultAndProject() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+        let fileMenu = try #require(mainMenu.item(withTitle: "File")?.submenu)
+        #expect(fileMenu.item(withTitle: "Open Folder in New Window…") != nil)
+
+        let tempRoot = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("CozyMultiWorkspaceTests-\(UUID().uuidString)", isDirectory: true)
+        let vaultRoot = tempRoot.appendingPathComponent("PersonalVault", isDirectory: true)
+        let projectRoot = tempRoot.appendingPathComponent("CodingProject", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        try FileManager.default.createDirectory(at: vaultRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: projectRoot.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        let vaultNoteURL = vaultRoot.appendingPathComponent("journal.md")
+        let projectPlanURL = projectRoot.appendingPathComponent("PLAN.md")
+        try "# Daily Journal\nPersonal thoughts.".write(to: vaultNoteURL, atomically: true, encoding: .utf8)
+        try "# Project Plan\nAgent milestones.".write(to: projectPlanURL, atomically: true, encoding: .utf8)
+
+        let primaryWS = try delegate.openVault(vaultRoot, persistPreference: false)
+        primaryWS.showWindow(nil)
+        primaryWS.openNote(vaultNoteURL)
+        defer {
+            for ws in delegate.workspaces {
+                ws.shutdown()
+                ws.window?.orderOut(nil)
+            }
+        }
+
+        #expect(delegate.workspaces.count == 1)
+        #expect(primaryWS.editor.text.contains("Daily Journal"))
+
+        // Open project folder in a second WorkspaceController window
+        let projectWS = try delegate.openWorkspaceInNewWindow(projectRoot)
+        projectWS.openNote(projectPlanURL)
+        #expect(delegate.workspaces.count == 2)
+        #expect(primaryWS !== projectWS)
+        #expect(primaryWS.editor.text.contains("Daily Journal"))
+        #expect(projectWS.editor.text.contains("Project Plan"))
+        #expect(delegate.workspace === projectWS)
+
+        // Requesting openWorkspaceInNewWindow for an already-open folder reuses that window
+        let duplicateProjectWS = try delegate.openWorkspaceInNewWindow(projectRoot)
+        #expect(duplicateProjectWS === projectWS)
+        #expect(delegate.workspaces.count == 2)
+
+        // Closing the secondary project workspace window removes it while keeping the primary vault open
+        if let projWin = projectWS.window {
+            #expect(projectWS.windowShouldClose(projWin))
+        }
+        #expect(delegate.workspaces.count == 1)
+        #expect(delegate.workspace === primaryWS)
+    }
 }
 #endif

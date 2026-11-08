@@ -2,10 +2,25 @@ import AppKit
 import CozyCore
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
-    private(set) var workspace: WorkspaceController?
+    private(set) var workspaces: [WorkspaceController] = []
+    private weak var lastActiveWorkspace: WorkspaceController?
     private var quickCapture: QuickCaptureController?
     private var hotKey: GlobalHotKey?
 
+    var workspace: WorkspaceController? {
+        if let key = NSApp.keyWindow {
+            if let direct = workspaces.first(where: { $0.window === key }) {
+                return direct
+            }
+            if let owner = workspaces.first(where: { ws in ws.noteWindows.contains { $0.window === key } }) {
+                return owner
+            }
+        }
+        if let last = lastActiveWorkspace, workspaces.contains(where: { $0 === last }) {
+            return last
+        }
+        return workspaces.first
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildMenus()
@@ -39,39 +54,130 @@ import CozyCore
         } catch { showError(error, in: workspace?.window) }
         workspace?.showAndFocus()
     }
-    private func openVault(_ root: URL, persistPreference: Bool = true) throws {
+    @discardableResult
+    func openVault(_ root: URL, persistPreference: Bool = true, replacing targetWorkspace: WorkspaceController? = nil) throws -> WorkspaceController {
         let vault = try Vault(root: root)
-        let nextWorkspace = WorkspaceController(vault: vault)
-        let nextQuick = QuickCaptureController(vault: vault)
-        nextWorkspace.onChooseFolder = { [weak self] in self?.chooseFolder() }
-        nextQuick.onCapture = { [weak nextWorkspace] in nextWorkspace?.refresh() }
-        nextQuick.onOpenWikiLink = { [weak nextWorkspace, weak nextQuick] link in
-            guard nextQuick?.persistDraft() != false else { return }
-            nextQuick?.hide()
-            nextWorkspace?.showAndFocus()
-            nextWorkspace?.openWikiLink(link)
+        if let existing = workspaces.first(where: { $0.vault.root == vault.root }) {
+            lastActiveWorkspace = existing
+            existing.showAndFocus()
+            return existing
         }
-        workspace?.shutdown()
-        workspace?.window?.orderOut(nil)
-        quickCapture?.window?.orderOut(nil)
-        workspace = nextWorkspace
-        quickCapture = nextQuick
+        let nextWorkspace = WorkspaceController(vault: vault)
+        wireWorkspace(nextWorkspace)
+        let replaced = targetWorkspace ?? workspaces.first
+        if let replaced, let idx = workspaces.firstIndex(where: { $0 === replaced }) {
+            if let oldFrame = replaced.window?.frame {
+                nextWorkspace.window?.setFrame(oldFrame, display: false)
+            }
+            replaced.shutdown()
+            replaced.window?.orderOut(nil)
+            workspaces[idx] = nextWorkspace
+        } else {
+            workspaces.append(nextWorkspace)
+        }
+        lastActiveWorkspace = nextWorkspace
+        if workspaces.first === nextWorkspace {
+            let nextQuick = QuickCaptureController(vault: vault)
+            nextQuick.onCapture = { [weak nextWorkspace] in nextWorkspace?.refresh() }
+            nextQuick.onOpenWikiLink = { [weak nextWorkspace, weak nextQuick] link in
+                guard nextQuick?.persistDraft() != false else { return }
+                nextQuick?.hide()
+                nextWorkspace?.showAndFocus()
+                nextWorkspace?.openWikiLink(link)
+            }
+            quickCapture?.window?.orderOut(nil)
+            quickCapture = nextQuick
+        }
         if persistPreference {
             UserDefaults.standard.set(root.path, forKey: "vaultPath")
         }
+        return nextWorkspace
     }
+
+    @discardableResult
+    func openWorkspaceInNewWindow(_ root: URL) throws -> WorkspaceController {
+        let vault = try Vault(root: root)
+        if let existing = workspaces.first(where: { $0.vault.root == vault.root }) {
+            lastActiveWorkspace = existing
+            existing.showAndFocus()
+            return existing
+        }
+        let controller = WorkspaceController(vault: vault)
+        if let anchor = (workspace?.window ?? workspaces.last?.window), let win = controller.window {
+            let anchorFrame = anchor.frame
+            let nextOrigin = NSPoint(x: anchorFrame.minX + 36, y: anchorFrame.maxY - win.frame.height - 28)
+            win.setFrameOrigin(nextOrigin)
+        }
+        wireWorkspace(controller)
+        workspaces.append(controller)
+        lastActiveWorkspace = controller
+        controller.showAndFocus()
+        return controller
+    }
+
+    private func wireWorkspace(_ controller: WorkspaceController) {
+        controller.onChooseFolder = { [weak self, weak controller] in
+            self?.promptFolderReplacement(for: controller)
+        }
+        controller.onOpenFolderInNewWindow = { [weak self] in
+            self?.openFolderInNewWindow()
+        }
+        controller.onDidBecomeActive = { [weak self] active in
+            self?.lastActiveWorkspace = active
+        }
+        controller.onRequestCloseWorkspace = { [weak self] closing in
+            guard let self, self.workspaces.count > 1 else { return false }
+            closing.shutdown()
+            self.workspaces.removeAll { $0 === closing }
+            if self.lastActiveWorkspace === closing {
+                self.lastActiveWorkspace = self.workspaces.first
+            }
+            return true
+        }
+        controller.onDidChangeTheme = { [weak self, weak controller] appearance in
+            guard let self else { return }
+            for ws in self.workspaces where ws !== controller {
+                ws.applySharedTheme(appearance: appearance)
+            }
+        }
+    }
+
     @objc func chooseFolder() {
-        guard workspace?.persistAllWindows() != false, quickCapture?.persistDraft() != false else { return }
+        promptFolderReplacement(for: workspace)
+    }
+
+    private func promptFolderReplacement(for targetWorkspace: WorkspaceController?) {
+        guard (targetWorkspace ?? workspace)?.persistAllWindows() != false, quickCapture?.persistDraft() != false else { return }
         let picker = NSOpenPanel()
-        picker.title = "Choose your local notes folder"
-        picker.message = "Choose the same folder you sync with Syncthing. Notes are ordinary Markdown files; attachments stay beside them."
+        picker.title = "Choose your local notes or project folder"
+        picker.message = "Choose a notes vault or a project repository. Cozy Notes indexes Markdown files and attachments locally."
         picker.canChooseDirectories = true
         picker.canChooseFiles = false
         picker.canCreateDirectories = true
         picker.prompt = "Use this folder"
         guard picker.runModal() == .OK, let url = picker.url else { return }
-        do { try openVault(url); workspace?.showAndFocus() }
-        catch { showError(error, in: workspace?.window) }
+        do {
+            let opened = try openVault(url, replacing: targetWorkspace)
+            opened.showAndFocus()
+        } catch {
+            showError(error, in: (targetWorkspace ?? workspace)?.window)
+        }
+    }
+
+    @objc func openFolderInNewWindow() {
+        let picker = NSOpenPanel()
+        picker.title = "Open Folder or Project in New Window"
+        picker.message = "Open another notes vault or project repository alongside your current workspace."
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.canCreateDirectories = true
+        picker.prompt = "Open in New Window"
+        guard picker.runModal() == .OK, let url = picker.url else { return }
+        do {
+            _ = try openWorkspaceInNewWindow(url)
+        } catch {
+            showError(error, in: workspace?.window)
+        }
     }
     @objc private func newCapture() { workspace?.newCapture(); workspace?.showAndFocus() }
     @objc private func quick() { quickCapture?.summon() }
@@ -172,8 +278,13 @@ import CozyCore
         return true
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard workspace?.persistAllWindows() != false, quickCapture?.persistDraft() != false else { return .terminateCancel }
-        workspace?.shutdown()
+        for ws in workspaces {
+            guard ws.persistAllWindows() else { return .terminateCancel }
+        }
+        guard quickCapture?.persistDraft() != false else { return .terminateCancel }
+        for ws in workspaces {
+            ws.shutdown()
+        }
         return .terminateNow
     }
     func buildMenus() {
@@ -199,6 +310,7 @@ import CozyCore
         add("Keep / Save", action: #selector(save), key: "\r", to: file)
         add("Delete Note…", action: #selector(deleteNote), key: "\u{08}", to: file)
         add("Choose Notes Folder…", action: #selector(chooseFolder), key: "o", modifiers: [.command, .shift], to: file)
+        add("Open Folder in New Window…", action: #selector(openFolderInNewWindow), key: "o", modifiers: [.command, .control], to: file)
         add("Open Notes Folder", action: #selector(openFolder), key: "", to: file)
         add("Recovery…", action: #selector(recovery), key: "", to: file)
         add("Make Searchable", action: #selector(makeSearchable), key: "", to: file)

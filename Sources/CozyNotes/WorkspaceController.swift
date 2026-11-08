@@ -122,6 +122,10 @@ import CozyCore
         noteWindows.first { $0.window === NSApp.keyWindow }
     }
     var onChooseFolder: (() -> Void)?
+    var onOpenFolderInNewWindow: (() -> Void)?
+    var onDidBecomeActive: ((WorkspaceController) -> Void)?
+    var onRequestCloseWorkspace: ((WorkspaceController) -> Bool)?
+    var onDidChangeTheme: ((NSAppearance?) -> Void)?
 
     private static let headerDateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -137,7 +141,7 @@ import CozyCore
             backing: .buffered,
             defer: false
         )
-        window.title = "Cozy Notes"
+        window.title = "Cozy Notes — \(vault.root.lastPathComponent)"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.representedURL = vault.root
@@ -327,6 +331,7 @@ import CozyCore
         searchPanel.onSwitchAtmosphere = { [weak self] preset in self?.switchAtmosphere(preset) }
         searchPanel.onRevealFolder = { [weak self] in self?.revealFolder() }
         searchPanel.onChooseFolder = { [weak self] in self?.chooseFolder() }
+        searchPanel.onOpenFolderInNewWindow = { [weak self] in self?.openFolderInNewWindow() }
         searchPanel.onShowRecovery = { [weak self] in self?.showRecovery() }
         searchPanel.onShowGlobalSearch = { [weak self] in self?.showQuickSwitcher() }
     }
@@ -359,6 +364,7 @@ import CozyCore
             win.window?.appearance = window.appearance
         }
         refreshThemeSurfaces()
+        onDidChangeTheme?(window.appearance)
     }
 
     @objc func cycleVoice() {
@@ -372,24 +378,28 @@ import CozyCore
         editor.refreshTypography()
         updateEditorChrome()
         for win in noteWindows { win.refreshTypography() }
+        onDidChangeTheme?(window?.appearance)
     }
 
     @objc func increaseFontSize() {
         Theme.fontScale += 1
         editor.refreshTypography()
         for win in noteWindows { win.refreshTypography() }
+        onDidChangeTheme?(window?.appearance)
     }
 
     @objc func decreaseFontSize() {
         Theme.fontScale -= 1
         editor.refreshTypography()
         for win in noteWindows { win.refreshTypography() }
+        onDidChangeTheme?(window?.appearance)
     }
 
     @objc func resetFontSize() {
         Theme.fontScale = 0
         editor.refreshTypography()
         for win in noteWindows { win.refreshTypography() }
+        onDidChangeTheme?(window?.appearance)
     }
 
     @objc func cycleAtmosphere() {
@@ -400,9 +410,18 @@ import CozyCore
     func switchAtmosphere(_ preset: Theme.Atmosphere) {
         Theme.atmosphere = preset
         refreshThemeSurfaces()
+        onDidChangeTheme?(window?.appearance)
     }
 
-    private func refreshThemeSurfaces() {
+    func applySharedTheme(appearance: NSAppearance?) {
+        if let appearance {
+            window?.appearance = appearance
+            for win in noteWindows { win.window?.appearance = appearance }
+        }
+        refreshThemeSurfaces()
+    }
+
+    func refreshThemeSurfaces() {
         window?.backgroundColor = Theme.canvas
         editor.refreshTypography()
         updateEditorChrome()
@@ -1100,6 +1119,7 @@ import CozyCore
     }
     @objc private func revealFolder() { NSWorkspace.shared.open(vault.root) }
     @objc private func chooseFolder() { onChooseFolder?() }
+    @objc private func openFolderInNewWindow() { onOpenFolderInNewWindow?() }
 
     @objc func showRecovery() {
         guard persistAllWindows() else { return }
@@ -1167,11 +1187,17 @@ import CozyCore
         noteWindows.removeAll()
         searchPanel.shutdown()
     }
+    func windowDidBecomeKey(_ notification: Notification) {
+        onDidBecomeActive?(self)
+    }
     func windowDidResignKey(_ notification: Notification) {
         _ = persistCurrent()
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard persistCurrent() else { return false }
+        guard persistAllWindows() else { return false }
+        if onRequestCloseWorkspace?(self) == true {
+            return true
+        }
         sender.orderOut(nil)
         return false
     }

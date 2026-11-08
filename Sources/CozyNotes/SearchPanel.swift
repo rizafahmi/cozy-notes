@@ -15,6 +15,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onSwitchAtmosphere: ((Theme.Atmosphere) -> Void)?
     var onRevealFolder: (() -> Void)?
     var onChooseFolder: (() -> Void)?
+    var onOpenFolderInNewWindow: (() -> Void)?
     var onShowRecovery: (() -> Void)?
     var onShowGlobalSearch: (() -> Void)?
     var onStatus: ((String) -> Void)?
@@ -59,9 +60,12 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         engine = CaptureSearch(vault: vault)
         super.init(frame: .zero)
 
-        let sectionStamp = Theme.label("INDEX", size: 10, color: Theme.subtle)
+        let folderLabel = vault.root.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sectionStamp = Theme.label((folderLabel.isEmpty ? "INDEX" : folderLabel).uppercased(), size: 10, color: Theme.subtle)
         sectionStamp.font = Theme.monoFont(10, weight: .semibold)
-
+        sectionStamp.lineBreakMode = .byTruncatingMiddle
+        sectionStamp.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        sectionStamp.toolTip = vault.root.path
         let globalSearchBtn = QuietButton(symbol: "magnifyingglass", target: self, action: #selector(globalSearchTapped))
         globalSearchBtn.toolTip = "Global Note Search (⌘P / ⇧⌘F)"
         globalSearchBtn.setAccessibilityLabel("Global Note Search")
@@ -314,6 +318,10 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         openFolder.target = self
         menu.addItem(openFolder)
 
+
+        let openFolderNewWindow = NSMenuItem(title: "Open Folder in New Window…", action: #selector(openFolderInNewWindowTapped), keyEquivalent: "")
+        openFolderNewWindow.target = self
+        menu.addItem(openFolderNewWindow)
         let changeFolder = NSMenuItem(title: "Change Notes Folder…", action: #selector(chooseFolderTapped), keyEquivalent: "")
         changeFolder.target = self
         menu.addItem(changeFolder)
@@ -333,6 +341,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     @objc private func revealFolderTapped() { onRevealFolder?() }
     @objc private func chooseFolderTapped() { onChooseFolder?() }
+    @objc private func openFolderInNewWindowTapped() { onOpenFolderInNewWindow?() }
     @objc private func recoveryTapped() { onShowRecovery?() }
 
     private func start(extract: Bool) {
