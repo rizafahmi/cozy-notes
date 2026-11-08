@@ -5,7 +5,9 @@ import CozySearch
 /// One queue owns the engine; only immutable search snapshots reach AppKit.
 @MainActor
 final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     var onOpenNote: ((URL) -> Void)?
+    var onOpenNoteInNewWindow: ((URL) -> Void)?
     var onNewNote: (() -> Void)?
     var onDeleteNote: ((URL) -> Void)?
     var onToggleSidebar: (() -> Void)?
@@ -142,6 +144,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.action = #selector(rowClicked)
         table.doubleAction = #selector(openSelected)
         table.onReturn = { [weak self] in self?.openSelected() }
+        table.onOptionReturn = { [weak self] in self?.openSelectedInNewWindow() }
         table.onDelete = { [weak self] in self?.deleteSelectedNote() }
         table.onMenuForRow = { [weak self] row in self?.contextMenuForRow(row) }
         let scroll = NSScrollView()
@@ -171,11 +174,11 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         NSLayoutConstraint.activate([
             headerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 78),
             headerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            headerBar.heightAnchor.constraint(equalToConstant: 28),
+            headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            headerBar.heightAnchor.constraint(equalToConstant: 30),
             top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            top.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 4),
+            top.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 6),
             results.leadingAnchor.constraint(equalTo: leadingAnchor),
             results.trailingAnchor.constraint(equalTo: trailingAnchor),
             results.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 4),
@@ -186,8 +189,8 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             footerDivider.bottomAnchor.constraint(equalTo: footer.topAnchor),
             footer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
-            footer.heightAnchor.constraint(equalToConstant: 30)
+            footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            footer.heightAnchor.constraint(equalToConstant: 32)
         ])
     }
 
@@ -506,8 +509,13 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let row = table.selectedRow
         guard hits.indices.contains(row) else { return }
         let hit = hits[row]
+        let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+        let eventType = NSApp.currentEvent?.type
+        let isContextClick = eventType == .rightMouseDown || (eventType == .leftMouseDown && flags.contains(.control))
+        guard !isContextClick else { return }
+        let inNewWindow = (eventType == .leftMouseDown || eventType == .leftMouseUp) && flags.contains(.option)
         if hit.source.kind == .note {
-            activateHit(hit, allowExternalViewer: false)
+            activateHit(hit, allowExternalViewer: false, inNewWindow: inNewWindow)
         }
     }
 
@@ -516,8 +524,9 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
         guard hits.indices.contains(row) else { return }
         let hit = hits[row]
+        let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
         if hit.source.kind == .note {
-            activateHit(hit, allowExternalViewer: false)
+            activateHit(hit, allowExternalViewer: false, inNewWindow: flags.contains(.option))
         }
     }
 
@@ -526,6 +535,13 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let row = table.selectedRow >= 0 ? table.selectedRow : 0
         guard hits.indices.contains(row) else { return }
         activateHit(hits[row], allowExternalViewer: true)
+    }
+
+    @objc func openSelectedInNewWindow() {
+        guard !closed, !busy, !hits.isEmpty else { return }
+        let row = table.selectedRow >= 0 ? table.selectedRow : 0
+        guard hits.indices.contains(row), hits[row].source.kind == .note else { return }
+        activateHit(hits[row], allowExternalViewer: false, inNewWindow: true)
     }
 
     @objc func deleteSelectedNote() {
@@ -545,6 +561,16 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         openItem.target = self
         openItem.representedObject = row
         menu.addItem(openItem)
+        if hit.source.kind == .note {
+            let openNewWindowItem = NSMenuItem(
+                title: "Open in New Window",
+                action: #selector(openRowInNewWindowFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            openNewWindowItem.target = self
+            openNewWindowItem.representedObject = row
+            menu.addItem(openNewWindowItem)
+        }
 
         let revealItem = NSMenuItem(
             title: "Reveal in Finder",
@@ -575,6 +601,11 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         activateHit(hits[row], allowExternalViewer: true)
     }
 
+    @objc fileprivate func openRowInNewWindowFromMenu(_ sender: NSMenuItem) {
+        guard !closed, !busy, let row = sender.representedObject as? Int, hits.indices.contains(row) else { return }
+        activateHit(hits[row], allowExternalViewer: false, inNewWindow: true)
+    }
+
     @objc private func revealRowFromMenu(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
@@ -585,7 +616,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         onDeleteNote?(url)
     }
 
-    private func activateHit(_ hit: SearchHit, allowExternalViewer: Bool) {
+    private func activateHit(_ hit: SearchHit, allowExternalViewer: Bool, inNewWindow: Bool = false) {
         guard let expected = stamps[hit.source.url] else {
             setStatus("Missing or unreadable: \(hit.source.relativePath)")
             return
@@ -603,8 +634,13 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
                     guard let self, !self.closed, self.generation == id else { return }
                     self.updateOpenButtonVisibility()
                     if hit.source.kind == .note {
-                        self.activeNoteURL = hit.source.url
-                        self.onOpenNote?(hit.source.url)
+                        if inNewWindow {
+                            self.selectNote(self.activeNoteURL)
+                            self.onOpenNoteInNewWindow?(hit.source.url)
+                        } else {
+                            self.activeNoteURL = hit.source.url
+                            self.onOpenNote?(hit.source.url)
+                        }
                     } else if allowExternalViewer {
                         if !NSWorkspace.shared.open(hit.source.url) {
                             self.setStatus("No viewer could open \(hit.source.relativePath).")
@@ -687,12 +723,17 @@ private final class SearchHitRow: NSTableRowView {
 @MainActor
 private final class SearchResultsTable: NSTableView {
     var onReturn: (() -> Void)?
+    var onOptionReturn: (() -> Void)?
     var onDelete: (() -> Void)?
     var onMenuForRow: ((Int) -> NSMenu?)?
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if event.keyCode == 36 || event.keyCode == 76 {
-            onReturn?()
+            if flags.contains(.option) {
+                onOptionReturn?()
+            } else {
+                onReturn?()
+            }
         } else if (event.keyCode == 51 || event.keyCode == 117) && (flags.isEmpty || flags == .command) {
             onDelete?()
         } else {
@@ -703,9 +744,6 @@ private final class SearchResultsTable: NSTableView {
         let point = convert(event.locationInWindow, from: nil)
         let row = self.row(at: point)
         guard row >= 0 else { return nil }
-        if !selectedRowIndexes.contains(row) {
-            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        }
         return onMenuForRow?(row)
     }
 }
@@ -874,6 +912,7 @@ private final class SearchHitCell: NSTableCellView {
 final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     let searchField = NSSearchField()
     var onOpenNote: ((URL) -> Void)?
+    var onOpenNoteInNewWindow: ((URL) -> Void)?
     var onOpenExternal: ((URL) -> Void)?
     var onDismiss: (() -> Void)?
     var onShowSidebarSearch: (() -> Void)?
@@ -984,7 +1023,7 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
             emptyLabel.centerYAnchor.constraint(equalTo: resultsContainer.centerYAnchor)
         ])
 
-        let hintLabel = Theme.label("↑↓ navigate  ·  ↵ open  ·  esc dismiss", size: 10, color: Theme.subtle)
+        let hintLabel = Theme.label("↑↓ navigate  ·  ↵ open  ·  ⌥↵ new window  ·  esc dismiss", size: 10, color: Theme.subtle)
         hintLabel.font = Theme.monoFont(10, weight: .medium)
         statusLabel.font = Theme.monoFont(10, weight: .semibold)
         statusLabel.setContentHuggingPriority(.required, for: .horizontal)
@@ -1084,7 +1123,8 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
             return true
         case #selector(NSResponder.insertNewline(_:)),
              #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
-            confirmSelection()
+            let inNewWindow = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.option) == true
+            confirmSelection(inNewWindow: inNewWindow)
             return true
         case #selector(NSResponder.cancelOperation(_:)):
             dismiss()
@@ -1113,6 +1153,8 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         } else if flags == [.command, .shift], key == "f" {
             dismiss()
             return true
+        } else if flags == .option, (event.keyCode == 36 || event.keyCode == 76 || key == "\r" || key == "\n") {
+            return confirmSelection(inNewWindow: true)
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -1127,14 +1169,18 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
     }
 
     @discardableResult
-    func confirmSelection(at explicitRow: Int? = nil) -> Bool {
+    func confirmSelection(at explicitRow: Int? = nil, inNewWindow: Bool = false) -> Bool {
         guard !hits.isEmpty else { return false }
         let row = explicitRow ?? (table.selectedRow >= 0 ? table.selectedRow : 0)
         guard hits.indices.contains(row) else { return false }
         let hit = hits[row]
         isHidden = true
         if hit.source.kind == .note {
-            onOpenNote?(hit.source.url)
+            if inNewWindow, let onOpenNoteInNewWindow {
+                onOpenNoteInNewWindow(hit.source.url)
+            } else {
+                onOpenNote?(hit.source.url)
+            }
         } else {
             onOpenExternal?(hit.source.url)
         }
@@ -1145,7 +1191,8 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
         guard hits.indices.contains(row) else { return }
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        confirmSelection(at: row)
+        let inNewWindow = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.option) == true
+        confirmSelection(at: row, inNewWindow: inNewWindow)
     }
 
     private func updateResults() {

@@ -28,6 +28,8 @@ import CozyCore
     var onFocusChange: (() -> Void)?
     var onFoldStatusChange: ((String) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
+    var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
+    var onOpenCurrentNoteInNewWindow: (() -> Void)?
     var onInsertWikiLinkShortcut: (() -> Void)?
     var onWikiAutocompleteCommand: ((Selector) -> Bool)?
     var onQuickSwitcher: (() -> Void)?
@@ -683,6 +685,11 @@ import CozyCore
             case "g":
                 onFindPreviousInNote?()
                 return true
+            case "\r", "\n":
+                if let link = wikiLinkAtCursor() {
+                    onOpenWikiLinkInNewWindow?(link)
+                    return true
+                }
             default:
                 break
             }
@@ -730,7 +737,11 @@ import CozyCore
                 openWikiLinkAtCursor(self)
                 return true
             case "o":
-                openWikiLinkAtCursor(self)
+                if let link = wikiLinkAtCursor() {
+                    onOpenWikiLinkInNewWindow?(link)
+                } else {
+                    onOpenCurrentNoteInNewWindow?()
+                }
                 return true
             default:
                 break
@@ -777,6 +788,11 @@ import CozyCore
         } else if flags == .option {
             if (key == "\r" || key == "\n"), let link = wikiLinkAtCursor() {
                 onOpenWikiLink?(link)
+                return true
+            }
+        } else if flags == [.command, .option, .shift] {
+            if (key == "\r" || key == "\n" || key == "o"), let link = wikiLinkAtCursor() {
+                onOpenWikiLinkInNewWindow?(link)
                 return true
             }
         }
@@ -836,7 +852,11 @@ import CozyCore
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command), let link = wikiLink(atPoint: pt) {
-            onOpenWikiLink?(link)
+            if flags.contains(.option) {
+                onOpenWikiLinkInNewWindow?(link)
+            } else {
+                onOpenWikiLink?(link)
+            }
             return
         }
         super.mouseDown(with: event)
@@ -1365,6 +1385,12 @@ import CozyCore
     @objc func openWikiLinkAtCursor(_ sender: Any?) {
         if let link = wikiLinkAtCursor() {
             onOpenWikiLink?(link)
+        }
+    }
+
+    @objc func openWikiLinkInNewWindowAtCursor(_ sender: Any?) {
+        if let link = wikiLinkAtCursor() {
+            onOpenWikiLinkInNewWindow?(link)
         }
     }
 
@@ -2364,6 +2390,7 @@ import CozyCore
 }
 
 @MainActor final class CaptureEditor: NSView, NSTextViewDelegate {
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     let textView = MarkdownTextView()
     let status = Theme.label("", size: 11, color: Theme.muted)
     let wordCount = Theme.label("", size: 10.5, color: Theme.subtle)
@@ -2372,6 +2399,8 @@ import CozyCore
     var onRemoveLinkedAttachment: ((LinkedAttachment) -> Void)?
     var onHorizontalInsetChange: ((CGFloat) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
+    var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
+    var onOpenCurrentNoteInNewWindow: (() -> Void)?
     var onQuickSwitcher: (() -> Void)?
     var noteRecordsProvider: (() -> [NoteRecord])?
     var currentNoteURLProvider: (() -> URL?)?
@@ -2480,6 +2509,8 @@ import CozyCore
         textView.onFocusChange = { [weak self] in self?.handleFocusChange() }
         textView.onFoldStatusChange = { [weak self] msg in self?.status.stringValue = msg }
         textView.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
+        textView.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
+        textView.onOpenCurrentNoteInNewWindow = { [weak self] in self?.onOpenCurrentNoteInNewWindow?() }
         textView.onInsertWikiLinkShortcut = { [weak self] in self?.handleInsertWikiLinkShortcut() }
         textView.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
         textView.onShowInNoteFind = { [weak self] in self?.showInNoteFind() }
