@@ -162,7 +162,7 @@ public final class Vault: @unchecked Sendable {
     public func notes() throws -> [NoteRecord] {
         try synchronized {
             try files(under: root).filter {
-                ["md", "markdown"].contains($0.pathExtension.lowercased()) && $0.lastPathComponent != "AGENTS.md" && !Self.isExtractedCompanion($0, root: root)
+                ["md", "markdown"].contains($0.pathExtension.lowercased()) && !Self.isExtractedCompanion($0, root: root)
             }.map(record).sorted {
                     $0.modifiedAt == $1.modifiedAt ? $0.url.path < $1.url.path : $0.modifiedAt > $1.modifiedAt
                 }
@@ -195,8 +195,7 @@ public final class Vault: @unchecked Sendable {
     public func delete(_ noteURL: URL, moveToTrash: Bool = true) throws -> VaultSnapshot {
         try synchronized {
             try validateNote(noteURL)
-            guard noteURL.lastPathComponent != "AGENTS.md",
-                  !Self.isExtractedCompanion(noteURL, root: root) else {
+            guard !Self.isExtractedCompanion(noteURL, root: root) else {
                 throw VaultError.unsafePath(noteURL.path)
             }
             try validateSource(noteURL)
@@ -545,7 +544,7 @@ public final class Vault: @unchecked Sendable {
 
     /// Safe original enumeration shared by local indexing and capture.
     public func sourceFiles() throws -> [URL] {
-        try synchronized { try files(under: root).filter { $0.lastPathComponent != "AGENTS.md" } }
+        try synchronized { try files(under: root) }
     }
 
     public func validateSource(_ url: URL) throws {

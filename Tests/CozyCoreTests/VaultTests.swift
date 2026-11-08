@@ -177,6 +177,7 @@ final class VaultTests: XCTestCase {
             try "# Not visible".write(to: directory.appendingPathComponent("ignored.md"), atomically: true, encoding: .utf8)
         }
         let notes = try fixture.vault.notes()
+        XCTAssertTrue(notes.contains { $0.url == instructions && $0.title == "Existing user instructions" })
         XCTAssertTrue(notes.contains { $0.url == note && $0.title == "Reorganized" && $0.excerpt == "Companion text" })
         XCTAssertFalse(notes.contains { $0.title == "Not visible" })
     }
@@ -187,7 +188,6 @@ final class VaultTests: XCTestCase {
         let text = "```swift\nlet value = \"# not a heading\"\n```\n\n  Keep this indentation.\n"
         let note = try fixture.vault.capture(text: text)
         XCTAssertEqual(try fixture.vault.read(note.url), text)
-        XCTAssertFalse(try fixture.vault.notes().contains { $0.url.lastPathComponent == "AGENTS.md" })
     }
 
     func testCaseVariantAttachmentNamesPreserveBothOriginals() throws {
@@ -258,11 +258,11 @@ final class VaultTests: XCTestCase {
         XCTAssertEqual(try fixture.vault.read(doomed.url), doomedText)
         XCTAssertEqual(try Data(contentsOf: attachmentURL), imageBytes)
 
-        // Deleting AGENTS.md or paths outside the vault must be rejected
-        let agents = fixture.root.appendingPathComponent("AGENTS.md")
-        try "# Instructions".write(to: agents, atomically: true, encoding: .utf8)
-        XCTAssertThrowsError(try fixture.vault.delete(agents, moveToTrash: false))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: agents.path))
+        // Deleting paths outside the vault must be rejected
+        let outside = fixture.workspace.appendingPathComponent("outside.md")
+        try "# Outside".write(to: outside, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try fixture.vault.delete(outside, moveToTrash: false))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path))
     }
 
     func testWikiLinkParsingResolutionAndNoteCreation() throws {

@@ -7,7 +7,7 @@ Cozy Notes (`local.cozy.notes`) is a local-first macOS workspace (AppKit, Swift 
 Core invariants:
 - **Plain-file storage**: Notes (`Inbox/<UTC-timestamp>-<UUID>.md`), attachments (`Attachments/<UUID>/<filename>`), and OCR/PDF extraction sidecars (`Extracted Text/<sha256-of-relative-path>.md`) are ordinary local files synced externally (e.g., via Syncthing).
 - **Offline & private**: Zero network requests, zero LLMs/cloud APIs, zero persistent databases, and zero external Swift Package dependencies.
-- **Legacy `AGENTS.md` handling**: `Vault` explicitly ignores `AGENTS.md` inside user note vaults during note enumeration, search indexing, and deletion (`Sources/CozyCore/Vault.swift`), while preserving it on disk and in recovery snapshots.
+- **Repository & vault Markdown discovery**: `Vault` surfaces all `.md` / `.markdown` files (including `AGENTS.md`, `README.md`, `PLAN.md`, and `docs/**/*.md`). When opened on a project repository (`Vault.isProjectRepository`), it prunes build/dependency directories (`node_modules`, `target`, `build`, `dist`, `vendor`, `DerivedData`, etc.) and scopes indexing outside `Inbox/`, `Attachments/`, and `Extracted Text/` to Markdown files.
 
 ---
 
