@@ -9,6 +9,16 @@ public struct NoteRecord {
     public let excerpt: String
 }
 
+public struct LinkedAttachment: Equatable {
+    public let url: URL
+    public let markdownRange: NSRange
+
+    public init(url: URL, markdownRange: NSRange) {
+        self.url = url
+        self.markdownRange = markdownRange
+    }
+}
+
 public struct VaultSnapshot {
     public let id: String
     public let label: String
@@ -133,6 +143,94 @@ public final class Vault: @unchecked Sendable {
         try synchronized {
             try validateNote(url)
             try atomicWrite(Data(text.utf8), to: url, expectedContent: expectedContent)
+        }
+    }
+
+    public func attach(_ attachments: [URL], to noteURL: URL, text: String, expectedContent: String) throws -> String {
+        try synchronized {
+            try validateNote(noteURL)
+            guard !attachments.isEmpty else {
+                try atomicWrite(Data(text.utf8), to: noteURL, expectedContent: expectedContent)
+                return text
+            }
+            let stem = noteURL.deletingPathExtension().lastPathComponent
+            let bucket: String
+            if stem.count > 37, let uuid = UUID(uuidString: String(stem.suffix(36))) {
+                bucket = uuid.uuidString
+            } else {
+                bucket = UUID().uuidString
+            }
+            let attachmentDirectory = root.appendingPathComponent("Attachments/\(bucket)", isDirectory: true)
+            let existed = fm.fileExists(atPath: attachmentDirectory.path)
+            var copiedURLs: [URL] = []
+            var copiedNames: [String] = []
+            do {
+                try safeDirectory(attachmentDirectory)
+                var reserved = (try? fm.contentsOfDirectory(atPath: attachmentDirectory.path)) ?? []
+                for source in attachments {
+                    guard source.isFileURL else { throw VaultError.invalidAttachment(source.absoluteString) }
+                    let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                    guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                        throw VaultError.invalidAttachment(source.path)
+                    }
+                    let base = Self.sanitizedFilename(source.lastPathComponent)
+                    var name = base
+                    var suffix = 2
+                    while reserved.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+                        let url = URL(fileURLWithPath: base)
+                        let ext = url.pathExtension
+                        name = "\(url.deletingPathExtension().lastPathComponent)-\(suffix)" + (ext.isEmpty ? "" : ".\(ext)")
+                        suffix += 1
+                    }
+                    let destination = attachmentDirectory.appendingPathComponent(name)
+                    try fm.copyItem(at: source, to: destination)
+                    copiedURLs.append(destination)
+                    copiedNames.append(name)
+                    reserved.append(name)
+                }
+                let noteDir = noteURL.deletingLastPathComponent().path
+                let relativeDir = noteDir.count > root.path.count ? String(noteDir.dropFirst(root.path.count + 1)) : ""
+                let depth = relativeDir.isEmpty ? 0 : relativeDir.split(separator: "/").count
+                let prefix = String(repeating: "../", count: depth)
+                var markdown = text
+                if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    markdown = "# \(copiedNames.first ?? "Untitled capture")\n"
+                } else if !markdown.hasSuffix("\n") {
+                    markdown += "\n"
+                }
+                for name in copiedNames {
+                    let ext = URL(fileURLWithPath: name).pathExtension.lowercased()
+                    let image = Self.imageExtensions.contains(ext)
+                    let label = name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "[", with: "\\[").replacingOccurrences(of: "]", with: "\\]")
+                    markdown += "\n\(image ? "!" : "")[\(label)](\(prefix)Attachments/\(bucket)/\(Self.encodedFilename(name)))\n"
+                }
+                try atomicWrite(Data(markdown.utf8), to: noteURL, expectedContent: expectedContent)
+                return markdown
+            } catch {
+                for copied in copiedURLs { try? fm.removeItem(at: copied) }
+                if !existed { try? fm.removeItem(at: attachmentDirectory) }
+                throw error
+            }
+        }
+    }
+
+    public func linkedAttachments(in text: String, relativeTo noteURL: URL) -> [LinkedAttachment] {
+        synchronized {
+            guard (try? validateNote(noteURL)) != nil,
+                  let regex = try? NSRegularExpression(pattern: "!?\\[[^\\]\\n]*\\]\\(([^\\)\\n]+)\\)") else { return [] }
+            let ns = text as NSString
+            let baseDir = noteURL.deletingLastPathComponent()
+            var items: [LinkedAttachment] = []
+            for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) where match.numberOfRanges > 1 {
+                let rawTarget = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespaces)
+                guard !rawTarget.contains("://"), !rawTarget.hasPrefix("/"),
+                      let decoded = rawTarget.removingPercentEncoding,
+                      !decoded.isEmpty else { continue }
+                let candidate = baseDir.appendingPathComponent(decoded).standardizedFileURL.resolvingSymlinksInPath()
+                guard (try? validateSource(candidate)) != nil else { continue }
+                items.append(LinkedAttachment(url: candidate, markdownRange: match.range))
+            }
+            return items
         }
     }
 

@@ -187,4 +187,25 @@ final class VaultTests: XCTestCase {
         let files = try FileManager.default.contentsOfDirectory(at: XCTUnwrap(buckets.first), includingPropertiesForKeys: nil)
         XCTAssertEqual(Set(try files.map { try Data(contentsOf: $0) }), Set([firstBytes, secondBytes]))
     }
+
+    func testAttachToExistingNoteDeduplicatesAndResolvesLinkedAttachments() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let first = fixture.workspace.appendingPathComponent("diagram.png")
+        let second = fixture.workspace.appendingPathComponent("Sub/diagram.png")
+        try FileManager.default.createDirectory(at: second.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data([10, 20, 30]).write(to: first)
+        try Data([40, 50, 60]).write(to: second)
+
+        let note = try fixture.vault.capture(text: "# Architecture\nInitial thought.", attachments: [first])
+        let initial = try fixture.vault.read(note.url)
+        let updated = try fixture.vault.attach([second], to: note.url, text: initial, expectedContent: initial)
+        XCTAssertTrue(updated.contains("diagram.png"))
+        XCTAssertTrue(updated.contains("diagram-2.png"))
+
+        let linked = fixture.vault.linkedAttachments(in: updated, relativeTo: note.url)
+        XCTAssertEqual(linked.count, 2)
+        XCTAssertEqual(try Data(contentsOf: linked[0].url), Data([10, 20, 30]))
+        XCTAssertEqual(try Data(contentsOf: linked[1].url), Data([40, 50, 60]))
+    }
 }
