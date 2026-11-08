@@ -4,7 +4,7 @@ import CozySearch
 
 /// One queue owns the engine; only immutable search snapshots reach AppKit.
 @MainActor
-final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onOpenNote: ((URL) -> Void)?
     var onNewNote: (() -> Void)?
     var onDeleteNote: ((URL) -> Void)?
@@ -14,6 +14,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     var onRevealFolder: (() -> Void)?
     var onChooseFolder: (() -> Void)?
     var onShowRecovery: (() -> Void)?
+    var onShowGlobalSearch: (() -> Void)?
     var onStatus: ((String) -> Void)?
     var isProcessing: Bool { busy }
     var isExtracting: Bool { extracting }
@@ -27,8 +28,6 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private let engine: CaptureSearch
     private let queue = DispatchQueue(label: "CozyNotes.capture-search", qos: .userInitiated)
     private let lifetime = SearchCancellation()
-    private let searchBar = CozySearchBar()
-    private var field: NSSearchField { searchBar.field }
     private let table = SearchResultsTable()
     private let status = Theme.label("LOADING…", size: 10.5, color: Theme.subtle)
     private let empty = Theme.label("Loading…", size: 12.5, color: Theme.muted)
@@ -36,7 +35,6 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private let processingRow = NSStackView()
     private let processingNotice = PaperSurface(cornerRadius: 8, color: Theme.accentSoft, bordered: false)
     private let processingLabel = Theme.label("", size: 11, color: Theme.ink)
-    private var renderedQuery: String?
     private var makeButton: QuietButton!
     private var cancelButton: QuietButton!
     private var openButton: QuietButton!
@@ -62,6 +60,10 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         let sectionStamp = Theme.label("INDEX", size: 10, color: Theme.subtle)
         sectionStamp.font = Theme.monoFont(10, weight: .semibold)
 
+        let globalSearchBtn = QuietButton(symbol: "magnifyingglass", target: self, action: #selector(globalSearchTapped))
+        globalSearchBtn.toolTip = "Global Note Search (⌘P / ⇧⌘F)"
+        globalSearchBtn.setAccessibilityLabel("Global Note Search")
+
         let appearanceBtn = QuietButton(symbol: "circle.lefthalf.filled", target: self, action: #selector(toggleAppearanceTapped))
         appearanceBtn.toolTip = "Switch Light / Dark appearance"
         appearanceBtn.setAccessibilityLabel("Switch appearance")
@@ -77,17 +79,7 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
 
         let headerSpacer = NSView()
         headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let headerBar = Theme.stack([sectionStamp, headerSpacer, appearanceBtn, toggleSidebar, newNote], spacing: 2)
-
-        field.placeholderString = "Filter notes & clippings…"
-        field.delegate = self
-        field.target = self
-        field.action = #selector(openSelected)
-        field.sendsWholeSearchString = false
-        field.sendsSearchStringImmediately = true
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        field.setAccessibilityLabel("Search notes and files")
-
+        let headerBar = Theme.stack([sectionStamp, headerSpacer, globalSearchBtn, appearanceBtn, toggleSidebar, newNote], spacing: 2)
         makeButton = QuietButton(title: "Index", target: self, action: #selector(makeSearchable))
         makeButton.tint = Theme.accent
         makeButton.font = .systemFont(ofSize: 11, weight: .semibold)
@@ -118,10 +110,8 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         Theme.fill(processingRow, in: processingNotice, inset: 8)
         processingNotice.isHidden = true
 
-        let top = Theme.stack([searchBar, processingNotice], orientation: .vertical, spacing: 8)
-        searchBar.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
+        let top = Theme.stack([processingNotice], orientation: .vertical, spacing: 8)
         processingNotice.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
-
         progress.style = .spinning
         progress.controlSize = .small
         progress.isIndeterminate = true
@@ -185,11 +175,10 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
             headerBar.heightAnchor.constraint(equalToConstant: 28),
             top.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             top.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            top.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 6),
-            searchBar.heightAnchor.constraint(equalToConstant: 30),
+            top.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 4),
             results.leadingAnchor.constraint(equalTo: leadingAnchor),
             results.trailingAnchor.constraint(equalTo: trailingAnchor),
-            results.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 8),
+            results.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 4),
             results.bottomAnchor.constraint(equalTo: footerDivider.topAnchor),
             footerDivider.leadingAnchor.constraint(equalTo: leadingAnchor),
             footerDivider.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -209,10 +198,14 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         bounds.fill()
     }
 
-    func focusSearch() {
+    func focusSidebar() {
         guard !closed else { return }
-        window?.makeFirstResponder(field)
-        field.selectText(nil)
+        if table.selectedRow < 0, !hits.isEmpty {
+            suppressSelectionAction = true
+            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            suppressSelectionAction = false
+        }
+        window?.makeFirstResponder(table)
     }
 
     func freshSnapshotAndModifiedDates() -> (snapshot: SearchSnapshot?, dates: [URL: Date]) {
@@ -276,27 +269,15 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         onRevealFolder = nil
         onChooseFolder = nil
         onShowRecovery = nil
+        onShowGlobalSearch = nil
         onStatus = nil
-        field.isEnabled = false
         makeButton.isEnabled = false
         cancelButton.isEnabled = false
         openButton.isEnabled = false
         moreButton.isEnabled = false
     }
 
-    func controlTextDidChange(_ obj: Notification) { render() }
-
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        if commandSelector == #selector(NSResponder.moveDown(_:)), !hits.isEmpty {
-            let next = table.selectedRow >= 0 ? min(hits.count - 1, table.selectedRow + 1) : 0
-            table.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
-            table.scrollRowToVisible(next)
-            window?.makeFirstResponder(table)
-            return true
-        }
-        return false
-    }
-
+    @objc private func globalSearchTapped() { onShowGlobalSearch?() }
     @objc private func toggleAppearanceTapped() { onToggleAppearance?() }
     @objc private func toggleSidebarTapped() { onToggleSidebar?() }
     @objc private func newNoteTapped() { onNewNote?() }
@@ -432,19 +413,15 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
 
     private func render() {
         guard !closed else { return }
-        let query = field.stringValue
-        let browsing = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let selectedHit = table.selectedRow >= 0 && table.selectedRow < hits.count ? hits[table.selectedRow] : nil
         let targetURL = selectedHit?.source.url ?? activeNoteURL
         let targetPage = selectedHit?.page
         let previousOffset = table.enclosingScrollView?.contentView.bounds.origin ?? .zero
-        hits = snapshot?.search(query) ?? []
-        if browsing {
-            hits.sort {
-                let left = stamps[$0.source.url]?.modified ?? .distantPast
-                let right = stamps[$1.source.url]?.modified ?? .distantPast
-                return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
-            }
+        hits = snapshot?.search("") ?? []
+        hits.sort {
+            let left = stamps[$0.source.url]?.modified ?? .distantPast
+            let right = stamps[$1.source.url]?.modified ?? .distantPast
+            return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
         }
         suppressSelectionAction = true
         table.reloadData()
@@ -455,11 +432,10 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         suppressSelectionAction = false
         if let scroll = table.enclosingScrollView {
             let height = hits.isEmpty ? 0 : table.rect(ofRow: hits.count - 1).maxY
-            let y = renderedQuery == query ? min(previousOffset.y, max(0, height - scroll.contentView.bounds.height)) : 0
+            let y = min(previousOffset.y, max(0, height - scroll.contentView.bounds.height))
             scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
             scroll.reflectScrolledClipView(scroll.contentView)
         }
-        renderedQuery = query
         updateProcessingNotice()
         empty.isHidden = !hits.isEmpty
         let pending = snapshot?.pendingCount ?? 0
@@ -468,11 +444,11 @@ final class SearchPanel: NSView, NSSearchFieldDelegate, NSTableViewDataSource, N
         } else if snapshot?.sources.isEmpty == true {
             empty.stringValue = "No notes yet.\nStart writing on the right."
         } else {
-            empty.stringValue = "No matches.\(pending > 0 ? "\n\(pending) files still need indexing." : "")"
+            empty.stringValue = "No notes yet.\(pending > 0 ? "\n\(pending) files still need indexing." : "")"
         }
         if !busy, let snapshot {
             let count = hits.count
-            let noun = browsing ? (count == 1 ? "ENTRY" : "ENTRIES") : (count == 1 ? "MATCH" : "MATCHES")
+            let noun = count == 1 ? "ENTRY" : "ENTRIES"
             var summary = "\(count) \(noun)"
             if snapshot.pendingCount > 0 { summary += " · \(snapshot.pendingCount) PENDING" }
             if snapshot.issueCount > 0 { summary += " · \(snapshot.issueCount) ISSUE" }
