@@ -3,6 +3,7 @@
     <style name="CozyTheme" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans-serif</item>
         <item name="android:colorAccent">#6E9BF6</item>
+        <item name="android:textCursorDrawable">@drawable/transparent_cursor</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:statusBarColor">#0E1218</item>
         <item name="android:navigationBarColor">#0E1218</item>
