@@ -1,4 +1,25 @@
+#if canImport(XCTest)
 import XCTest
+#else
+import Testing
+class XCTestCase {}
+func XCTAssertEqual<T: Equatable>(_ a: T, _ b: T, _ message: String = "") { #expect(a == b) }
+func XCTAssertTrue(_ expr: Bool, _ message: String = "") { #expect(expr) }
+func XCTAssertFalse(_ expr: Bool, _ message: String = "") { #expect(!expr) }
+func XCTFail(_ message: String = "") { Issue.record(Comment(rawValue: message)) }
+func XCTUnwrap<T>(_ value: T?) throws -> T {
+    guard let value else { throw NSError(domain: "XCTUnwrap", code: 1) }
+    return value
+}
+func XCTAssertThrowsError<T>(_ expression: @autoclosure () throws -> T, _ errorHandler: (Error) -> Void = { _ in }) {
+    do {
+        _ = try expression()
+        Issue.record("Expected error to be thrown")
+    } catch {
+        errorHandler(error)
+    }
+}
+#endif
 import Foundation
 import CoreGraphics
 import CoreText

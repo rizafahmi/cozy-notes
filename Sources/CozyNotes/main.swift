@@ -10,6 +10,19 @@ import CozyCore
         NSApp.setActivationPolicy(.regular)
         buildMenus()
         let arguments = CommandLine.arguments
+        if arguments.contains("--moby-dick-workout") {
+            do {
+                let cycles: Int = arguments.firstIndex(of: "--cycles").flatMap { arguments.indices.contains($0 + 1) ? Int(arguments[$0 + 1]) : nil } ?? 2
+                let sample: String = arguments.firstIndex(of: "--sample").flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil } ?? "Whale"
+                let report = try MobyDickWorkout.run(repeatCycles: cycles, typingSample: sample)
+                print(report.formattedSummary())
+                fflush(stdout)
+                exit(0)
+            } catch {
+                fputs("Moby Dick Workout failed: \(error)\n", stderr)
+                exit(1)
+            }
+        }
         let argumentVault: String? = arguments.firstIndex(of: "--vault").flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
         let envVault = ProcessInfo.processInfo.environment["COZY_VAULT"]
         let path = argumentVault ?? envVault ?? UserDefaults.standard.string(forKey: "vaultPath")
