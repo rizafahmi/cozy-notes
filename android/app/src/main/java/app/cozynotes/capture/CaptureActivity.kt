@@ -7,7 +7,10 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
+import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
@@ -21,12 +24,17 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.core.content.IntentCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class CaptureActivity : ComponentActivity() {
     private lateinit var worker: CaptureWorker
     private lateinit var text: EditText
     private lateinit var note: EditText
     private lateinit var folder: TextView
+    private lateinit var wordCountLabel: TextView
+    private lateinit var sealDot: View
     private lateinit var attachmentsLabel: TextView
     private lateinit var status: TextView
     private lateinit var save: Button
@@ -34,7 +42,21 @@ class CaptureActivity : ComponentActivity() {
     private lateinit var fresh: Button
     private val attachments = mutableListOf<Uri>()
     private val preferences by lazy { getSharedPreferences("capture", MODE_PRIVATE) }
-    private val brown = Color.rgb(76, 56, 43)
+
+    // Midnight Ink palette (matching macOS Midnight Ink & Porcelain dark mode)
+    private val deskColor = Color.rgb(14, 18, 24)        // #0E1218
+    private val folioColor = Color.rgb(20, 25, 35)       // #141923
+    private val recessedColor = Color.rgb(27, 34, 48)    // #1B2230
+    private val borderColor = Color.rgb(39, 48, 66)      // #273042
+    private val ruleColor = Color.rgb(31, 39, 54)        // #1F2736
+    private val headingInk = Color.rgb(240, 244, 250)    // #F0F4FA
+    private val bodyInk = Color.rgb(218, 226, 238)       // #DAE2EE
+    private val mutedInk = Color.rgb(142, 156, 178)      // #8E9CB2
+    private val subtleInk = Color.rgb(95, 108, 130)      // #5F6C82
+    private val accentColor = Color.rgb(110, 155, 246)   // #6E9BF6
+    private val onAccentColor = Color.rgb(11, 15, 22)    // #0B0F16
+    private val seafoamColor = Color.rgb(94, 194, 176)   // #5EC2B0
+
     private var root: Uri? = null
     private val folderPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         handleFolderResult(result.resultCode, result.data)
@@ -92,67 +114,190 @@ class CaptureActivity : ComponentActivity() {
     }
 
     private fun buildView() {
-        val scroll = ScrollView(this).apply { isFillViewport = true; setBackgroundColor(Color.rgb(247, 241, 232)) }
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(28), dp(24), dp(28))
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(deskColor)
         }
-        scroll.addView(layout)
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(22))
+        }
+        scroll.addView(outer)
         // Target 35 draws edge-to-edge; keep controls clear of system bars and the keyboard.
         ViewCompat.setOnApplyWindowInsetsListener(scroll) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             insets
         }
-        fun label(value: String, size: Float = 16f): TextView = TextView(this).apply {
-            this.text = value
-            textSize = size
-            setTextColor(brown)
-            setPadding(0, dp(8), 0, dp(8))
-            layout.addView(this)
+
+        // 1. Top Desk Bar: Seal dot + "MIDNIGHT FOLIO" + Vault Selector Pill
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(4), dp(4), dp(12))
         }
-        label("Cozy Notes", 32f).setTypeface(Typeface.create("serif", Typeface.NORMAL))
-        label("A quiet place to keep a thought.")
-        folder = label("")
+        sealDot = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(seafoamColor)
+            }
+            topBar.addView(this, LinearLayout.LayoutParams(dp(8), dp(8)).apply { rightMargin = dp(8) })
+        }
+        val brandStamp = TextView(this).apply {
+            this.text = "COZY NOTES  ·  MIDNIGHT"
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            letterSpacing = 0.08f
+            setTextColor(mutedInk)
+            topBar.addView(this, LinearLayout.LayoutParams(0, -2, 1f))
+        }
         choose = Button(this).apply {
-            this.text = "Choose vault folder"
+            this.text = "Choose vault…"
+            textSize = 12f
+            isAllCaps = false
+            setTextColor(headingInk)
+            background = surfaceDrawable(recessedColor, borderColor, dp(8))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            minHeight = dp(32)
+            minimumHeight = dp(32)
+            stateListAnimator = null
             setOnClickListener { chooseFolder() }
-            layout.addView(this)
+            topBar.addView(this, LinearLayout.LayoutParams(-2, dp(34)))
         }
-        label("Text or link")
+        outer.addView(topBar, LinearLayout.LayoutParams(-1, -2))
+
+        folder = TextView(this).apply {
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(subtleInk)
+            setPadding(dp(6), 0, dp(6), dp(10))
+            outer.addView(this, LinearLayout.LayoutParams(-1, -2))
+        }
+
+        // 2. Inset Folio Page Card
+        val folioCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = surfaceDrawable(folioColor, borderColor, dp(16))
+            setPadding(dp(20), dp(16), dp(20), dp(18))
+        }
+
+        val folioHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(10))
+        }
+        val dateStamp = SimpleDateFormat("EEE, MMM d, yyyy", Locale.US).format(Date()).uppercase(Locale.US)
+        TextView(this).apply {
+            this.text = "FOLIO  ·  $dateStamp"
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(mutedInk)
+            folioHeader.addView(this, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        wordCountLabel = TextView(this).apply {
+            this.text = "BLANK FOLIO"
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(subtleInk)
+            folioHeader.addView(this, LinearLayout.LayoutParams(-2, -2))
+        }
+        folioCard.addView(folioHeader, LinearLayout.LayoutParams(-1, -2))
+
+        // Hairline rule under dateline
+        View(this).apply {
+            setBackgroundColor(ruleColor)
+            folioCard.addView(this, LinearLayout.LayoutParams(-1, dp(1)).apply { bottomMargin = dp(14) })
+        }
+
+        val watcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) { updateWordCount() }
+        }
+
         text = EditText(this).apply {
             id = 1001
-            hint = "What's worth keeping?"
-            minLines = 5
-            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            hint = "Begin a note, paste a link, or jot a thought…"
+            minLines = 7
+            textSize = 17.5f
+            setLineSpacing(dp(6).toFloat(), 1f)
+            gravity = Gravity.TOP or Gravity.START
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            setTextColor(brown)
-            background = fieldBackground()
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            layout.addView(this, LinearLayout.LayoutParams(-1, -2))
+            setTextColor(bodyInk)
+            setHintTextColor(subtleInk)
+            background = null
+            setPadding(0, dp(2), 0, dp(14))
+            addTextChangedListener(watcher)
+            folioCard.addView(this, LinearLayout.LayoutParams(-1, -2))
         }
-        label("Optional note")
+
+        // Hairline rule before context note
+        View(this).apply {
+            setBackgroundColor(ruleColor)
+            folioCard.addView(this, LinearLayout.LayoutParams(-1, dp(1)).apply {
+                topMargin = dp(4)
+                bottomMargin = dp(10)
+            })
+        }
+
+        TextView(this).apply {
+            this.text = "MARGIN CONTEXT"
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            letterSpacing = 0.08f
+            setTextColor(subtleInk)
+            setPadding(0, 0, 0, dp(6))
+            folioCard.addView(this, LinearLayout.LayoutParams(-1, -2))
+        }
+
         note = EditText(this).apply {
             id = 1002
-            hint = "Add a little context…"
+            hint = "Add context or a note for shared links & files…"
             minLines = 2
-            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            textSize = 15f
+            setLineSpacing(dp(4).toFloat(), 1f)
+            gravity = Gravity.TOP or Gravity.START
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            setTextColor(brown)
-            background = fieldBackground()
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            layout.addView(this, LinearLayout.LayoutParams(-1, -2))
+            setTextColor(bodyInk)
+            setHintTextColor(subtleInk)
+            background = surfaceDrawable(recessedColor, borderColor, dp(10))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            addTextChangedListener(watcher)
+            folioCard.addView(this, LinearLayout.LayoutParams(-1, -2))
         }
-        attachmentsLabel = label("")
+
+        attachmentsLabel = TextView(this).apply {
+            textSize = 11.5f
+            typeface = Typeface.MONOSPACE
+            setTextColor(mutedInk)
+            background = surfaceDrawable(recessedColor, borderColor, dp(8))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            folioCard.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        }
+
+        outer.addView(folioCard, LinearLayout.LayoutParams(-1, -2))
+
+        // 3. Primary & Secondary Actions below the Folio
         save = Button(this).apply {
-            this.text = "Save to Inbox"
+            this.text = "Keep in Inbox"
+            textSize = 15f
+            isAllCaps = false
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(onAccentColor)
+            background = surfaceDrawable(accentColor, accentColor, dp(12))
+            stateListAnimator = null
             setOnClickListener { saveCapture() }
-            layout.addView(this)
+            outer.addView(this, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(16) })
         }
-        status = label("")
-        status.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+
         fresh = Button(this).apply {
-            this.text = "New capture"
+            this.text = "New Folio Capture"
+            textSize = 15f
+            isAllCaps = false
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(headingInk)
+            background = surfaceDrawable(recessedColor, borderColor, dp(12))
+            stateListAnimator = null
             visibility = View.GONE
             setOnClickListener {
                 this@CaptureActivity.text.setText("")
@@ -164,9 +309,27 @@ class CaptureActivity : ComponentActivity() {
                 render()
                 this@CaptureActivity.text.requestFocus()
             }
-            layout.addView(this)
+            outer.addView(this, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(16) })
         }
-        label("Files stay in your chosen folder. Sync that folder with Syncthing separately. Cozy Notes needs no account or network access.", 13f)
+
+        status = TextView(this).apply {
+            textSize = 12.5f
+            setTextColor(seafoamColor)
+            setPadding(dp(6), dp(12), dp(6), dp(6))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            outer.addView(this, LinearLayout.LayoutParams(-1, -2))
+        }
+
+        TextView(this).apply {
+            this.text = "LOCAL MARKDOWN  ·  SYNCTHING READY  ·  NO NETWORK"
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.CENTER_HORIZONTAL
+            setTextColor(subtleInk)
+            setPadding(0, dp(10), 0, dp(4))
+            outer.addView(this, LinearLayout.LayoutParams(-1, -2))
+        }
+
         setContentView(scroll)
     }
 
@@ -252,33 +415,67 @@ class CaptureActivity : ComponentActivity() {
         worker.start(CaptureRequest(selected, combined, attachments.toList()))
     }
 
+    private fun updateWordCount() {
+        val combined = "${text.text} ${note.text}".trim()
+        if (combined.isEmpty()) {
+            wordCountLabel.text = "BLANK FOLIO"
+            return
+        }
+        val words = combined.split(Regex("\\s+")).count { it.isNotEmpty() }
+        wordCountLabel.text = "$words ${if (words == 1) "WORD" else "WORDS"}"
+    }
+
     private fun render() {
         val selected = root
+        val validVault = selected != null && hasPermission(selected)
         folder.text = when {
-            selected == null -> "No vault selected yet."
-            !hasPermission(selected) -> "Folder access expired. Choose the vault again."
-            else -> "Vault: ${Uri.decode(DocumentsContract.getTreeDocumentId(selected))}"
+            selected == null -> "NO VAULT SELECTED  ·  TAP 'CHOOSE VAULT…' ABOVE"
+            !validVault -> "FOLDER ACCESS EXPIRED  ·  CHOOSE VAULT AGAIN"
+            else -> {
+                val rawId = Uri.decode(DocumentsContract.getTreeDocumentId(selected))
+                "VAULT  ·  $rawId"
+            }
         }
-        attachmentsLabel.text = if (attachments.isEmpty()) "Share images or files to Cozy Notes from another app to attach them." else "${attachments.size} attachment${if (attachments.size == 1) "" else "s"} · originals will be preserved"
+        choose.text = if (validVault) "Change vault…" else "Choose vault…"
+        sealDot.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(if (validVault) seafoamColor else accentColor)
+        }
+        if (attachments.isEmpty()) {
+            attachmentsLabel.text = "ATTACHMENTS  ·  NONE (SHARE FILES TO COZY NOTES)"
+            attachmentsLabel.setTextColor(subtleInk)
+        } else {
+            attachmentsLabel.text = "${attachments.size} ATTACHMENT${if (attachments.size == 1) "" else "S"}  ·  ORIGINALS PRESERVED"
+            attachmentsLabel.setTextColor(seafoamColor)
+        }
+        updateWordCount()
         val done = worker.result != null || save.visibility == View.GONE
         save.isEnabled = !worker.busy && !done
+        save.alpha = if (save.isEnabled) 1f else 0.55f
         choose.isEnabled = !worker.busy
         text.isEnabled = !worker.busy && !done
         note.isEnabled = !worker.busy && !done
-        if (worker.busy) status.text = "Saving capture… Keep this app open until the save finishes."
-        worker.failure?.let { status.text = "$it\nYour input has been kept. Check folder access, then retry." }
+        if (worker.busy) {
+            status.setTextColor(accentColor)
+            status.text = "Saving capture… Keep this app open until the save finishes."
+        }
+        worker.failure?.let {
+            status.setTextColor(accentColor)
+            status.text = "$it\nYour input has been kept. Check folder access, then retry."
+        }
         worker.result?.let {
+            status.setTextColor(seafoamColor)
             status.text = "Saved to ${it.path}"
             save.visibility = View.GONE
         }
         fresh.visibility = if (done) View.VISIBLE else View.GONE
+        status.visibility = if (status.text.isNullOrBlank()) View.GONE else View.VISIBLE
     }
 
-
-    private fun fieldBackground() = GradientDrawable().apply {
-        setColor(Color.rgb(255, 252, 247))
-        cornerRadius = dp(12).toFloat()
-        setStroke(dp(1), Color.rgb(218, 202, 185))
+    private fun surfaceDrawable(fill: Int, stroke: Int, radius: Int) = GradientDrawable().apply {
+        setColor(fill)
+        cornerRadius = radius.toFloat()
+        setStroke(dp(1), stroke)
     }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }
