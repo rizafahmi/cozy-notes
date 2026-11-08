@@ -159,6 +159,9 @@ import CozyCore
         addResponder("Bullet List", action: #selector(MarkdownTextView.toggleBulletList(_:)), key: "8", modifiers: [.command, .shift], to: format)
         addResponder("Numbered List", action: #selector(MarkdownTextView.toggleNumberedList(_:)), key: "7", modifiers: [.command, .shift], to: format)
         addResponder("Checklist", action: #selector(MarkdownTextView.toggleChecklist(_:)), key: "l", modifiers: [.command, .shift], to: format)
+        format.addItem(.separator())
+        addResponder("Indent List Level", action: #selector(MarkdownTextView.indentListLevel(_:)), key: "]", to: format)
+        addResponder("Outdent List Level", action: #selector(MarkdownTextView.outdentListLevel(_:)), key: "[", to: format)
         let viewItem = NSMenuItem()
         viewItem.title = "View"
         let view = NSMenu(title: "View")

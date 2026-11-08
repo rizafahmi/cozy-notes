@@ -37,11 +37,23 @@ import CozyCore
         let label: String
         let level: Int
     }
+    struct BulletItem: Equatable {
+        enum Kind: Equatable {
+            case unordered
+            case ordered
+            case task(completed: Bool)
+        }
+        let lineRange: NSRange
+        let markerRange: NSRange
+        let level: Int
+        let kind: Kind
+    }
 
     var blockquoteRanges: [NSRange] = []
     var fencedBlocks: [FencedBlock] = []
     var inlineCodeRanges: [NSRange] = []
     var headingGutterItems: [HeadingGutter] = []
+    var bulletItems: [BulletItem] = []
 
     struct EditRecord {
         let affectedRange: NSRange
@@ -102,7 +114,7 @@ import CozyCore
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty else { return }
+        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty else { return }
         guard let layoutManager = layoutManager, let textContainer = textContainer, let storage = textStorage else { return }
         let totalLength = storage.length
         guard totalLength > 0 else { return }
@@ -209,6 +221,65 @@ import CozyCore
                 if item.level == 1 {
                     Theme.marginLine.setFill()
                     NSRect(x: origin.x + 4, y: origin.y + box.maxY + 4, width: max(0, columnWidth - 8), height: 1).fill()
+                }
+            }
+        }
+
+        if !bulletItems.isEmpty {
+            for item in bulletItems {
+                if item.lineRange.location > visEnd { break }
+                guard NSMaxRange(item.lineRange) >= visStart,
+                      NSMaxRange(item.lineRange) <= totalLength,
+                      NSMaxRange(item.markerRange) <= totalLength else { continue }
+                if item.level > 0 {
+                    let lineGlyphs = layoutManager.glyphRange(forCharacterRange: item.lineRange, actualCharacterRange: nil)
+                    let lineBox = layoutManager.boundingRect(forGlyphRange: lineGlyphs, in: textContainer)
+                    Theme.border.withAlphaComponent(0.48).setFill()
+                    for lvl in 1...min(item.level, 6) {
+                        let guideX = round(origin.x + CGFloat(lvl - 1) * 22.0 + 3.5)
+                        let guideRect = NSRect(
+                            x: guideX,
+                            y: origin.y + lineBox.minY + 1,
+                            width: 1.0,
+                            height: max(8, lineBox.height - 4)
+                        )
+                        guideRect.fill()
+                    }
+                }
+                if item.kind == .unordered {
+                    let markerGlyphs = layoutManager.glyphRange(forCharacterRange: item.markerRange, actualCharacterRange: nil)
+                    let markerBox = layoutManager.boundingRect(forGlyphRange: markerGlyphs, in: textContainer)
+                    let cx = origin.x + markerBox.midX
+                    let cy = origin.y + markerBox.minY + round(markerBox.height * 0.44)
+                    let color = CaptureEditor.bulletColor(forLevel: item.level)
+                    color.setFill()
+                    color.setStroke()
+                    switch item.level % 4 {
+                    case 0:
+                        let r: CGFloat = 3.0
+                        NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)).fill()
+                    case 1:
+                        let r: CGFloat = 2.8
+                        let ring = NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
+                        ring.lineWidth = 1.5
+                        ring.stroke()
+                    case 2:
+                        let r: CGFloat = 3.2
+                        let diamond = NSBezierPath()
+                        diamond.move(to: NSPoint(x: cx, y: cy - r))
+                        diamond.line(to: NSPoint(x: cx + r, y: cy))
+                        diamond.line(to: NSPoint(x: cx, y: cy + r))
+                        diamond.line(to: NSPoint(x: cx - r, y: cy))
+                        diamond.close()
+                        diamond.fill()
+                    default:
+                        let bar = NSBezierPath(
+                            roundedRect: NSRect(x: cx - 3.25, y: cy - 1.0, width: 6.5, height: 2.0),
+                            xRadius: 1.0,
+                            yRadius: 1.0
+                        )
+                        bar.fill()
+                    }
                 }
             }
         }
@@ -411,6 +482,14 @@ import CozyCore
                 guard isEditable else { return false }
                 insertMarkdownLink(self)
                 return true
+            case "]":
+                guard isEditable else { return false }
+                indentListLevel(self)
+                return true
+            case "[":
+                guard isEditable else { return false }
+                outdentListLevel(self)
+                return true
             default:
                 break
             }
@@ -527,6 +606,88 @@ import CozyCore
         autoreleasepool {
             super.selectAll(sender)
         }
+    }
+    override func insertTab(_ sender: Any?) {
+        if isEditable, let ns = textStorage?.mutableString {
+            let sel = selectedRange()
+            if NSMaxRange(sel) <= ns.length {
+                let lineRange = ns.lineRange(for: sel)
+                let lineStr = ns.substring(with: lineRange)
+                if Self.lineStartsWithListMarker(lineStr) {
+                    indentListLevel(sender)
+                    return
+                }
+            }
+        }
+        super.insertTab(sender)
+    }
+
+    override func insertBacktab(_ sender: Any?) {
+        if isEditable {
+            outdentListLevel(sender)
+            return
+        }
+        super.insertBacktab(sender)
+    }
+
+    private static let listLineCheckRegex = try! NSRegularExpression(pattern: "(?m)^[ \\t]*(?:[-*+]|\\d+\\.)(?:\\s+\\[[ xX]\\])? ")
+
+    private static func lineStartsWithListMarker(_ text: String) -> Bool {
+        let ns = text as NSString
+        return listLineCheckRegex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
+    }
+
+    @objc func indentListLevel(_ sender: Any?) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        guard NSMaxRange(sel) <= ns.length else { return }
+        let lineRange = ns.lineRange(for: sel)
+        let block = ns.substring(with: lineRange)
+        let hasTrailingNewline = block.hasSuffix("\n")
+        let content = hasTrailingNewline ? String(block.dropLast()) : block
+        let lines = content.components(separatedBy: "\n")
+        let transformed = lines.map { "  " + $0 }
+        let joined = transformed.joined(separator: "\n") + (hasTrailingNewline ? "\n" : "")
+        let nextSel: NSRange
+        if sel.length == 0 {
+            nextSel = NSRange(location: max(lineRange.location, sel.location + 2), length: 0)
+        } else {
+            nextSel = NSRange(location: lineRange.location, length: max(0, (joined as NSString).length - (hasTrailingNewline ? 1 : 0)))
+        }
+        applyUndoableReplacement(in: lineRange, with: joined, selectedRangeAfter: nextSel)
+    }
+
+    @objc func outdentListLevel(_ sender: Any?) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        guard NSMaxRange(sel) <= ns.length else { return }
+        let lineRange = ns.lineRange(for: sel)
+        let block = ns.substring(with: lineRange)
+        let hasTrailingNewline = block.hasSuffix("\n")
+        let content = hasTrailingNewline ? String(block.dropLast()) : block
+        let lines = content.components(separatedBy: "\n")
+        var removedOnFirstLine = 0
+        var transformed: [String] = []
+        for (idx, line) in lines.enumerated() {
+            if line.hasPrefix("  ") {
+                if idx == 0 { removedOnFirstLine = 2 }
+                transformed.append(String(line.dropFirst(2)))
+            } else if line.hasPrefix("\t") || line.hasPrefix(" ") {
+                if idx == 0 { removedOnFirstLine = 1 }
+                transformed.append(String(line.dropFirst(1)))
+            } else {
+                transformed.append(line)
+            }
+        }
+        let joined = transformed.joined(separator: "\n") + (hasTrailingNewline ? "\n" : "")
+        guard joined != block else { return }
+        let nextSel: NSRange
+        if sel.length == 0 {
+            nextSel = NSRange(location: max(lineRange.location, sel.location - removedOnFirstLine), length: 0)
+        } else {
+            nextSel = NSRange(location: lineRange.location, length: max(0, (joined as NSString).length - (hasTrailingNewline ? 1 : 0)))
+        }
+        applyUndoableReplacement(in: lineRange, with: joined, selectedRangeAfter: nextSel)
     }
 
     @objc func toggleBold(_ sender: Any?) {
@@ -1234,7 +1395,7 @@ import CozyCore
     private var lastFullCountWords = 0
     private let heading = try! NSRegularExpression(pattern: "(?m)^(#{1,6}) (.+)$")
     private let blockquote = try! NSRegularExpression(pattern: "(?m)^(>+) (.*)$")
-    private let listMarker = try! NSRegularExpression(pattern: "(?m)^([ \\t]*(?:[-*+]|\\d+\\.)(?:\\s+\\[[ xX]\\])?) (.*)$")
+    private let listMarker = try! NSRegularExpression(pattern: "(?m)^(([ \\t]*)([-*+]|\\d+\\.)(?:\\s+(\\[[ xX]\\]))?) (.*)$")
     private let bold = try! NSRegularExpression(pattern: "\\*\\*([^\\*\\n]+)\\*\\*")
     private let italic = try! NSRegularExpression(pattern: "(?<!\\*)\\*([^\\*\\n]+)\\*(?!\\*)")
     private let underline = try! NSRegularExpression(pattern: "__([^_\\n]+)__")
@@ -1902,13 +2063,15 @@ import CozyCore
             var q: [NSRange] = []
             var h: [MarkdownTextView.HeadingGutter] = []
             var c: [NSRange] = []
-            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c)
+            var b: [MarkdownTextView.BulletItem] = []
+            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c, bullets: &b)
         }
         if newNeeds, newLine != oldLine, NSMaxRange(newLine) <= ns.length {
             var q: [NSRange] = []
             var h: [MarkdownTextView.HeadingGutter] = []
             var c: [NSRange] = []
-            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c)
+            var b: [MarkdownTextView.BulletItem] = []
+            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c, bullets: &b)
         }
         storage.endEditing()
         textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
@@ -1946,6 +2109,7 @@ import CozyCore
         let hadItemsInOldLine = textView.headingGutterItems.contains { NSIntersectionRange($0.range, oldLineRange).length > 0 || $0.range.location == oldLineRange.location }
             || textView.blockquoteRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
             || textView.inlineCodeRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
+            || textView.bulletItems.contains { NSIntersectionRange($0.lineRange, oldLineRange).length > 0 || $0.lineRange.location == oldLineRange.location }
 
         let newHasSyntax = lineHasMarkdownSyntax(ns, lineRange: newLineRange)
 
@@ -1969,6 +2133,15 @@ import CozyCore
                     let r = textView.inlineCodeRanges[i]
                     textView.inlineCodeRanges[i] = NSRange(location: r.location + delta, length: r.length)
                 }
+                for i in textView.bulletItems.indices where textView.bulletItems[i].lineRange.location >= shiftStart {
+                    let item = textView.bulletItems[i]
+                    textView.bulletItems[i] = MarkdownTextView.BulletItem(
+                        lineRange: NSRange(location: item.lineRange.location + delta, length: item.lineRange.length),
+                        markerRange: NSRange(location: item.markerRange.location + delta, length: item.markerRange.length),
+                        level: item.level,
+                        kind: item.kind
+                    )
+                }
             }
             lastCursorLine = ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, newLen), length: 0))
             return false
@@ -1977,11 +2150,12 @@ import CozyCore
         var newQuotes: [NSRange] = []
         var newHeadings: [MarkdownTextView.HeadingGutter] = []
         var newCodes: [NSRange] = []
+        var newBullets: [MarkdownTextView.BulletItem] = []
         let cursor = textView.selectedRange()
 
         textView.undoManager?.disableUndoRegistration()
         storage.beginEditing()
-        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, headings: &newHeadings, codes: &newCodes)
+        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, headings: &newHeadings, codes: &newCodes, bullets: &newBullets)
         storage.endEditing()
         textView.undoManager?.enableUndoRegistration()
 
@@ -2038,6 +2212,27 @@ import CozyCore
         }
         if !insertedCodes { updatedCodes.append(contentsOf: newCodes) }
         textView.inlineCodeRanges = updatedCodes
+
+        var updatedBullets: [MarkdownTextView.BulletItem] = []
+        var insertedBullets = false
+        for item in textView.bulletItems {
+            if NSMaxRange(item.lineRange) <= oldLineRange.location && item.lineRange.location < oldLineRange.location {
+                updatedBullets.append(item)
+            } else if item.lineRange.location >= oldEnd && oldEnd > oldLineRange.location {
+                if !insertedBullets {
+                    updatedBullets.append(contentsOf: newBullets)
+                    insertedBullets = true
+                }
+                updatedBullets.append(MarkdownTextView.BulletItem(
+                    lineRange: NSRange(location: item.lineRange.location + delta, length: item.lineRange.length),
+                    markerRange: NSRange(location: item.markerRange.location + delta, length: item.markerRange.length),
+                    level: item.level,
+                    kind: item.kind
+                ))
+            }
+        }
+        if !insertedBullets { updatedBullets.append(contentsOf: newBullets) }
+        textView.bulletItems = updatedBullets
 
         lastCursorLine = ns.lineRange(for: NSRange(location: min(cursor.location, newLen), length: 0))
         return true
@@ -2101,6 +2296,7 @@ import CozyCore
             textView.headingGutterItems = []
             textView.inlineCodeRanges = []
             textView.fencedBlocks = []
+            textView.bulletItems = []
             hasPotentialLinks = false
             return
         }
@@ -2112,9 +2308,10 @@ import CozyCore
         var quotes: [NSRange] = []
         var headings: [MarkdownTextView.HeadingGutter] = []
         var inlinePills: [NSRange] = []
+        var bullets: [MarkdownTextView.BulletItem] = []
         var parsedFences: [MarkdownTextView.FencedBlock] = []
 
-        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, headings: &headings, codes: &inlinePills)
+        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, headings: &headings, codes: &inlinePills, bullets: &bullets)
 
         if scan.hasTripleBacktick && ns.range(of: "```", options: .literal, range: range).location != NSNotFound {
             let codeBodyParagraph = NSMutableParagraphStyle()
@@ -2196,6 +2393,16 @@ import CozyCore
         textView.headingGutterItems = headings
         textView.inlineCodeRanges = inlinePills
         textView.fencedBlocks = parsedFences
+        textView.bulletItems = bullets
+    }
+
+    static func bulletColor(forLevel level: Int) -> NSColor {
+        switch level % 4 {
+        case 0: return Theme.accent
+        case 1: return Theme.sage
+        case 2: return Theme.bulletTertiary
+        default: return Theme.muted
+        }
     }
 
     private func formatLineRange(
@@ -2206,7 +2413,8 @@ import CozyCore
         scan: DocumentScanResult? = nil,
         quotes: inout [NSRange],
         headings: inout [MarkdownTextView.HeadingGutter],
-        codes: inout [NSRange]
+        codes: inout [NSRange],
+        bullets: inout [MarkdownTextView.BulletItem]
     ) {
         let totalLen = ns.length
         guard targetRange.length > 0, NSMaxRange(targetRange) <= totalLen else { return }
@@ -2527,26 +2735,78 @@ import CozyCore
                 if let match = listMarker.firstMatch(in: lineStr, range: NSRange(location: 0, length: contentLen)) {
                     let fullMatchRange = NSRange(location: contentRange.location + match.range.location, length: match.range.length)
                     let markerRange = NSRange(location: contentRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
-                    let bodyRange = NSRange(location: contentRange.location + match.range(at: 2).location, length: match.range(at: 2).length)
+                    let wsSubrange = match.range(at: 2)
+                    let symbolSubrange = match.range(at: 3)
+                    let taskSubrange = match.range(at: 4)
+                    let bodyRange = NSRange(location: contentRange.location + match.range(at: 5).location, length: match.range(at: 5).length)
+
+                    var indentCols = 0
+                    if wsSubrange.location != NSNotFound && wsSubrange.length > 0 {
+                        let wsRange = NSRange(location: contentRange.location + wsSubrange.location, length: wsSubrange.length)
+                        for idx in wsRange.location..<NSMaxRange(wsRange) {
+                            let ch = ns.character(at: idx)
+                            if ch == 0x09 { indentCols += 2 }
+                            else if ch == 0x20 { indentCols += 1 }
+                        }
+                        storage.addAttributes(hiddenAttrs, range: wsRange)
+                    }
+                    let level = indentCols / 2
+                    let clampedLevel = min(level, 6)
+                    let levelIndent = CGFloat(clampedLevel) * 22.0
+
+                    let symbolRange = NSRange(location: contentRange.location + symbolSubrange.location, length: symbolSubrange.length)
+                    let symbolChar = ns.character(at: symbolRange.location)
+                    let isUnordered = (symbolChar == 0x2D || symbolChar == 0x2A || symbolChar == 0x2B)
+                    let isTask = taskSubrange.location != NSNotFound && taskSubrange.length > 0
                     let markerText = (lineStr as NSString).substring(with: match.range(at: 1))
-                    let isTask = markerText.hasSuffix("[ ]") || markerText.hasSuffix("[x]") || markerText.hasSuffix("[X]")
+                    let completed = isTask && (markerText.hasSuffix("[x]") || markerText.hasSuffix("[X]"))
+
                     let itemParagraph = NSMutableParagraphStyle()
                     itemParagraph.lineSpacing = 5.5
-                    itemParagraph.paragraphSpacing = 4.5
-                    itemParagraph.headIndent = isTask ? 42 : 18
+                    itemParagraph.paragraphSpacing = level == 0 ? 4.5 : 3.0
+                    itemParagraph.firstLineHeadIndent = levelIndent
+                    itemParagraph.headIndent = levelIndent + (isTask ? 42 : 18)
                     storage.addAttribute(.paragraphStyle, value: itemParagraph, range: fullMatchRange)
-                    let completed = markerText.hasSuffix("[x]") || markerText.hasSuffix("[X]")
-                    storage.addAttributes([
-                        .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
-                        .foregroundColor: completed ? Theme.sage : Theme.accent
-                    ], range: markerRange)
-                    if completed {
+
+                    let levelColor = Self.bulletColor(forLevel: level)
+                    if isTask {
                         storage.addAttributes([
-                            .foregroundColor: Theme.muted,
-                            .strikethroughStyle: NSUnderlineStyle.single.rawValue,
-                            .strikethroughColor: Theme.subtle.withAlphaComponent(0.75)
-                        ], range: bodyRange)
+                            .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
+                            .foregroundColor: completed ? Theme.sage : levelColor
+                        ], range: markerRange)
+                        if completed {
+                            storage.addAttributes([
+                                .foregroundColor: Theme.muted,
+                                .strikethroughStyle: NSUnderlineStyle.single.rawValue,
+                                .strikethroughColor: Theme.subtle.withAlphaComponent(0.75)
+                            ], range: bodyRange)
+                        }
+                    } else if isUnordered {
+                        storage.addAttributes([
+                            .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
+                            .foregroundColor: NSColor.clear
+                        ], range: symbolRange)
+                    } else {
+                        storage.addAttributes([
+                            .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
+                            .foregroundColor: levelColor
+                        ], range: symbolRange)
                     }
+
+                    let kind: MarkdownTextView.BulletItem.Kind
+                    if isTask {
+                        kind = .task(completed: completed)
+                    } else if isUnordered {
+                        kind = .unordered
+                    } else {
+                        kind = .ordered
+                    }
+                    bullets.append(MarkdownTextView.BulletItem(
+                        lineRange: fullMatchRange,
+                        markerRange: symbolRange,
+                        level: level,
+                        kind: kind
+                    ))
                 }
             }
         }

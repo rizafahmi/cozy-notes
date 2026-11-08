@@ -390,5 +390,72 @@ struct MobyDickWorkoutSuite {
         #expect(window.performKeyEquivalent(with: try keyEvent("l", modifiers: [.command, .shift])))
         #expect(editor.text == "Section Title")
     }
+
+    @Test("Multi-level bullet lists compute nesting levels, distinct indentation steps, and indent/outdent via Tab, Shift+Tab, and ⌘] / ⌘[")
+    @MainActor
+    func multiLevelBulletHierarchy() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+        let formatMenu = try #require(mainMenu.item(withTitle: "Format")?.submenu)
+        #expect(formatMenu.item(withTitle: "Indent List Level")?.keyEquivalent == "]")
+        #expect(formatMenu.item(withTitle: "Outdent List Level")?.keyEquivalent == "[")
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        defer { window.orderOut(nil) }
+
+        editor.text = """
+        - Level 0 bullet
+          - Level 1 bullet
+            - Level 2 bullet
+              - Level 3 bullet
+        """
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+
+        let items = editor.textView.bulletItems
+        #expect(items.count == 4)
+        #expect(items.map(\.level) == [0, 1, 2, 3])
+        #expect(items.allSatisfy { $0.kind == .unordered })
+
+        // Verify progressive 22pt firstLineHeadIndent per level
+        let storage = try #require(editor.textView.textStorage)
+        for (idx, item) in items.enumerated() {
+            let para = try #require(storage.attribute(.paragraphStyle, at: item.lineRange.location, effectiveRange: nil) as? NSParagraphStyle)
+            #expect(para.firstLineHeadIndent == CGFloat(idx) * 22.0)
+            #expect(para.headIndent == CGFloat(idx) * 22.0 + 18.0)
+        }
+
+        // Verify Tab and Shift+Tab / ⌘] and ⌘[ step bullet levels incrementally
+        editor.text = "- Adjustable point"
+        editor.textView.setSelectedRange(NSRange(location: 2, length: 0))
+        #expect(editor.textView.bulletItems.first?.level == 0)
+
+        editor.textView.insertTab(nil)
+        #expect(editor.text == "  - Adjustable point")
+        #expect(editor.textView.bulletItems.first?.level == 1)
+
+        editor.textView.indentListLevel(nil)
+        #expect(editor.text == "    - Adjustable point")
+        #expect(editor.textView.bulletItems.first?.level == 2)
+
+        editor.textView.insertBacktab(nil)
+        #expect(editor.text == "  - Adjustable point")
+        #expect(editor.textView.bulletItems.first?.level == 1)
+
+        editor.textView.outdentListLevel(nil)
+        #expect(editor.text == "- Adjustable point")
+        #expect(editor.textView.bulletItems.first?.level == 0)
+    }
 }
 #endif

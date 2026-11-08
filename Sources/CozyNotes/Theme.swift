@@ -223,6 +223,14 @@ import AppKit
         botanicalLight: (0.195, 0.535, 0.495),
         botanicalDark: (0.385, 0.765, 0.695)
     )
+    /// Tertiary list-level accent — warm burnished amber in Obsidian, soft amethyst-lavender in Midnight.
+    static let bulletTertiary = adaptive(
+        "bulletTertiary",
+        studyLight: (0.765, 0.495, 0.145),
+        studyDark: (0.945, 0.725, 0.345),
+        botanicalLight: (0.485, 0.335, 0.785),
+        botanicalDark: (0.725, 0.595, 0.965)
+    )
     /// Highlight wash behind search matches.
     static let accentSoft = adaptive(
         "accentWash",
