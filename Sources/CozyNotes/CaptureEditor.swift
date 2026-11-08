@@ -1545,6 +1545,8 @@ import CozyCore
     private let footer = NSStackView()
     private var attachmentLeading: NSLayoutConstraint?
     private var attachmentTrailing: NSLayoutConstraint?
+    private var attachmentHeight: NSLayoutConstraint?
+    private var attachmentBottom: NSLayoutConstraint?
     private var footerLeading: NSLayoutConstraint?
     private var footerTrailing: NSLayoutConstraint?
     private var previews: [URL: NSImage] = [:]
@@ -1639,8 +1641,12 @@ import CozyCore
         let attachTrail = attachmentScroll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -36)
         let footLead = footer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 36)
         let footTrail = footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -36)
+        let attachHeight = attachmentScroll.heightAnchor.constraint(equalToConstant: 0)
+        let attachBottom = attachmentScroll.bottomAnchor.constraint(equalTo: footerRule.topAnchor, constant: 0)
         attachmentLeading = attachLead
         attachmentTrailing = attachTrail
+        attachmentHeight = attachHeight
+        attachmentBottom = attachBottom
         footerLeading = footLead
         footerTrailing = footTrail
 
@@ -1651,8 +1657,8 @@ import CozyCore
             scroll.bottomAnchor.constraint(equalTo: attachmentScroll.topAnchor, constant: -4),
             attachLead,
             attachTrail,
-            attachmentScroll.heightAnchor.constraint(equalToConstant: 62),
-            attachmentScroll.bottomAnchor.constraint(equalTo: footerRule.topAnchor, constant: -6),
+            attachHeight,
+            attachBottom,
             footerRule.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
             footerRule.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
             footerRule.heightAnchor.constraint(equalToConstant: 1),
@@ -1945,7 +1951,10 @@ import CozyCore
             chips.addArrangedSubview(card)
         }
         chips.setFrameSize(chips.fittingSize)
-        attachmentScroll.isHidden = items.isEmpty
+        let empty = items.isEmpty
+        attachmentScroll.isHidden = empty
+        attachmentHeight?.constant = empty ? 0 : 62
+        attachmentBottom?.constant = empty ? 0 : -6
     }
 
     @objc private func openChipAttachment(_ sender: NSButton) {

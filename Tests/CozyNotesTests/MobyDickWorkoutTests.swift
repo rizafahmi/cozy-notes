@@ -480,6 +480,7 @@ struct MobyDickWorkoutSuite {
         let scrollView = try #require(textView.enclosingScrollView)
         let clipView = scrollView.contentView
         let visHeight = clipView.bounds.height
+        #expect(editor.bounds.height - visHeight <= 50, "Hidden attachment strip must collapse to zero height so text extends down to the footer rule")
 
         // Start with 20 lines so the bottom lines extend well below the 320pt window
         let lines = (1...20).map { "Line number \($0) of the journal folio." }.joined(separator: "\n")
