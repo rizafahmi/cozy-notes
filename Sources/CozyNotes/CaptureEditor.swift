@@ -391,13 +391,95 @@ import CozyCore
                 guard isEditable, let um = undoManager, um.canUndo else { return false }
                 um.undo()
                 return true
+            case "b":
+                guard isEditable else { return false }
+                toggleBold(self)
+                return true
+            case "i":
+                guard isEditable else { return false }
+                toggleItalic(self)
+                return true
+            case "u":
+                guard isEditable else { return false }
+                toggleUnderline(self)
+                return true
+            case "e", "`":
+                guard isEditable else { return false }
+                toggleInlineCode(self)
+                return true
+            case "k":
+                guard isEditable else { return false }
+                insertMarkdownLink(self)
+                return true
             default:
                 break
             }
-        } else if flags == [.command, .shift], key == "z" {
-            guard isEditable, let um = undoManager, um.canRedo else { return false }
-            um.redo()
-            return true
+        } else if flags == [.command, .shift] {
+            switch key {
+            case "z":
+                guard isEditable, let um = undoManager, um.canRedo else { return false }
+                um.redo()
+                return true
+            case "x", "s":
+                guard isEditable else { return false }
+                toggleStrikethrough(self)
+                return true
+            case "c":
+                guard isEditable else { return false }
+                toggleCodeBlock(self)
+                return true
+            case ".", ">":
+                guard isEditable else { return false }
+                toggleBlockquote(self)
+                return true
+            case "8", "*":
+                guard isEditable else { return false }
+                toggleBulletList(self)
+                return true
+            case "7", "&":
+                guard isEditable else { return false }
+                toggleNumberedList(self)
+                return true
+            case "l":
+                guard isEditable else { return false }
+                toggleChecklist(self)
+                return true
+            default:
+                break
+            }
+        } else if flags == [.command, .option] || flags == [.command, .control] {
+            switch key {
+            case "c":
+                guard isEditable else { return false }
+                toggleCodeBlock(self)
+                return true
+            case "1":
+                guard isEditable else { return false }
+                toggleHeading1(self)
+                return true
+            case "2":
+                guard isEditable else { return false }
+                toggleHeading2(self)
+                return true
+            case "3":
+                guard isEditable else { return false }
+                toggleHeading3(self)
+                return true
+            case "q":
+                guard isEditable else { return false }
+                toggleBlockquote(self)
+                return true
+            case "l":
+                guard isEditable else { return false }
+                toggleBulletList(self)
+                return true
+            case "t":
+                guard isEditable else { return false }
+                toggleChecklist(self)
+                return true
+            default:
+                break
+            }
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -447,10 +529,380 @@ import CozyCore
         }
     }
 
-    private func applyUndoableReplacement(in range: NSRange, with replacement: String) {
+    @objc func toggleBold(_ sender: Any?) {
+        toggleInlineWrapper(open: "**", close: "**")
+    }
+
+    @objc func toggleItalic(_ sender: Any?) {
+        toggleInlineWrapper(open: "*", close: "*")
+    }
+
+    @objc func toggleUnderline(_ sender: Any?) {
+        toggleInlineWrapper(open: "__", close: "__", alternateOpen: "<u>", alternateClose: "</u>")
+    }
+
+    @objc func toggleStrikethrough(_ sender: Any?) {
+        toggleInlineWrapper(open: "~~", close: "~~")
+    }
+
+    @objc func toggleInlineCode(_ sender: Any?) {
+        toggleInlineWrapper(open: "`", close: "`")
+    }
+
+    @objc func toggleCodeBlock(_ sender: Any?) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        let totalLen = ns.length
+        guard NSMaxRange(sel) <= totalLen else { return }
+
+        // 1. If selection itself is a fenced code block (```...\nbody\n```), unwrap it
+        if sel.length >= 7 {
+            let selected = ns.substring(with: sel)
+            if selected.hasPrefix("```") && selected.hasSuffix("```") {
+                var inner = String(selected.dropFirst(3).dropLast(3))
+                if let firstNL = inner.firstIndex(of: "\n") {
+                    inner = String(inner[inner.index(after: firstNL)...])
+                }
+                if inner.hasSuffix("\n") {
+                    inner.removeLast()
+                }
+                let innerLen = (inner as NSString).length
+                applyUndoableReplacement(
+                    in: sel,
+                    with: inner,
+                    selectedRangeAfter: NSRange(location: sel.location, length: innerLen)
+                )
+                return
+            }
+        }
+
+        // 2. If cursor/selection is inside an existing FencedBlock, unwrap that block
+        if let enclosing = fencedBlocks.first(where: { sel.location >= $0.fullRange.location && NSMaxRange(sel) <= NSMaxRange($0.fullRange) }),
+           NSMaxRange(enclosing.fullRange) <= totalLen,
+           NSMaxRange(enclosing.bodyRange) <= totalLen {
+            var body = ns.substring(with: enclosing.bodyRange)
+            if body.hasSuffix("\n") {
+                body.removeLast()
+            }
+            let bodyLen = (body as NSString).length
+            applyUndoableReplacement(
+                in: enclosing.fullRange,
+                with: body,
+                selectedRangeAfter: NSRange(location: enclosing.fullRange.location, length: bodyLen)
+            )
+            return
+        }
+
+        // 3. Wrap selection (or empty caret) in a fenced code block
+        let atLineStart = sel.location == 0 || ns.character(at: sel.location - 1) == 10
+        let leading = atLineStart ? "" : "\n"
+        let leadingLen = (leading as NSString).length
+        if sel.length == 0 {
+            let atLineEnd = sel.location == totalLen || ns.character(at: sel.location) == 10
+            let trailing = atLineEnd ? "" : "\n"
+            let replacement = "\(leading)```\n\n```\(trailing)"
+            let caretLoc = sel.location + leadingLen + 4
+            applyUndoableReplacement(
+                in: sel,
+                with: replacement,
+                selectedRangeAfter: NSRange(location: caretLoc, length: 0)
+            )
+        } else {
+            let rawSelected = ns.substring(with: sel)
+            let hadTrailingNewline = rawSelected.hasSuffix("\n")
+            let body = hadTrailingNewline ? String(rawSelected.dropLast()) : rawSelected
+            let bodyLen = (body as NSString).length
+            let atLineEnd = NSMaxRange(sel) == totalLen || ns.character(at: NSMaxRange(sel)) == 10
+            let trailing = hadTrailingNewline ? "\n" : (atLineEnd ? "" : "\n")
+            let replacement = "\(leading)```\n\(body)\n```\(trailing)"
+            let bodyStart = sel.location + leadingLen + 4
+            applyUndoableReplacement(
+                in: sel,
+                with: replacement,
+                selectedRangeAfter: NSRange(location: bodyStart, length: bodyLen)
+            )
+        }
+    }
+
+    @objc func insertMarkdownLink(_ sender: Any?) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        guard NSMaxRange(sel) <= ns.length else { return }
+
+        if sel.length > 0 {
+            let selected = ns.substring(with: sel)
+            if selected.hasPrefix("["), let mid = selected.range(of: "]("), selected.hasSuffix(")") {
+                let label = String(selected[selected.index(after: selected.startIndex)..<mid.lowerBound])
+                let labelLen = (label as NSString).length
+                applyUndoableReplacement(
+                    in: sel,
+                    with: label,
+                    selectedRangeAfter: NSRange(location: sel.location, length: labelLen)
+                )
+                return
+            }
+            if selected.hasPrefix("http://") || selected.hasPrefix("https://") {
+                let replacement = "[](\(selected))"
+                applyUndoableReplacement(
+                    in: sel,
+                    with: replacement,
+                    selectedRangeAfter: NSRange(location: sel.location + 1, length: 0)
+                )
+                return
+            }
+            let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let urlStr = (clip.hasPrefix("http://") || clip.hasPrefix("https://")) ? clip : "https://"
+            let urlLen = (urlStr as NSString).length
+            let replacement = "[\(selected)](\(urlStr))"
+            let urlStart = sel.location + 1 + sel.length + 2
+            applyUndoableReplacement(
+                in: sel,
+                with: replacement,
+                selectedRangeAfter: NSRange(location: urlStart, length: urlLen)
+            )
+        } else {
+            let replacement = "[](https://)"
+            applyUndoableReplacement(
+                in: sel,
+                with: replacement,
+                selectedRangeAfter: NSRange(location: sel.location + 1, length: 0)
+            )
+        }
+    }
+
+    @objc func toggleHeading1(_ sender: Any?) { toggleHeading(level: 1) }
+    @objc func toggleHeading2(_ sender: Any?) { toggleHeading(level: 2) }
+    @objc func toggleHeading3(_ sender: Any?) { toggleHeading(level: 3) }
+
+    @objc func toggleBlockquote(_ sender: Any?) {
+        toggleLinePrefix("> ")
+    }
+
+    @objc func toggleBulletList(_ sender: Any?) {
+        toggleLinePrefix("- ")
+    }
+
+    @objc func toggleChecklist(_ sender: Any?) {
+        toggleLinePrefix("- [ ] ", alternatePrefixes: ["- [x] ", "- [X] "])
+    }
+
+    @objc func toggleNumberedList(_ sender: Any?) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        guard NSMaxRange(sel) <= ns.length else { return }
+        let lineRange = ns.lineRange(for: sel)
+        let block = ns.substring(with: lineRange)
+        let hasTrailingNewline = block.hasSuffix("\n")
+        let content = hasTrailingNewline ? String(block.dropLast()) : block
+        let lines = content.components(separatedBy: "\n")
+        let numberedRegex = try! NSRegularExpression(pattern: "^\\d+\\. ")
+        let allNumbered = lines.filter { !$0.isEmpty }.allSatisfy { line in
+            numberedRegex.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) != nil
+        } && !lines.allSatisfy(\.isEmpty)
+
+        var transformed: [String] = []
+        var number = 1
+        for line in lines {
+            if allNumbered {
+                let lineNS = line as NSString
+                if let m = numberedRegex.firstMatch(in: line, range: NSRange(location: 0, length: lineNS.length)) {
+                    transformed.append(lineNS.substring(from: NSMaxRange(m.range)))
+                } else {
+                    transformed.append(line)
+                }
+            } else {
+                transformed.append("\(number). \(line)")
+                number += 1
+            }
+        }
+        let joined = transformed.joined(separator: "\n") + (hasTrailingNewline ? "\n" : "")
+        let joinedLen = (joined as NSString).length
+        let nextSel = sel.length == 0
+            ? NSRange(location: lineRange.location + joinedLen - (hasTrailingNewline ? 1 : 0), length: 0)
+            : NSRange(location: lineRange.location, length: joinedLen - (hasTrailingNewline ? 1 : 0))
+        applyUndoableReplacement(in: lineRange, with: joined, selectedRangeAfter: nextSel)
+    }
+
+    private func toggleHeading(level: Int) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        guard NSMaxRange(sel) <= ns.length else { return }
+        let lineRange = ns.lineRange(for: sel)
+        let block = ns.substring(with: lineRange)
+        let hasTrailingNewline = block.hasSuffix("\n")
+        let content = hasTrailingNewline ? String(block.dropLast()) : block
+        let lines = content.components(separatedBy: "\n")
+        let targetPrefix = String(repeating: "#", count: level) + " "
+        let headingPrefixRegex = try! NSRegularExpression(pattern: "^#{1,6} ")
+        let allHaveTarget = lines.filter { !$0.isEmpty }.allSatisfy { $0.hasPrefix(targetPrefix) } && !lines.allSatisfy(\.isEmpty)
+
+        let transformed = lines.map { line -> String in
+            if allHaveTarget {
+                return line.hasPrefix(targetPrefix) ? String(line.dropFirst(targetPrefix.count)) : line
+            }
+            let lineNS = line as NSString
+            if let match = headingPrefixRegex.firstMatch(in: line, range: NSRange(location: 0, length: lineNS.length)) {
+                return targetPrefix + lineNS.substring(from: NSMaxRange(match.range))
+            }
+            return targetPrefix + line
+        }
+        let joined = transformed.joined(separator: "\n") + (hasTrailingNewline ? "\n" : "")
+        let joinedLen = (joined as NSString).length
+        let nextSel = sel.length == 0
+            ? NSRange(location: lineRange.location + joinedLen - (hasTrailingNewline ? 1 : 0), length: 0)
+            : NSRange(location: lineRange.location, length: joinedLen - (hasTrailingNewline ? 1 : 0))
+        applyUndoableReplacement(in: lineRange, with: joined, selectedRangeAfter: nextSel)
+    }
+
+    private func toggleLinePrefix(_ prefix: String, alternatePrefixes: [String] = []) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        guard NSMaxRange(sel) <= ns.length else { return }
+        let lineRange = ns.lineRange(for: sel)
+        let block = ns.substring(with: lineRange)
+        let hasTrailingNewline = block.hasSuffix("\n")
+        let content = hasTrailingNewline ? String(block.dropLast()) : block
+        let lines = content.components(separatedBy: "\n")
+        let allPrefixes = [prefix] + alternatePrefixes
+        let allHavePrefix = lines.filter { !$0.isEmpty }.allSatisfy { line in
+            allPrefixes.contains(where: { line.hasPrefix($0) })
+        } && !lines.allSatisfy(\.isEmpty)
+
+        let transformed = lines.map { line -> String in
+            if allHavePrefix {
+                if let matched = allPrefixes.first(where: { line.hasPrefix($0) }) {
+                    return String(line.dropFirst(matched.count))
+                }
+                return line
+            }
+            return prefix + line
+        }
+        let joined = transformed.joined(separator: "\n") + (hasTrailingNewline ? "\n" : "")
+        let joinedLen = (joined as NSString).length
+        let nextSel = sel.length == 0
+            ? NSRange(location: lineRange.location + joinedLen - (hasTrailingNewline ? 1 : 0), length: 0)
+            : NSRange(location: lineRange.location, length: joinedLen - (hasTrailingNewline ? 1 : 0))
+        applyUndoableReplacement(in: lineRange, with: joined, selectedRangeAfter: nextSel)
+    }
+
+    private func toggleInlineWrapper(
+        open: String,
+        close: String,
+        alternateOpen: String? = nil,
+        alternateClose: String? = nil
+    ) {
+        guard isEditable, let ns = textStorage?.mutableString else { return }
+        let sel = selectedRange()
+        let totalLen = ns.length
+        guard NSMaxRange(sel) <= totalLen else { return }
+
+        // Check alternate wrapper first (e.g. <u>...</u> for underline)
+        if let altOpen = alternateOpen, let altClose = alternateClose {
+            let altOpenLen = (altOpen as NSString).length
+            let altCloseLen = (altClose as NSString).length
+            if sel.location >= altOpenLen, NSMaxRange(sel) + altCloseLen <= totalLen {
+                let before = ns.substring(with: NSRange(location: sel.location - altOpenLen, length: altOpenLen))
+                let after = ns.substring(with: NSRange(location: NSMaxRange(sel), length: altCloseLen))
+                if before.caseInsensitiveCompare(altOpen) == .orderedSame && after.caseInsensitiveCompare(altClose) == .orderedSame {
+                    let inner = ns.substring(with: sel)
+                    let fullRange = NSRange(location: sel.location - altOpenLen, length: sel.length + altOpenLen + altCloseLen)
+                    applyUndoableReplacement(
+                        in: fullRange,
+                        with: inner,
+                        selectedRangeAfter: NSRange(location: sel.location - altOpenLen, length: sel.length)
+                    )
+                    return
+                }
+            }
+            if sel.length >= altOpenLen + altCloseLen {
+                let selected = ns.substring(with: sel)
+                if selected.lowercased().hasPrefix(altOpen.lowercased()) && selected.lowercased().hasSuffix(altClose.lowercased()) {
+                    let innerRange = NSRange(location: sel.location + altOpenLen, length: sel.length - altOpenLen - altCloseLen)
+                    let inner = ns.substring(with: innerRange)
+                    applyUndoableReplacement(
+                        in: sel,
+                        with: inner,
+                        selectedRangeAfter: NSRange(location: sel.location, length: innerRange.length)
+                    )
+                    return
+                }
+            }
+        }
+
+        let openLen = (open as NSString).length
+        let closeLen = (close as NSString).length
+
+        // Helper for single '*' vs '**' bold disambiguation
+        func canUnwrapSurroundingSingleStar() -> Bool {
+            guard open == "*" && close == "*" else { return true }
+            var beforeStars = 0
+            var idx = sel.location
+            while idx > 0 && beforeStars < 3 && ns.character(at: idx - 1) == 0x2A {
+                beforeStars += 1
+                idx -= 1
+            }
+            var afterStars = 0
+            idx = NSMaxRange(sel)
+            while idx < totalLen && afterStars < 3 && ns.character(at: idx) == 0x2A {
+                afterStars += 1
+                idx += 1
+            }
+            return !(beforeStars == 2 && afterStars == 2)
+        }
+
+        func canUnwrapSelectedSingleStar(_ selected: String) -> Bool {
+            guard open == "*" && close == "*" else { return true }
+            let leadStars = selected.prefix(while: { $0 == "*" }).count
+            let trailStars = selected.reversed().prefix(while: { $0 == "*" }).count
+            return !(leadStars == 2 && trailStars == 2)
+        }
+
+        // 1. Check if characters immediately outside the selection match open/close
+        if sel.location >= openLen, NSMaxRange(sel) + closeLen <= totalLen {
+            let before = ns.substring(with: NSRange(location: sel.location - openLen, length: openLen))
+            let after = ns.substring(with: NSRange(location: NSMaxRange(sel), length: closeLen))
+            if before == open && after == close && canUnwrapSurroundingSingleStar() {
+                let inner = ns.substring(with: sel)
+                let outerRange = NSRange(location: sel.location - openLen, length: sel.length + openLen + closeLen)
+                applyUndoableReplacement(
+                    in: outerRange,
+                    with: inner,
+                    selectedRangeAfter: NSRange(location: sel.location - openLen, length: sel.length)
+                )
+                return
+            }
+        }
+
+        // 2. Check if the selected range itself includes the open/close markers
+        if sel.length >= openLen + closeLen {
+            let selected = ns.substring(with: sel)
+            if selected.hasPrefix(open) && selected.hasSuffix(close) && canUnwrapSelectedSingleStar(selected) {
+                let innerRange = NSRange(location: sel.location + openLen, length: sel.length - openLen - closeLen)
+                let inner = ns.substring(with: innerRange)
+                applyUndoableReplacement(
+                    in: sel,
+                    with: inner,
+                    selectedRangeAfter: NSRange(location: sel.location, length: innerRange.length)
+                )
+                return
+            }
+        }
+
+        // 3. Wrap the selection (or insert empty pair with caret inside)
+        let selected = sel.length > 0 ? ns.substring(with: sel) : ""
+        let replacement = open + selected + close
+        applyUndoableReplacement(
+            in: sel,
+            with: replacement,
+            selectedRangeAfter: NSRange(location: sel.location + openLen, length: sel.length)
+        )
+    }
+
+    private func applyUndoableReplacement(in range: NSRange, with replacement: String, selectedRangeAfter: NSRange? = nil) {
         autoreleasepool {
             guard let storage = textStorage else { return }
             breakUndoCoalescing()
+            let previousSelection = selectedRange()
             let ns = storage.mutableString
             let safeLoc = min(range.location, ns.length)
             let safeRange = NSRange(location: safeLoc, length: min(range.length, ns.length - safeLoc))
@@ -474,8 +926,9 @@ import CozyCore
 
             let repLen = (replacement as NSString).length
             let inverseRange = NSRange(location: safeRange.location, length: repLen)
+            let restoreSelection = selectedRangeAfter != nil ? previousSelection : nil
             editorUndoManager.registerUndo(withTarget: self) { target in
-                target.applyUndoableReplacement(in: inverseRange, with: previousString)
+                target.applyUndoableReplacement(in: inverseRange, with: previousString, selectedRangeAfter: restoreSelection)
             }
 
             editorUndoManager.disableUndoRegistration()
@@ -484,7 +937,8 @@ import CozyCore
             storage.endEditing()
             editorUndoManager.enableUndoRegistration()
 
-            setSelectedRange(NSRange(location: safeRange.location + repLen, length: 0))
+            let nextSelection = selectedRangeAfter ?? NSRange(location: safeRange.location + repLen, length: 0)
+            setSelectedRange(nextSelection)
             didChangeText()
         }
     }
@@ -783,6 +1237,9 @@ import CozyCore
     private let listMarker = try! NSRegularExpression(pattern: "(?m)^([ \\t]*(?:[-*+]|\\d+\\.)(?:\\s+\\[[ xX]\\])?) (.*)$")
     private let bold = try! NSRegularExpression(pattern: "\\*\\*([^\\*\\n]+)\\*\\*")
     private let italic = try! NSRegularExpression(pattern: "(?<!\\*)\\*([^\\*\\n]+)\\*(?!\\*)")
+    private let underline = try! NSRegularExpression(pattern: "__([^_\\n]+)__")
+    private let htmlUnderline = try! NSRegularExpression(pattern: "(?i)<u>([^<\\n]+)</u>")
+    private let strikethrough = try! NSRegularExpression(pattern: "~~([^~\\n]+)~~")
     private let link = try! NSRegularExpression(pattern: "(!?\\[[^\\]\\n]*\\])(\\([^\\)\\n]+\\))")
     private let code = try! NSRegularExpression(pattern: "`([^`\\n]+)`")
     private let fencedCode = try! NSRegularExpression(pattern: "(?ms)^```[^\\n]*\\n.*?^```$")
@@ -1217,6 +1674,9 @@ import CozyCore
         let words: Int
         let hasStar: Bool
         let hasDoubleStar: Bool
+        let hasDoubleUnderscore: Bool
+        let hasHTMLUnderline: Bool
+        let hasDoubleTilde: Bool
         let hasBacktick: Bool
         let hasTripleBacktick: Bool
         let hasLinkOpen: Bool
@@ -1244,13 +1704,26 @@ import CozyCore
 
     static func scanDocument(in ns: NSString, range: NSRange) -> DocumentScanResult {
         guard range.length > 0 else {
-            return DocumentScanResult(words: 0, hasStar: false, hasDoubleStar: false, hasBacktick: false, hasTripleBacktick: false, hasLinkOpen: false)
+            return DocumentScanResult(
+                words: 0,
+                hasStar: false,
+                hasDoubleStar: false,
+                hasDoubleUnderscore: false,
+                hasHTMLUnderline: false,
+                hasDoubleTilde: false,
+                hasBacktick: false,
+                hasTripleBacktick: false,
+                hasLinkOpen: false
+            )
         }
         let cfStr = ns as CFString
         var words = 0
         var inWord = false
         var hasStar = false
         var hasDoubleStar = false
+        var hasDoubleUnderscore = false
+        var hasHTMLUnderline = false
+        var hasDoubleTilde = false
         var hasBacktick = false
         var hasTripleBacktick = false
         var hasLinkOpen = false
@@ -1270,7 +1743,7 @@ import CozyCore
             var i = 0
             while i < count {
                 let u = buf[i]
-                if u > 0x60 && u < 0x0085 {
+                if u > 0x60 && u < 0x007B {
                     if !inWord {
                         inWord = true
                         words &+= 1
@@ -1301,6 +1774,15 @@ import CozyCore
                             hasStar = true
                             if prevChar == 0x2A { hasDoubleStar = true }
                             runBackticks = 0
+                        } else if u == 0x5F {
+                            if prevChar == 0x5F { hasDoubleUnderscore = true }
+                            runBackticks = 0
+                        } else if u == 0x7E {
+                            if prevChar == 0x7E { hasDoubleTilde = true }
+                            runBackticks = 0
+                        } else if u == 0x3C {
+                            hasHTMLUnderline = true
+                            runBackticks = 0
                         } else if u == 0x60 {
                             hasBacktick = true
                             runBackticks &+= 1
@@ -1322,6 +1804,9 @@ import CozyCore
             words: words,
             hasStar: hasStar,
             hasDoubleStar: hasDoubleStar,
+            hasDoubleUnderscore: hasDoubleUnderscore,
+            hasHTMLUnderline: hasHTMLUnderline,
+            hasDoubleTilde: hasDoubleTilde,
             hasBacktick: hasBacktick,
             hasTripleBacktick: hasTripleBacktick,
             hasLinkOpen: hasLinkOpen
@@ -1334,7 +1819,17 @@ import CozyCore
 
     private func performOrReuseScan(on ns: NSString, length: Int, sig: Int) -> DocumentScanResult {
         if length == 0 {
-            return DocumentScanResult(words: 0, hasStar: false, hasDoubleStar: false, hasBacktick: false, hasTripleBacktick: false, hasLinkOpen: false)
+            return DocumentScanResult(
+                words: 0,
+                hasStar: false,
+                hasDoubleStar: false,
+                hasDoubleUnderscore: false,
+                hasHTMLUnderline: false,
+                hasDoubleTilde: false,
+                hasBacktick: false,
+                hasTripleBacktick: false,
+                hasLinkOpen: false
+            )
         }
         if length == lastFullCountLength, sig == lastFullCountSampleHash, let cached = lastScanResult {
             return cached
@@ -1428,6 +1923,9 @@ import CozyCore
         if ns.range(of: "*", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "](", options: .literal, range: lineRange).location != NSNotFound { return true }
+        if ns.range(of: "__", options: .literal, range: lineRange).location != NSNotFound { return true }
+        if ns.range(of: "<u>", options: .caseInsensitive, range: lineRange).location != NSNotFound { return true }
+        if ns.range(of: "~~", options: .literal, range: lineRange).location != NSNotFound { return true }
         return false
     }
 
@@ -1451,7 +1949,7 @@ import CozyCore
 
         let newHasSyntax = lineHasMarkdownSyntax(ns, lineRange: newLineRange)
 
-        if !hadItemsInOldLine && !newHasSyntax {
+        if edit.affectedRange.length == 0 && !hadItemsInOldLine && !newHasSyntax {
             // Fast path for plain prose editing: shift subsequent decoration ranges without touching NSTextStorage attributes
             if delta != 0 {
                 let shiftStart = oldLineEnd
@@ -1733,6 +2231,9 @@ import CozyCore
         let checkStar = scan?.hasStar ?? true
         let checkLink = scan?.hasLinkOpen ?? true
         let checkBacktick = scan?.hasBacktick ?? true
+        let checkDoubleUnderscore = scan?.hasDoubleUnderscore ?? true
+        let checkHTMLUnderline = scan?.hasHTMLUnderline ?? true
+        let checkDoubleTilde = scan?.hasDoubleTilde ?? true
 
         // 1. Inline spans via fast literal search on NSString
         if checkDoubleStar && ns.range(of: "**", options: .literal, range: targetRange).location != NSNotFound {
@@ -1771,6 +2272,79 @@ import CozyCore
                     storage.addAttributes([.font: italicFont], range: inner)
                     storage.addAttributes(markerAttrs, range: NSRange(location: full.location, length: 1))
                     storage.addAttributes(markerAttrs, range: NSRange(location: NSMaxRange(full) - 1, length: 1))
+                }
+                searchStart = NSMaxRange(lineRange)
+            }
+        }
+
+        if checkDoubleUnderscore && ns.range(of: "__", options: .literal, range: targetRange).location != NSNotFound {
+            let markerAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)]
+            let underlineAttrs: [NSAttributedString.Key: Any] = [
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .underlineColor: Theme.accent.withAlphaComponent(0.85)
+            ]
+            var searchStart = targetRange.location
+            let targetEnd = NSMaxRange(targetRange)
+            while searchStart < targetEnd {
+                let hit = ns.range(of: "__", options: .literal, range: NSRange(location: searchStart, length: targetEnd - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let lineStr = ns.substring(with: lineRange)
+                for match in underline.matches(in: lineStr, range: NSRange(location: 0, length: lineRange.length)) {
+                    let full = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                    let inner = NSRange(location: lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    storage.addAttributes(underlineAttrs, range: inner)
+                    storage.addAttributes(markerAttrs, range: NSRange(location: full.location, length: 2))
+                    storage.addAttributes(markerAttrs, range: NSRange(location: NSMaxRange(full) - 2, length: 2))
+                }
+                searchStart = NSMaxRange(lineRange)
+            }
+        }
+
+        if checkHTMLUnderline && ns.range(of: "<u>", options: .caseInsensitive, range: targetRange).location != NSNotFound {
+            let markerAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(11.5)]
+            let underlineAttrs: [NSAttributedString.Key: Any] = [
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+                .underlineColor: Theme.accent.withAlphaComponent(0.85)
+            ]
+            var searchStart = targetRange.location
+            let targetEnd = NSMaxRange(targetRange)
+            while searchStart < targetEnd {
+                let hit = ns.range(of: "<u>", options: .caseInsensitive, range: NSRange(location: searchStart, length: targetEnd - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let lineStr = ns.substring(with: lineRange)
+                for match in htmlUnderline.matches(in: lineStr, range: NSRange(location: 0, length: lineRange.length)) {
+                    let full = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                    let inner = NSRange(location: lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    storage.addAttributes(underlineAttrs, range: inner)
+                    storage.addAttributes(markerAttrs, range: NSRange(location: full.location, length: 3))
+                    storage.addAttributes(markerAttrs, range: NSRange(location: NSMaxRange(full) - 4, length: 4))
+                }
+                searchStart = NSMaxRange(lineRange)
+            }
+        }
+
+        if checkDoubleTilde && ns.range(of: "~~", options: .literal, range: targetRange).location != NSNotFound {
+            let markerAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)]
+            let strikeAttrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: Theme.muted,
+                .strikethroughStyle: NSUnderlineStyle.single.rawValue,
+                .strikethroughColor: Theme.subtle.withAlphaComponent(0.8)
+            ]
+            var searchStart = targetRange.location
+            let targetEnd = NSMaxRange(targetRange)
+            while searchStart < targetEnd {
+                let hit = ns.range(of: "~~", options: .literal, range: NSRange(location: searchStart, length: targetEnd - searchStart))
+                guard hit.location != NSNotFound else { break }
+                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let lineStr = ns.substring(with: lineRange)
+                for match in strikethrough.matches(in: lineStr, range: NSRange(location: 0, length: lineRange.length)) {
+                    let full = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                    let inner = NSRange(location: lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    storage.addAttributes(strikeAttrs, range: inner)
+                    storage.addAttributes(markerAttrs, range: NSRange(location: full.location, length: 2))
+                    storage.addAttributes(markerAttrs, range: NSRange(location: NSMaxRange(full) - 2, length: 2))
                 }
                 searchStart = NSMaxRange(lineRange)
             }

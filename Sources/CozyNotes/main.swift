@@ -138,6 +138,27 @@ import CozyCore
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let formatItem = NSMenuItem()
+        formatItem.title = "Format"
+        let format = NSMenu(title: "Format")
+        formatItem.submenu = format
+        bar.addItem(formatItem)
+        addResponder("Bold", action: #selector(MarkdownTextView.toggleBold(_:)), key: "b", to: format)
+        addResponder("Italic", action: #selector(MarkdownTextView.toggleItalic(_:)), key: "i", to: format)
+        addResponder("Underline", action: #selector(MarkdownTextView.toggleUnderline(_:)), key: "u", to: format)
+        addResponder("Strikethrough", action: #selector(MarkdownTextView.toggleStrikethrough(_:)), key: "x", modifiers: [.command, .shift], to: format)
+        addResponder("Inline Code", action: #selector(MarkdownTextView.toggleInlineCode(_:)), key: "e", to: format)
+        addResponder("Code Block", action: #selector(MarkdownTextView.toggleCodeBlock(_:)), key: "c", modifiers: [.command, .shift], to: format)
+        addResponder("Insert Link", action: #selector(MarkdownTextView.insertMarkdownLink(_:)), key: "k", to: format)
+        format.addItem(.separator())
+        addResponder("Heading 1", action: #selector(MarkdownTextView.toggleHeading1(_:)), key: "1", modifiers: [.command, .option], to: format)
+        addResponder("Heading 2", action: #selector(MarkdownTextView.toggleHeading2(_:)), key: "2", modifiers: [.command, .option], to: format)
+        addResponder("Heading 3", action: #selector(MarkdownTextView.toggleHeading3(_:)), key: "3", modifiers: [.command, .option], to: format)
+        format.addItem(.separator())
+        addResponder("Blockquote", action: #selector(MarkdownTextView.toggleBlockquote(_:)), key: ".", modifiers: [.command, .shift], to: format)
+        addResponder("Bullet List", action: #selector(MarkdownTextView.toggleBulletList(_:)), key: "8", modifiers: [.command, .shift], to: format)
+        addResponder("Numbered List", action: #selector(MarkdownTextView.toggleNumberedList(_:)), key: "7", modifiers: [.command, .shift], to: format)
+        addResponder("Checklist", action: #selector(MarkdownTextView.toggleChecklist(_:)), key: "l", modifiers: [.command, .shift], to: format)
         let viewItem = NSMenuItem()
         viewItem.title = "View"
         let view = NSMenu(title: "View")
@@ -161,6 +182,11 @@ import CozyCore
     private func add(_ title: String, action: Selector, key: String, modifiers: NSEvent.ModifierFlags = .command, to menu: NSMenu) {
         let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
         item.target = self
+        item.keyEquivalentModifierMask = modifiers
+    }
+    private func addResponder(_ title: String, action: Selector, key: String, modifiers: NSEvent.ModifierFlags = .command, to menu: NSMenu) {
+        let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        item.target = nil
         item.keyEquivalentModifierMask = modifiers
     }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {

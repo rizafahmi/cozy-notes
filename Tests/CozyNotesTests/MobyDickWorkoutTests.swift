@@ -263,5 +263,132 @@ struct MobyDickWorkoutSuite {
         #expect(snapshots.count == 1)
         #expect(snapshots[0].label == "Before deleting Disposable Note")
     }
+
+    @Test("Markdown formatting keyboard shortcuts toggle bold, italic, underline, strikethrough, inline code, code blocks, links, headings, quotes, and lists")
+    @MainActor
+    func markdownFormattingKeyboardShortcuts() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+        let formatMenu = try #require(mainMenu.item(withTitle: "Format")?.submenu)
+        #expect(formatMenu.item(withTitle: "Bold")?.keyEquivalent == "b")
+        #expect(formatMenu.item(withTitle: "Italic")?.keyEquivalent == "i")
+        #expect(formatMenu.item(withTitle: "Underline")?.keyEquivalent == "u")
+        #expect(formatMenu.item(withTitle: "Strikethrough")?.keyEquivalent == "x")
+        #expect(formatMenu.item(withTitle: "Inline Code")?.keyEquivalent == "e")
+        #expect(formatMenu.item(withTitle: "Code Block")?.keyEquivalent == "c")
+        #expect(formatMenu.item(withTitle: "Insert Link")?.keyEquivalent == "k")
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        defer { window.orderOut(nil) }
+
+        func keyEvent(_ chars: String, modifiers: NSEvent.ModifierFlags = .command, keyCode: UInt16 = 0) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: modifiers,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber,
+                context: nil,
+                characters: chars,
+                charactersIgnoringModifiers: chars.lowercased(),
+                isARepeat: false,
+                keyCode: keyCode
+            ))
+        }
+
+        // 1. Bold (⌘B) wraps and unwraps, and chains cleanly with Italic (⌘I)
+        editor.text = "Hello Cozy"
+        editor.textView.setSelectedRange(NSRange(location: 6, length: 4)) // "Cozy"
+        #expect(window.performKeyEquivalent(with: try keyEvent("b")))
+        #expect(editor.text == "Hello **Cozy**")
+        #expect(editor.textView.selectedRange() == NSRange(location: 8, length: 4))
+
+        // Chaining ⌘I on **Cozy** produces ***Cozy*** (bold + italic)
+        #expect(window.performKeyEquivalent(with: try keyEvent("i")))
+        #expect(editor.text == "Hello ***Cozy***")
+        #expect(editor.textView.selectedRange() == NSRange(location: 9, length: 4))
+
+        // Toggling ⌘I then ⌘B unwraps back to "Hello Cozy"
+        #expect(window.performKeyEquivalent(with: try keyEvent("i")))
+        #expect(editor.text == "Hello **Cozy**")
+        #expect(window.performKeyEquivalent(with: try keyEvent("b")))
+        #expect(editor.text == "Hello Cozy")
+        #expect(editor.textView.selectedRange() == NSRange(location: 6, length: 4))
+
+        // 2. Underline (⌘U) wraps in __...__ and applies NSUnderlineStyle.single attribute
+        #expect(window.performKeyEquivalent(with: try keyEvent("u")))
+        #expect(editor.text == "Hello __Cozy__")
+        #expect(editor.textView.selectedRange() == NSRange(location: 8, length: 4))
+        let storage = try #require(editor.textView.textStorage)
+        let underlineStyle = storage.attribute(.underlineStyle, at: 8, effectiveRange: nil) as? Int
+        #expect(underlineStyle == NSUnderlineStyle.single.rawValue)
+        #expect(window.performKeyEquivalent(with: try keyEvent("u")))
+        #expect(editor.text == "Hello Cozy")
+
+        // 3. Strikethrough (⇧⌘X) wraps in ~~...~~ and applies strikethroughStyle attribute
+        #expect(window.performKeyEquivalent(with: try keyEvent("x", modifiers: [.command, .shift])))
+        #expect(editor.text == "Hello ~~Cozy~~")
+        let strikeStyle = storage.attribute(.strikethroughStyle, at: 8, effectiveRange: nil) as? Int
+        #expect(strikeStyle == NSUnderlineStyle.single.rawValue)
+        #expect(window.performKeyEquivalent(with: try keyEvent("x", modifiers: [.command, .shift])))
+        #expect(editor.text == "Hello Cozy")
+
+        // 4. Inline Code (⌘E) wraps in `...` and populates inlineCodeRanges
+        #expect(window.performKeyEquivalent(with: try keyEvent("e")))
+        #expect(editor.text == "Hello `Cozy`")
+        #expect(editor.textView.inlineCodeRanges == [NSRange(location: 7, length: 4)])
+        #expect(window.performKeyEquivalent(with: try keyEvent("e")))
+        #expect(editor.text == "Hello Cozy")
+
+        // 5. Code Block (⇧⌘C) wraps and unwraps ```\n...\n``` and populates fencedBlocks
+        editor.text = "let x = 42"
+        editor.textView.setSelectedRange(NSRange(location: 0, length: 10))
+        #expect(window.performKeyEquivalent(with: try keyEvent("c", modifiers: [.command, .shift])))
+        #expect(editor.text == "```\nlet x = 42\n```")
+        #expect(editor.textView.fencedBlocks.count == 1)
+        #expect(window.performKeyEquivalent(with: try keyEvent("c", modifiers: [.command, .shift])))
+        #expect(editor.text == "let x = 42")
+
+        // 6. Headings (⌥⌘1, ⌥⌘2), Blockquote (⇧⌘.), Bullet List (⇧⌘8), Numbered List (⇧⌘7), Checklist (⇧⌘L)
+        editor.text = "Section Title"
+        editor.textView.setSelectedRange(NSRange(location: 0, length: 0))
+        #expect(window.performKeyEquivalent(with: try keyEvent("1", modifiers: [.command, .option])))
+        #expect(editor.text == "# Section Title")
+        #expect(window.performKeyEquivalent(with: try keyEvent("2", modifiers: [.command, .option])))
+        #expect(editor.text == "## Section Title")
+        #expect(window.performKeyEquivalent(with: try keyEvent("2", modifiers: [.command, .option])))
+        #expect(editor.text == "Section Title")
+
+        #expect(window.performKeyEquivalent(with: try keyEvent(".", modifiers: [.command, .shift])))
+        #expect(editor.text == "> Section Title")
+        #expect(window.performKeyEquivalent(with: try keyEvent(".", modifiers: [.command, .shift])))
+        #expect(editor.text == "Section Title")
+
+        #expect(window.performKeyEquivalent(with: try keyEvent("8", modifiers: [.command, .shift])))
+        #expect(editor.text == "- Section Title")
+        #expect(window.performKeyEquivalent(with: try keyEvent("8", modifiers: [.command, .shift])))
+        #expect(editor.text == "Section Title")
+
+        #expect(window.performKeyEquivalent(with: try keyEvent("7", modifiers: [.command, .shift])))
+        #expect(editor.text == "1. Section Title")
+        #expect(window.performKeyEquivalent(with: try keyEvent("7", modifiers: [.command, .shift])))
+        #expect(editor.text == "Section Title")
+
+        #expect(window.performKeyEquivalent(with: try keyEvent("l", modifiers: [.command, .shift])))
+        #expect(editor.text == "- [ ] Section Title")
+        #expect(window.performKeyEquivalent(with: try keyEvent("l", modifiers: [.command, .shift])))
+        #expect(editor.text == "Section Title")
+    }
 }
 #endif
