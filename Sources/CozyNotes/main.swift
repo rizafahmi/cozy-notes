@@ -61,7 +61,7 @@ import CozyCore
         }
     }
     @objc func chooseFolder() {
-        guard workspace?.persistCurrent() != false, quickCapture?.persistDraft() != false else { return }
+        guard workspace?.persistAllWindows() != false, quickCapture?.persistDraft() != false else { return }
         let picker = NSOpenPanel()
         picker.title = "Choose your local notes folder"
         picker.message = "Choose the same folder you sync with Syncthing. Notes are ordinary Markdown files; attachments stay beside them."
@@ -75,6 +75,21 @@ import CozyCore
     }
     @objc private func newCapture() { workspace?.newCapture(); workspace?.showAndFocus() }
     @objc private func quick() { quickCapture?.summon() }
+    @objc private func openInNewWindow() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            if let link = noteWin.editor.textView.wikiLinkAtCursor() {
+                _ = workspace?.openWikiLinkInNewWindow(link)
+            } else {
+                noteWin.showAndFocus()
+            }
+            return
+        }
+        if let link = workspace?.editor.textView.wikiLinkAtCursor() {
+            _ = workspace?.openWikiLinkInNewWindow(link)
+            return
+        }
+        workspace?.openCurrentNoteInNewWindow()
+    }
     @objc private func save() {
         if NSApp.keyWindow === quickCapture?.window {
             if let link = quickCapture?.editor.textView.wikiLinkAtCursor() {
@@ -82,6 +97,12 @@ import CozyCore
                 return
             }
             quickCapture?.save()
+        } else if let noteWin = workspace?.activeNoteWindowController {
+            if let link = noteWin.editor.textView.wikiLinkAtCursor() {
+                noteWin.openWikiLink(link)
+                return
+            }
+            noteWin.saveCurrent()
         } else {
             if let link = workspace?.editor.textView.wikiLinkAtCursor() {
                 workspace?.openWikiLink(link)
@@ -90,10 +111,37 @@ import CozyCore
             workspace?.saveCurrent()
         }
     }
-    @objc private func deleteNote() { workspace?.deleteCurrentNote() }
-    @objc private func search() { workspace?.showAndFocus(); workspace?.showInNoteFind() }
-    @objc private func findNext() { workspace?.showAndFocus(); workspace?.findNextInNote() }
-    @objc private func findPrevious() { workspace?.showAndFocus(); workspace?.findPreviousInNote() }
+    @objc private func deleteNote() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            noteWin.deleteCurrentNote()
+        } else {
+            workspace?.deleteCurrentNote()
+        }
+    }
+    @objc private func search() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            noteWin.showInNoteFind()
+        } else {
+            workspace?.showAndFocus()
+            workspace?.showInNoteFind()
+        }
+    }
+    @objc private func findNext() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            noteWin.findNextInNote()
+        } else {
+            workspace?.showAndFocus()
+            workspace?.findNextInNote()
+        }
+    }
+    @objc private func findPrevious() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            noteWin.findPreviousInNote()
+        } else {
+            workspace?.showAndFocus()
+            workspace?.findPreviousInNote()
+        }
+    }
     @objc private func quickSwitcher() { workspace?.showAndFocus(); workspace?.toggleQuickSwitcher() }
     @objc private func makeSearchable() { workspace?.makeSearchable() }
     @objc private func recovery() { workspace?.showRecovery() }
@@ -116,7 +164,7 @@ import CozyCore
         return true
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard workspace?.persistCurrent() != false, quickCapture?.persistDraft() != false else { return .terminateCancel }
+        guard workspace?.persistAllWindows() != false, quickCapture?.persistDraft() != false else { return .terminateCancel }
         workspace?.shutdown()
         return .terminateNow
     }
@@ -138,6 +186,7 @@ import CozyCore
         bar.addItem(fileItem)
         add("New Note", action: #selector(newCapture), key: "n", to: file)
         add("Quick Capture", action: #selector(quick), key: " ", modifiers: [.command, .shift], to: file)
+        add("Open in New Window", action: #selector(openInNewWindow), key: "o", modifiers: [.command, .option], to: file)
         add("Save Note", action: #selector(save), key: "s", to: file)
         add("Keep / Save", action: #selector(save), key: "\r", to: file)
         add("Delete Note…", action: #selector(deleteNote), key: "\u{08}", to: file)
@@ -176,6 +225,7 @@ import CozyCore
         addResponder("Insert Link", action: #selector(MarkdownTextView.insertMarkdownLink(_:)), key: "k", to: format)
         addResponder("Insert Note Link", action: #selector(MarkdownTextView.insertWikiLink(_:)), key: "k", modifiers: [.command, .option], to: format)
         addResponder("Open Note Link", action: #selector(MarkdownTextView.openWikiLinkAtCursor(_:)), key: "\r", modifiers: [.command, .option], to: format)
+        addResponder("Open Note Link in New Window", action: #selector(MarkdownTextView.openWikiLinkInNewWindowAtCursor(_:)), key: "\r", modifiers: [.command, .option, .shift], to: format)
         format.addItem(.separator())
         addResponder("Heading 1", action: #selector(MarkdownTextView.toggleHeading1(_:)), key: "1", modifiers: [.command, .option], to: format)
         addResponder("Heading 2", action: #selector(MarkdownTextView.toggleHeading2(_:)), key: "2", modifiers: [.command, .option], to: format)
@@ -226,8 +276,18 @@ import CozyCore
     }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(deleteNote) {
+            if let noteWin = workspace?.activeNoteWindowController {
+                return noteWin.noteURL != nil
+            }
             guard let workspace, NSApp.keyWindow === workspace.window || NSApp.keyWindow == nil else { return false }
             return workspace.canDeleteNote
+        }
+        if menuItem.action == #selector(openInNewWindow) {
+            if let noteWin = workspace?.activeNoteWindowController {
+                return noteWin.noteURL != nil
+            }
+            guard let workspace, NSApp.keyWindow === workspace.window || NSApp.keyWindow == nil else { return false }
+            return workspace.canOpenInNewWindow
         }
         return true
     }

@@ -47,7 +47,7 @@ final class MobyDickWorkoutTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Moby Dick Workout")
+@Suite("Moby Dick Workout", .serialized)
 struct MobyDickWorkoutSuite {
     @Test("Full Moby Dick Workout (Steps 1–6)")
     @MainActor
@@ -875,6 +875,113 @@ struct MobyDickWorkoutSuite {
         workspace.editor.hideInNoteFind()
         #expect(!workspace.editor.isInNoteFindVisible)
         #expect(workspace.editor.inNoteFindMatchCount == 0)
+    }
+
+    @Test("Comparison note windows open via header/menu, Quick Switcher ⌥Return, and WikiLink ⌥⌘-Click, deduplicate per note, sync clean edits bidirectional without CAS conflict, and close on note deletion")
+    @MainActor
+    func comparisonNoteWindows() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+        let fileMenu = try #require(mainMenu.item(withTitle: "File")?.submenu)
+        #expect(fileMenu.item(withTitle: "Open in New Window")?.keyEquivalent == "o")
+        let formatMenu = try #require(mainMenu.item(withTitle: "Format")?.submenu)
+        #expect(formatMenu.item(withTitle: "Open Note Link in New Window") != nil)
+
+        let tempRoot = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("CozyComparisonWindowTests-\(UUID().uuidString)", isDirectory: true)
+        let vaultRoot = tempRoot.appendingPathComponent("Vault", isDirectory: true)
+        let historyRoot = tempRoot.appendingPathComponent("History", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let vault = try Vault(root: vaultRoot, historyRoot: historyRoot)
+        let noteA = try vault.capture(text: "# Primary Hypothesis\nCompare against [[Counter Hypothesis]].")
+        Thread.sleep(forTimeInterval: 0.01)
+        let noteB = try vault.capture(text: "# Counter Hypothesis\nAlternative observations.")
+        Thread.sleep(forTimeInterval: 0.01)
+        let noteC = try vault.capture(text: "# Synthesis Notes\nThird reference document.")
+
+        let workspace = WorkspaceController(vault: vault)
+        workspace.showWindow(nil)
+        defer {
+            workspace.shutdown()
+            workspace.window?.orderOut(nil)
+        }
+
+        #expect(workspace.openInNewWindowButton.isHidden)
+        workspace.openNote(noteA.url)
+        #expect(!workspace.openInNewWindowButton.isHidden)
+        #expect(workspace.noteWindows.isEmpty)
+
+        // 1. ⌥⌘-Clicking [[Counter Hypothesis]] opens noteB in a secondary comparison window while main workspace stays on noteA
+        let textView = workspace.editor.textView
+        let linkItem = try #require(textView.wikiLinkItems.first)
+        let lm = try #require(textView.layoutManager)
+        let tc = try #require(textView.textContainer)
+        lm.ensureLayout(for: tc)
+        let gr = lm.glyphRange(forCharacterRange: linkItem.innerRange, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: gr, in: tc)
+        let clickPt = textView.convert(
+            NSPoint(x: textView.textContainerOrigin.x + rect.midX, y: textView.textContainerOrigin.y + rect.midY),
+            to: nil
+        )
+        let optCmdClick = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: clickPt,
+            modifierFlags: [.command, .option],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1.0
+        ))
+        textView.mouseDown(with: optCmdClick)
+
+        #expect(workspace.noteURL == noteA.url, "Main workspace must remain on Primary Hypothesis")
+        #expect(workspace.noteWindows.count == 1)
+        let winB = try #require(workspace.noteWindows.first)
+        #expect(winB.noteURL == noteB.url)
+        #expect(winB.editor.text.contains("Alternative observations."))
+        #expect(winB.window?.frame.width == 720)
+
+        // 2. Requesting openNoteInNewWindow for an already-open note reuses the existing NoteWindowController
+        let duplicateB = workspace.openNoteInNewWindow(noteB.url)
+        #expect(duplicateB === winB)
+        #expect(workspace.noteWindows.count == 1)
+
+        // 3. Quick Switcher confirmSelection(inNewWindow: true) opens noteC in a second comparison window without changing workspace.noteURL
+        workspace.showQuickSwitcher()
+        workspace.quickSwitcher.query = "Synthesis"
+        #expect(workspace.quickSwitcher.hits.first?.source.url == noteC.url)
+        #expect(workspace.quickSwitcher.confirmSelection(inNewWindow: true))
+        #expect(workspace.noteURL == noteA.url)
+        #expect(workspace.noteWindows.count == 2)
+        let winC = try #require(workspace.noteWindows.last)
+        #expect(winC.noteURL == noteC.url)
+
+        // 4. Same-note bidirectional sync: open noteA in a comparison window too, edit in comparison window, verify main workspace updates cleanly
+        let winA = try #require(workspace.openNoteInNewWindow(noteA.url))
+        #expect(workspace.noteWindows.count == 3)
+        let endA = winA.editor.nsText.length
+        winA.editor.textView.setSelectedRange(NSRange(location: endA, length: 0))
+        winA.editor.textView.insertText("\nAdded from comparison window.", replacementRange: NSRange(location: endA, length: 0))
+        #expect(winA.persistCurrent())
+        #expect(workspace.editor.text.hasSuffix("Added from comparison window."))
+
+        // Edit noteA in main workspace and verify winA receives the update cleanly without CAS conflict
+        let mainEndA = workspace.editor.nsText.length
+        workspace.editor.textView.setSelectedRange(NSRange(location: mainEndA, length: 0))
+        workspace.editor.textView.insertText("\nAdded from main workspace.", replacementRange: NSRange(location: mainEndA, length: 0))
+        #expect(workspace.persistCurrent())
+        #expect(!winA.noteConflicted)
+        #expect(winA.editor.text.hasSuffix("Added from main workspace."))
+
+        // 5. Deleting noteB closes winB automatically while keeping winA and winC open
+        #expect(workspace.performDeleteNote(noteB.url, moveToTrash: false))
+        #expect(workspace.noteWindows.count == 2)
+        #expect(!workspace.noteWindows.contains { $0 === winB })
     }
 }
 #endif
