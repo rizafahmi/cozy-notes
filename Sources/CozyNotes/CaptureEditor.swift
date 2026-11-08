@@ -1,6 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 import ImageIO
+import QuartzCore
 import CozyCore
 
 @MainActor final class MarkdownTextView: NSTextView {
@@ -8,6 +9,7 @@ import CozyCore
     override var undoManager: UndoManager? { editorUndoManager }
     var onFiles: (([URL]) -> Void)?
     var onClipboardImage: ((Data) -> Void)?
+    var onFocusChange: (() -> Void)?
     var placeholder = "Begin a note, paste a clipping, or drop a file…" { didSet { needsDisplay = true } }
     struct FencedBlock {
         let fullRange: NSRange
@@ -24,6 +26,29 @@ import CozyCore
     var fencedBlocks: [FencedBlock] = []
     var inlineCodeRanges: [NSRange] = []
     var headingGutterItems: [HeadingGutter] = []
+
+    /// Bike-style smooth typewriter caret layer driven by additive critically-damped springs.
+    private let caretLayer: CALayer = {
+        let layer = CALayer()
+        layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.cornerRadius = 1.0
+        layer.zPosition = 999
+        layer.isHidden = true
+        layer.actions = [
+            "position": NSNull(),
+            "bounds": NSNull(),
+            "backgroundColor": NSNull(),
+            "opacity": NSNull(),
+            "hidden": NSNull()
+        ]
+        return layer
+    }()
+    private var hasCaretOrigin = false
+    private var caretAnimationSeq: UInt64 = 0
+    private var caretBlinkWorkItem: DispatchWorkItem?
+    private var caretBlinkOn = true
+    private var windowFocusObservers: [NSObjectProtocol] = []
+    var suppressCaretUpdates = false
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
@@ -132,6 +157,264 @@ import CozyCore
             withAttributes: attributes
         )
     }
+
+    override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
+        // Suppress AppKit's teleporting insertion bar and NSTextInsertionIndicator; caretLayer renders the spring-animated caret.
+    }
+
+    @objc(_drawInsertionPointInRect:color:)
+    func _drawInsertionPoint(in rect: NSRect, color: NSColor) {}
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        for token in windowFocusObservers { NotificationCenter.default.removeObserver(token) }
+        windowFocusObservers.removeAll()
+        wantsLayer = true
+        ensureCaretSublayer()
+        if let window {
+            let nc = NotificationCenter.default
+            windowFocusObservers.append(
+                nc.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.updateCaret(animated: false) }
+                }
+            )
+            windowFocusObservers.append(
+                nc.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.updateCaret(animated: false) }
+                }
+            )
+        }
+        updateCaret(animated: false)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshCaretAppearance()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok {
+            onFocusChange?()
+            updateCaret(animated: false)
+        }
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        if ok {
+            hasCaretOrigin = false
+            cancelCaretBlink()
+            caretLayer.isHidden = true
+            onFocusChange?()
+        }
+        return ok
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        updateCaret(animated: true)
+    }
+
+    override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
+        super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelectingFlag)
+        guard !suppressCaretUpdates else { return }
+        updateCaret(animated: !stillSelectingFlag)
+    }
+
+    func resetCaretPosition() {
+        hasCaretOrigin = false
+        caretLayer.removeAllAnimations()
+    }
+
+    private func ensureCaretSublayer() {
+        wantsLayer = true
+        guard let hostLayer = layer else { return }
+        if caretLayer.superlayer !== hostLayer {
+            hostLayer.addSublayer(caretLayer)
+        }
+        caretLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        refreshCaretAppearance()
+    }
+
+    func refreshCaretAppearance() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            caretLayer.backgroundColor = insertionPointColor.cgColor
+        }
+    }
+
+    /// Computes the exact glyph-aligned caret rect in view coordinates, excluding trailing lineSpacing/paragraphSpacing.
+    func currentCaretRect() -> NSRect {
+        guard let lm = layoutManager, let tc = textContainer else { return .zero }
+        lm.ensureLayout(for: tc)
+        let origin = textContainerOrigin
+        let ns = string as NSString
+        let len = ns.length
+        let charIdx = min(selectedRange().location, len)
+        let caretWidth: CGFloat = 2.0
+
+        let fallbackFont = (typingAttributes[.font] as? NSFont) ?? font ?? Theme.bodyFont()
+        let fallbackPara = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)
+        let sampleFont: NSFont
+        let samplePara: NSParagraphStyle?
+
+        if len == 0 || (charIdx == len && ns.character(at: len - 1) == 10) {
+            sampleFont = fallbackFont
+            samplePara = fallbackPara
+        } else {
+            let lineRange = ns.lineRange(for: NSRange(location: charIdx, length: 0))
+            var lineContentEnd = NSMaxRange(lineRange)
+            while lineContentEnd > lineRange.location {
+                let ch = ns.character(at: lineContentEnd - 1)
+                if ch == 10 || ch == 13 { lineContentEnd -= 1 } else { break }
+            }
+            let probe = min(max(lineRange.location, charIdx < lineContentEnd ? charIdx : max(lineRange.location, lineContentEnd - 1)), len - 1)
+            var resolvedFont = (textStorage?.attribute(.font, at: probe, effectiveRange: nil) as? NSFont) ?? fallbackFont
+            if resolvedFont.pointSize < 2, lineContentEnd > lineRange.location,
+               let endFont = textStorage?.attribute(.font, at: lineContentEnd - 1, effectiveRange: nil) as? NSFont,
+               endFont.pointSize >= 2 {
+                resolvedFont = endFont
+            }
+            sampleFont = resolvedFont
+            samplePara = (textStorage?.attribute(.paragraphStyle, at: probe, effectiveRange: nil) as? NSParagraphStyle) ?? fallbackPara
+        }
+
+        let fontLineHeight = ceil(sampleFont.ascender - sampleFont.descender + max(0, sampleFont.leading))
+        let lineSpacing = samplePara?.lineSpacing ?? 0
+
+        let glyphIdx = lm.glyphIndexForCharacter(at: charIdx)
+        let raw = lm.boundingRect(forGlyphRange: NSRange(location: glyphIdx, length: 0), in: tc)
+        let rawHeight = raw.height > 0 ? raw.height : fontLineHeight
+        let trimmedHeight = (lineSpacing > 0 && rawHeight - lineSpacing >= fontLineHeight - 1)
+            ? (rawHeight - lineSpacing)
+            : rawHeight
+        let height = max(14, round(trimmedHeight))
+        let x = round((origin.x + raw.minX) * 2) / 2
+        let y = round((origin.y + raw.minY) * 2) / 2
+        return NSRect(x: x, y: y, width: caretWidth, height: height)
+    }
+
+    func updateCaret(animated: Bool) {
+        guard !suppressCaretUpdates else { return }
+        ensureCaretSublayer()
+        let isActive = window?.firstResponder === self && (window?.isKeyWindow ?? false) && isEditable
+        let sel = selectedRange()
+        guard isActive, sel.length == 0 else {
+            cancelCaretBlink()
+            caretLayer.isHidden = true
+            if sel.length > 0 { hasCaretOrigin = false }
+            return
+        }
+
+        let targetRect = currentCaretRect()
+        guard targetRect.height > 0 else { return }
+        let targetPos = CGPoint(x: targetRect.midX, y: targetRect.midY)
+        let targetBounds = CGRect(x: 0, y: 0, width: targetRect.width, height: targetRect.height)
+
+        let oldPos = caretLayer.position
+        let oldBounds = caretLayer.bounds
+        let shouldAnimate = animated
+            && hasCaretOrigin
+            && !caretLayer.isHidden
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        refreshCaretAppearance()
+        caretLayer.isHidden = false
+        caretLayer.opacity = 1.0
+        caretLayer.position = targetPos
+        caretLayer.bounds = targetBounds
+        CATransaction.commit()
+
+        hasCaretOrigin = true
+        scheduleCaretBlink()
+
+        guard shouldAnimate else { return }
+        let rawDX = oldPos.x - targetPos.x
+        let rawDY = oldPos.y - targetPos.y
+        let dh = oldBounds.height - targetBounds.height
+        guard hypot(rawDX, rawDY) > 0.25 || abs(dh) > 0.5 else { return }
+
+        caretAnimationSeq &+= 1
+        // Critically-damped spring matching BikeLib.CaretLineLayer (response = 0.125s, dampingRatio = 1.0)
+        let response: CGFloat = 0.125
+        let dampingRatio: CGFloat = 1.0
+        let omega0 = (2.0 * .pi) / response
+        let stiffness = omega0 * omega0
+        let damping = 4.0 * .pi * dampingRatio / response
+
+        if hypot(rawDX, rawDY) > 0.25 {
+            let dx = max(-180, min(180, rawDX))
+            let dy = max(-120, min(120, rawDY))
+            let posAnim = CASpringAnimation(keyPath: "position")
+            posAnim.isAdditive = true
+            posAnim.mass = 1.0
+            posAnim.stiffness = stiffness
+            posAnim.damping = damping
+            posAnim.initialVelocity = 0.0
+            posAnim.fromValue = NSValue(point: NSPoint(x: dx, y: dy))
+            posAnim.toValue = NSValue(point: .zero)
+            posAnim.duration = posAnim.settlingDuration
+            posAnim.isRemovedOnCompletion = true
+            caretLayer.add(posAnim, forKey: "caret.pos.\(caretAnimationSeq)")
+        }
+
+        if abs(dh) > 0.5 {
+            let clampedDH = max(-40, min(40, dh))
+            let boundsAnim = CASpringAnimation(keyPath: "bounds")
+            boundsAnim.isAdditive = true
+            boundsAnim.mass = 1.0
+            boundsAnim.stiffness = stiffness
+            boundsAnim.damping = damping
+            boundsAnim.initialVelocity = 0.0
+            boundsAnim.fromValue = NSValue(rect: NSRect(x: 0, y: 0, width: 0, height: clampedDH))
+            boundsAnim.toValue = NSValue(rect: .zero)
+            boundsAnim.duration = boundsAnim.settlingDuration
+            boundsAnim.isRemovedOnCompletion = true
+            caretLayer.add(boundsAnim, forKey: "caret.bounds.\(caretAnimationSeq)")
+        }
+    }
+
+    private func cancelCaretBlink() {
+        caretBlinkWorkItem?.cancel()
+        caretBlinkWorkItem = nil
+        caretBlinkOn = true
+        caretLayer.removeAnimation(forKey: "caret.blink")
+    }
+
+    private func scheduleCaretBlink() {
+        cancelCaretBlink()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.tickCaretBlink()
+            }
+        }
+        caretBlinkWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.53, execute: work)
+    }
+
+    private func tickCaretBlink() {
+        guard !caretLayer.isHidden, window?.firstResponder === self, window?.isKeyWindow == true else { return }
+        caretBlinkOn.toggle()
+        let targetOpacity: Float = caretBlinkOn ? 1.0 : 0.08
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = caretLayer.presentation()?.opacity ?? caretLayer.opacity
+        fade.toValue = targetOpacity
+        fade.duration = 0.16
+        fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        caretLayer.opacity = targetOpacity
+        caretLayer.add(fade, forKey: "caret.blink")
+
+        let next = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.tickCaretBlink()
+            }
+        }
+        caretBlinkWorkItem = next
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.50, execute: next)
+    }
     override func paste(_ sender: Any?) {
         if let urls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
             onFiles?(urls)
@@ -224,6 +507,7 @@ import CozyCore
         textView.registerForDraggedTypes([.fileURL])
         textView.onFiles = { [weak self] in self?.addAttachments($0) }
         textView.onClipboardImage = { [weak self] in self?.addClipboardImage($0) }
+        textView.onFocusChange = { [weak self] in self?.formatMarkdown() }
         scroll.verticalScroller = CozyScroller()
         scroll.documentView = textView
         scroll.scrollerStyle = .overlay
@@ -323,6 +607,7 @@ import CozyCore
             textView.layoutManager?.ensureLayout(for: container)
         }
         onHorizontalInsetChange?(horizontal)
+        textView.updateCaret(animated: false)
         textView.needsDisplay = true
     }
 
@@ -330,11 +615,15 @@ import CozyCore
         get { textView.string }
         set {
             let previousSelection = textView.selectedRange()
+            textView.suppressCaretUpdates = true
+            textView.resetCaretPosition()
             textView.string = newValue
             textView.undoManager?.removeAllActions()
             formatMarkdown()
             let clampedLocation = min(previousSelection.location, (newValue as NSString).length)
             textView.setSelectedRange(NSRange(location: clampedLocation, length: 0))
+            textView.suppressCaretUpdates = false
+            textView.updateCaret(animated: false)
             updateWordCount()
             textView.needsDisplay = true
         }
@@ -506,6 +795,7 @@ import CozyCore
 
     func refreshTypography() {
         formatMarkdown()
+        textView.updateCaret(animated: false)
         textView.needsDisplay = true
     }
 
@@ -577,7 +867,7 @@ import CozyCore
             .foregroundColor: Theme.headingInk
         ]
         textView.insertionPointColor = Theme.accent
-
+        textView.refreshCaretAppearance()
         var inlinePills: [NSRange] = []
         var parsedFences: [MarkdownTextView.FencedBlock] = []
 
