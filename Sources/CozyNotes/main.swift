@@ -162,6 +162,11 @@ import CozyCore
         format.addItem(.separator())
         addResponder("Indent List Level", action: #selector(MarkdownTextView.indentListLevel(_:)), key: "]", to: format)
         addResponder("Outdent List Level", action: #selector(MarkdownTextView.outdentListLevel(_:)), key: "[", to: format)
+        format.addItem(.separator())
+        addResponder("Toggle Heading Fold", action: #selector(MarkdownTextView.toggleHeadingFoldAtCursor(_:)), key: "[", modifiers: [.command, .option], to: format)
+        addResponder("Unfold Heading Section", action: #selector(MarkdownTextView.unfoldHeadingAtCursor(_:)), key: "]", modifiers: [.command, .option], to: format)
+        addResponder("Cycle Outline Folding", action: #selector(MarkdownTextView.cycleOutlineFolding(_:)), key: "[", modifiers: [.command, .control], to: format)
+        addResponder("Unfold All Headings", action: #selector(MarkdownTextView.unfoldAllHeadings(_:)), key: "]", modifiers: [.command, .control], to: format)
         let viewItem = NSMenuItem()
         viewItem.title = "View"
         let view = NSMenu(title: "View")

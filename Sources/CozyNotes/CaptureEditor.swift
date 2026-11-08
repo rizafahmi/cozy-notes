@@ -16,7 +16,7 @@ import CozyCore
     }
 }
 
-@MainActor final class MarkdownTextView: NSTextView {
+@MainActor final class MarkdownTextView: NSTextView, NSLayoutManagerDelegate {
     private let editorUndoManager: UndoManager = {
         let um = CozyUndoManager()
         um.levelsOfUndo = 2
@@ -26,6 +26,7 @@ import CozyCore
     var onFiles: (([URL]) -> Void)?
     var onClipboardImage: ((Data) -> Void)?
     var onFocusChange: (() -> Void)?
+    var onFoldStatusChange: ((String) -> Void)?
     var placeholder = "Begin a note, paste a clipping, or drop a file…" { didSet { needsDisplay = true } }
     struct FencedBlock {
         let fullRange: NSRange
@@ -48,12 +49,31 @@ import CozyCore
         let level: Int
         let kind: Kind
     }
+    enum OutlineFoldMode: Equatable {
+        case showAll
+        case overview
+        case headingsOnly
+    }
+    struct FoldedSection: Equatable {
+        let headingLocation: Int
+        let headingRange: NSRange
+        let headingLevel: Int
+        let foldedCharRange: NSRange
+        let hiddenLineCount: Int
+    }
+    private struct FoldHitTarget {
+        let rect: NSRect
+        let headingLocation: Int
+    }
 
     var blockquoteRanges: [NSRange] = []
     var fencedBlocks: [FencedBlock] = []
     var inlineCodeRanges: [NSRange] = []
     var headingGutterItems: [HeadingGutter] = []
     var bulletItems: [BulletItem] = []
+    private(set) var foldedSections: [FoldedSection] = []
+    private(set) var outlineFoldMode: OutlineFoldMode = .showAll
+    private var foldHitTargets: [FoldHitTarget] = []
 
     struct EditRecord {
         let affectedRange: NSRange
@@ -139,6 +159,7 @@ import CozyCore
 
         for block in fencedBlocks {
             if block.fullRange.location > visEnd { break }
+            if isCharacterFolded(block.fullRange.location) { continue }
             guard NSMaxRange(block.fullRange) >= visStart,
                   NSMaxRange(block.fullRange) <= totalLength,
                   NSMaxRange(block.bodyRange) <= totalLength else { continue }
@@ -173,6 +194,7 @@ import CozyCore
             let pillHeight = ceil(codeFont.ascender - codeFont.descender) + 5
             for inner in inlineCodeRanges {
                 if inner.location > visEnd { break }
+                if isCharacterFolded(inner.location) { continue }
                 guard NSMaxRange(inner) >= visStart, NSMaxRange(inner) <= totalLength else { continue }
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: inner, actualCharacterRange: nil)
                 let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
@@ -193,6 +215,7 @@ import CozyCore
 
         for range in blockquoteRanges {
             if range.location > visEnd { break }
+            if isCharacterFolded(range.location) { continue }
             guard NSMaxRange(range) >= visStart, NSMaxRange(range) <= totalLength else { continue }
             let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             var box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
@@ -211,23 +234,61 @@ import CozyCore
             bar.fill()
         }
 
+        foldHitTargets.removeAll(keepingCapacity: true)
         if !headingGutterItems.isEmpty {
-            let badgeAttrs: [NSAttributedString.Key: Any] = [
+            let unfoldedBadgeAttrs: [NSAttributedString.Key: Any] = [
                 .font: Theme.monoFont(9.5, weight: .semibold),
-                .foregroundColor: Theme.subtle.withAlphaComponent(0.8)
+                .foregroundColor: Theme.subtle.withAlphaComponent(0.85)
+            ]
+            let foldedBadgeAttrs: [NSAttributedString.Key: Any] = [
+                .font: Theme.monoFont(9.5, weight: .bold),
+                .foregroundColor: Theme.accent
+            ]
+            let pillTextAttrs: [NSAttributedString.Key: Any] = [
+                .font: Theme.monoFont(9.5, weight: .semibold),
+                .foregroundColor: Theme.muted
             ]
             for item in headingGutterItems {
                 if item.range.location > visEnd { break }
+                if isCharacterFolded(item.range.location) { continue }
                 guard NSMaxRange(item.range) >= visStart, NSMaxRange(item.range) <= totalLength else { continue }
                 let glyphRange = layoutManager.glyphRange(forCharacterRange: item.range, actualCharacterRange: nil)
                 let box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                let activeFold = foldedSections.first { $0.headingLocation == item.range.location }
+                let isFolded = activeFold != nil
                 if origin.x >= 56 {
-                    let badgeSize = (item.label as NSString).size(withAttributes: badgeAttrs)
-                    let x = origin.x - 24 - badgeSize.width
+                    let badgeLabel = "\(isFolded ? "▸" : "▾") \(item.label)" as NSString
+                    let attrs = isFolded ? foldedBadgeAttrs : unfoldedBadgeAttrs
+                    let badgeSize = badgeLabel.size(withAttributes: attrs)
+                    let x = origin.x - 18 - badgeSize.width
                     let y = origin.y + box.minY + max(0, (box.height - badgeSize.height) / 2) - 2
-                    (item.label as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: badgeAttrs)
+                    let badgeRect = NSRect(x: x - 4, y: y - 2, width: badgeSize.width + 8, height: badgeSize.height + 4)
+                    if isFolded {
+                        let bgPath = NSBezierPath(roundedRect: badgeRect, xRadius: 4, yRadius: 4)
+                        Theme.accentSoft.setFill()
+                        bgPath.fill()
+                    }
+                    badgeLabel.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
+                    foldHitTargets.append(FoldHitTarget(rect: badgeRect, headingLocation: item.range.location))
                 }
-                if item.level == 1 {
+                if let activeFold {
+                    let lastGlyph = max(glyphRange.location, NSMaxRange(glyphRange) - 1)
+                    let usedRect = layoutManager.lineFragmentUsedRect(forGlyphAt: lastGlyph, effectiveRange: nil)
+                    let pillLabel = "⋯ \(activeFold.hiddenLineCount) \(activeFold.hiddenLineCount == 1 ? "line" : "lines")" as NSString
+                    let pillSize = pillLabel.size(withAttributes: pillTextAttrs)
+                    let pillX = min(origin.x + columnWidth - pillSize.width - 14, origin.x + usedRect.maxX + 10)
+                    let pillY = origin.y + box.minY + max(0, (box.height - pillSize.height) / 2) - 2
+                    let pillRect = NSRect(x: pillX, y: pillY - 1.5, width: pillSize.width + 12, height: pillSize.height + 3)
+                    let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 5, yRadius: 5)
+                    Theme.elevated.setFill()
+                    pillPath.fill()
+                    Theme.border.setStroke()
+                    pillPath.lineWidth = 1
+                    pillPath.stroke()
+                    pillLabel.draw(at: NSPoint(x: pillRect.minX + 6, y: pillY), withAttributes: pillTextAttrs)
+                    foldHitTargets.append(FoldHitTarget(rect: pillRect, headingLocation: item.range.location))
+                }
+                if item.level == 1 && !isFolded {
                     Theme.marginLine.setFill()
                     NSRect(x: origin.x + 4, y: origin.y + box.maxY + 4, width: max(0, columnWidth - 8), height: 1).fill()
                 }
@@ -237,6 +298,7 @@ import CozyCore
         if !bulletItems.isEmpty {
             for item in bulletItems {
                 if item.lineRange.location > visEnd { break }
+                if isCharacterFolded(item.lineRange.location) { continue }
                 guard NSMaxRange(item.lineRange) >= visStart,
                       NSMaxRange(item.lineRange) <= totalLength,
                       NSMaxRange(item.markerRange) <= totalLength else { continue }
@@ -369,6 +431,9 @@ import CozyCore
         let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
         guard ok, let ns = textStorage?.mutableString else { return ok }
         isEditingText = true
+        if !foldedSections.isEmpty {
+            unfoldSectionsIntersecting(affectedCharRange)
+        }
         let oldLen = ns.length
         let repNS = (replacementString ?? "") as NSString
         let repLen = repNS.length
@@ -526,7 +591,7 @@ import CozyCore
             default:
                 break
             }
-        } else if flags == [.command, .option] || flags == [.command, .control] {
+        } else if flags == [.command, .option] {
             switch key {
             case "c":
                 guard isEditable else { return false }
@@ -555,6 +620,51 @@ import CozyCore
             case "t":
                 guard isEditable else { return false }
                 toggleChecklist(self)
+                return true
+            case "[":
+                toggleHeadingFoldAtCursor(self)
+                return true
+            case "]":
+                unfoldHeadingAtCursor(self)
+                return true
+            default:
+                break
+            }
+        } else if flags == [.command, .control] {
+            switch key {
+            case "c":
+                guard isEditable else { return false }
+                toggleCodeBlock(self)
+                return true
+            case "1":
+                guard isEditable else { return false }
+                toggleHeading1(self)
+                return true
+            case "2":
+                guard isEditable else { return false }
+                toggleHeading2(self)
+                return true
+            case "3":
+                guard isEditable else { return false }
+                toggleHeading3(self)
+                return true
+            case "q":
+                guard isEditable else { return false }
+                toggleBlockquote(self)
+                return true
+            case "l":
+                guard isEditable else { return false }
+                toggleBulletList(self)
+                return true
+            case "t":
+                guard isEditable else { return false }
+                toggleChecklist(self)
+                return true
+            case "[":
+                cycleOutlineFolding(self)
+                return true
+            case "]":
+                unfoldAllHeadings(self)
                 return true
             default:
                 break
@@ -608,13 +718,26 @@ import CozyCore
             super.selectAll(sender)
         }
     }
+    override func mouseDown(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        if let hit = foldHitTargets.first(where: { $0.rect.insetBy(dx: -4, dy: -3).contains(pt) }) {
+            toggleFold(forHeadingAt: hit.headingLocation)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
     override func insertTab(_ sender: Any?) {
-        if isEditable, let ns = textStorage?.mutableString {
+        if let ns = textStorage?.mutableString {
             let sel = selectedRange()
             if NSMaxRange(sel) <= ns.length {
+                if sel.length == 0, headingIndex(atOrEnclosing: sel.location, requireSameLine: true) != nil {
+                    toggleHeadingFoldAtCursor(sender)
+                    return
+                }
                 let lineRange = ns.lineRange(for: sel)
                 let lineStr = ns.substring(with: lineRange)
-                if Self.lineStartsWithListMarker(lineStr) {
+                if isEditable, Self.lineStartsWithListMarker(lineStr) {
                     indentListLevel(sender)
                     return
                 }
@@ -624,11 +747,242 @@ import CozyCore
     }
 
     override func insertBacktab(_ sender: Any?) {
+        if let ns = textStorage?.mutableString {
+            let sel = selectedRange()
+            if NSMaxRange(sel) <= ns.length,
+               sel.length == 0,
+               headingIndex(atOrEnclosing: sel.location, requireSameLine: true) != nil {
+                cycleOutlineFolding(sender)
+                return
+            }
+        }
         if isEditable {
             outdentListLevel(sender)
             return
         }
         super.insertBacktab(sender)
+    }
+
+    nonisolated func layoutManager(
+        _ layoutManager: NSLayoutManager,
+        shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
+        properties props: UnsafePointer<NSLayoutManager.GlyphProperty>,
+        characterIndexes charIndexes: UnsafePointer<Int>,
+        font aFont: NSFont,
+        forGlyphRange glyphRange: NSRange
+    ) -> Int {
+        MainActor.assumeIsolated {
+            guard !foldedSections.isEmpty, glyphRange.length > 0 else { return 0 }
+            let firstChar = charIndexes[0]
+            let lastChar = charIndexes[glyphRange.length - 1]
+            let spanRange = NSRange(location: min(firstChar, lastChar), length: abs(lastChar - firstChar) + 1)
+            let overlaps = foldedSections.contains { NSIntersectionRange($0.foldedCharRange, spanRange).length > 0 }
+            guard overlaps else { return 0 }
+
+            var mutableProps = Array(UnsafeBufferPointer(start: props, count: glyphRange.length))
+            var didModify = false
+            for i in 0..<glyphRange.length {
+                if isCharacterFolded(charIndexes[i]) {
+                    mutableProps[i] = .null
+                    didModify = true
+                }
+            }
+            guard didModify else { return 0 }
+            layoutManager.setGlyphs(
+                glyphs,
+                properties: &mutableProps,
+                characterIndexes: charIndexes,
+                font: aFont,
+                forGlyphRange: glyphRange
+            )
+            return glyphRange.length
+        }
+    }
+
+    func isCharacterFolded(_ charIndex: Int) -> Bool {
+        !foldedSections.isEmpty && foldedSections.contains { NSLocationInRange(charIndex, $0.foldedCharRange) }
+    }
+
+    private func headingIndex(atOrEnclosing location: Int, requireSameLine: Bool) -> Int? {
+        guard !headingGutterItems.isEmpty, let ns = textStorage?.mutableString else { return nil }
+        let clamped = min(location, ns.length)
+        let lineRange = ns.lineRange(for: NSRange(location: clamped, length: 0))
+        if let sameLineIdx = headingGutterItems.firstIndex(where: { NSIntersectionRange($0.range, lineRange).length > 0 || $0.range.location == lineRange.location }) {
+            return sameLineIdx
+        }
+        guard !requireSameLine else { return nil }
+        return headingGutterItems.lastIndex(where: { $0.range.location <= clamped })
+    }
+
+    private func computeFoldedSection(forHeadingIndex idx: Int, bodyOnly: Bool) -> FoldedSection? {
+        guard headingGutterItems.indices.contains(idx),
+              let ns = textStorage?.mutableString else { return nil }
+        let totalLen = ns.length
+        let item = headingGutterItems[idx]
+        let headingLineRange = ns.lineRange(for: item.range)
+        let foldEnd: Int
+        if bodyOnly {
+            foldEnd = (idx + 1 < headingGutterItems.count) ? headingGutterItems[idx + 1].range.location : totalLen
+        } else {
+            var nextSameOrHigher: Int?
+            for j in (idx + 1)..<headingGutterItems.count {
+                if headingGutterItems[j].level <= item.level {
+                    nextSameOrHigher = headingGutterItems[j].range.location
+                    break
+                }
+            }
+            foldEnd = nextSameOrHigher ?? totalLen
+        }
+        let foldStart = foldEnd == totalLen ? NSMaxRange(item.range) : NSMaxRange(headingLineRange)
+        guard foldEnd > foldStart else { return nil }
+        let foldedRange = NSRange(location: foldStart, length: foldEnd - foldStart)
+        let bodySlice = ns.substring(with: NSRange(
+            location: min(NSMaxRange(headingLineRange), foldEnd),
+            length: max(0, foldEnd - min(NSMaxRange(headingLineRange), foldEnd))
+        ))
+        let trimmed = bodySlice.hasSuffix("\n") ? String(bodySlice.dropLast()) : bodySlice
+        let lineCount = trimmed.isEmpty ? 0 : trimmed.components(separatedBy: "\n").count
+        guard lineCount > 0 else { return nil }
+        return FoldedSection(
+            headingLocation: item.range.location,
+            headingRange: item.range,
+            headingLevel: item.level,
+            foldedCharRange: foldedRange,
+            hiddenLineCount: lineCount
+        )
+    }
+
+    func toggleFold(forHeadingAt headingLocation: Int) {
+        guard let idx = headingGutterItems.firstIndex(where: { $0.range.location == headingLocation }) else { return }
+        let item = headingGutterItems[idx]
+        if let existingIdx = foldedSections.firstIndex(where: { $0.headingLocation == headingLocation }) {
+            foldedSections.remove(at: existingIdx)
+            outlineFoldMode = .showAll
+            invalidateFoldLayout()
+            onFoldStatusChange?("Unfolded \(item.label)")
+        } else if let section = computeFoldedSection(forHeadingIndex: idx, bodyOnly: false) {
+            foldedSections.removeAll { NSLocationInRange($0.headingLocation, section.foldedCharRange) }
+            foldedSections.append(section)
+            foldedSections.sort { $0.headingLocation < $1.headingLocation }
+            outlineFoldMode = .showAll
+            let sel = selectedRange()
+            if NSLocationInRange(sel.location, section.foldedCharRange) || NSIntersectionRange(sel, section.foldedCharRange).length > 0 {
+                setSelectedRange(NSRange(location: NSMaxRange(item.range), length: 0))
+            }
+            invalidateFoldLayout()
+            onFoldStatusChange?("Folded \(item.label) (\(section.hiddenLineCount) \(section.hiddenLineCount == 1 ? "line" : "lines"))")
+        }
+    }
+
+    @objc func toggleHeadingFoldAtCursor(_ sender: Any?) {
+        guard let idx = headingIndex(atOrEnclosing: selectedRange().location, requireSameLine: false) else { return }
+        toggleFold(forHeadingAt: headingGutterItems[idx].range.location)
+    }
+
+    @objc func unfoldHeadingAtCursor(_ sender: Any?) {
+        let loc = selectedRange().location
+        if let idx = headingIndex(atOrEnclosing: loc, requireSameLine: false) {
+            let hLoc = headingGutterItems[idx].range.location
+            if let foldIdx = foldedSections.firstIndex(where: { $0.headingLocation == hLoc }) {
+                foldedSections.remove(at: foldIdx)
+                outlineFoldMode = .showAll
+                invalidateFoldLayout()
+                onFoldStatusChange?("Unfolded \(headingGutterItems[idx].label)")
+                return
+            }
+        }
+        if let enclosingIdx = foldedSections.firstIndex(where: { NSLocationInRange(loc, $0.foldedCharRange) }) {
+            foldedSections.remove(at: enclosingIdx)
+            outlineFoldMode = .showAll
+            invalidateFoldLayout()
+            onFoldStatusChange?("Unfolded section")
+        }
+    }
+
+    /// Cycles Org-mode global outline visibility: Overview (top-level headings) -> Headings Only (all headings) -> Show All.
+    @objc func cycleOutlineFolding(_ sender: Any?) {
+        guard !headingGutterItems.isEmpty else { return }
+        switch outlineFoldMode {
+        case .showAll:
+            let minLevel = headingGutterItems.map(\.level).min() ?? 1
+            var nextFolds: [FoldedSection] = []
+            for idx in headingGutterItems.indices where headingGutterItems[idx].level == minLevel {
+                if let section = computeFoldedSection(forHeadingIndex: idx, bodyOnly: false) {
+                    nextFolds.append(section)
+                }
+            }
+            foldedSections = nextFolds
+            outlineFoldMode = nextFolds.isEmpty ? .showAll : .overview
+            clampSelectionOutsideFolds()
+            invalidateFoldLayout()
+            onFoldStatusChange?(outlineFoldMode == .overview ? "Outline: Overview" : "Outline: Show All")
+
+        case .overview:
+            var nextFolds: [FoldedSection] = []
+            for idx in headingGutterItems.indices {
+                if let section = computeFoldedSection(forHeadingIndex: idx, bodyOnly: true) {
+                    nextFolds.append(section)
+                }
+            }
+            foldedSections = nextFolds
+            outlineFoldMode = .headingsOnly
+            clampSelectionOutsideFolds()
+            invalidateFoldLayout()
+            onFoldStatusChange?("Outline: Headings Only")
+
+        case .headingsOnly:
+            unfoldAllHeadings(sender)
+        }
+    }
+
+    @objc func unfoldAllHeadings(_ sender: Any?) {
+        guard !foldedSections.isEmpty || outlineFoldMode != .showAll else { return }
+        foldedSections.removeAll()
+        outlineFoldMode = .showAll
+        invalidateFoldLayout()
+        onFoldStatusChange?("Outline: Show All")
+    }
+
+    func clearAllFolds() {
+        guard !foldedSections.isEmpty || outlineFoldMode != .showAll else { return }
+        foldedSections.removeAll()
+        outlineFoldMode = .showAll
+        invalidateFoldLayout()
+    }
+
+    private func unfoldSectionsIntersecting(_ editRange: NSRange) {
+        let beforeCount = foldedSections.count
+        foldedSections.removeAll { section in
+            let expanded = NSRange(
+                location: section.headingRange.location,
+                length: NSMaxRange(section.foldedCharRange) - section.headingRange.location
+            )
+            return NSIntersectionRange(expanded, editRange).length > 0
+                || NSLocationInRange(editRange.location, expanded)
+                || editRange.location == NSMaxRange(expanded)
+        }
+        if foldedSections.count != beforeCount {
+            outlineFoldMode = .showAll
+            invalidateFoldLayout()
+        }
+    }
+
+    private func clampSelectionOutsideFolds() {
+        let sel = selectedRange()
+        if let enclosing = foldedSections.first(where: { NSLocationInRange(sel.location, $0.foldedCharRange) }) {
+            setSelectedRange(NSRange(location: NSMaxRange(enclosing.headingRange), length: 0))
+        }
+    }
+
+    private func invalidateFoldLayout() {
+        guard let lm = layoutManager, let tc = textContainer, let storage = textStorage else { return }
+        let fullRange = NSRange(location: 0, length: storage.length)
+        lm.invalidateGlyphs(forCharacterRange: fullRange, changeInLength: 0, actualCharacterRange: nil)
+        lm.invalidateLayout(forCharacterRange: fullRange, actualCharacterRange: nil)
+        lm.ensureLayout(for: tc)
+        minimumOverscrollHeight = 0
+        updateCaret(animated: false)
+        setNeedsDisplay(visibleRect, avoidAdditionalLayout: true)
     }
 
     private static let listLineCheckRegex = try! NSRegularExpression(pattern: "(?m)^[ \\t]*(?:[-*+]|\\d+\\.)(?:\\s+\\[[ xX]\\])? ")
@@ -1132,14 +1486,32 @@ import CozyCore
     override func doCommand(by selector: Selector) {
         super.doCommand(by: selector)
         guard !suppressCaretUpdates && !isEditingText,
-              window?.firstResponder === self,
-              selectedRange().length == 0 else { return }
-        ensureCaretVisible(animated: true, useTypewriterStep: true)
+              window?.firstResponder === self else { return }
+        if !foldedSections.isEmpty, selectedRange().length == 0 {
+            let loc = selectedRange().location
+            if let fold = foldedSections.first(where: { NSLocationInRange(loc, $0.foldedCharRange) }) {
+                let movingBackward = selector == #selector(NSResponder.moveUp(_:))
+                    || selector == #selector(NSResponder.moveBackward(_:))
+                    || selector == #selector(NSResponder.moveLeft(_:))
+                    || selector == #selector(NSResponder.moveWordBackward(_:))
+                    || selector == #selector(NSResponder.moveWordLeft(_:))
+                let targetLoc = movingBackward
+                    ? NSMaxRange(fold.headingRange)
+                    : min(textStorage?.length ?? 0, NSMaxRange(fold.foldedCharRange))
+                setSelectedRange(NSRange(location: targetLoc, length: 0))
+            }
+        }
+        if selectedRange().length == 0 {
+            ensureCaretVisible(animated: true, useTypewriterStep: true)
+        }
     }
 
     func resetCaretPosition() {
         hasCaretOrigin = false
         minimumOverscrollHeight = 0
+        foldedSections.removeAll()
+        outlineFoldMode = .showAll
+        foldHitTargets.removeAll()
         caretLayer.removeAllAnimations()
         cancelScrollSpring()
     }
@@ -1594,10 +1966,12 @@ import CozyCore
         textView.drawsBackground = false
         textView.insertionPointColor = Theme.accent
         textView.delegate = self
+        textView.layoutManager?.delegate = textView
         textView.registerForDraggedTypes([.fileURL])
         textView.onFiles = { [weak self] in self?.addAttachments($0) }
         textView.onClipboardImage = { [weak self] in self?.addClipboardImage($0) }
         textView.onFocusChange = { [weak self] in self?.handleFocusChange() }
+        textView.onFoldStatusChange = { [weak self] msg in self?.status.stringValue = msg }
         scroll.verticalScroller = CozyScroller()
         scroll.documentView = textView
         scroll.scrollerStyle = .overlay

@@ -521,5 +521,102 @@ struct MobyDickWorkoutSuite {
         textView.insertText("!", replacementRange: textView.selectedRange())
         #expect(abs(clipView.bounds.origin.y - steadyOrigin) < 0.01, "Same-line typing inside the comfort zone must remain steady")
     }
+
+    @Test("Org-mode heading folding collapses subtrees in layout, cycles Overview -> Headings Only -> Show All, and auto-unfolds on edit without mutating Markdown text")
+    @MainActor
+    func orgModeHeadingFolding() throws {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        delegate.buildMenus()
+        let mainMenu = try #require(app.mainMenu)
+        let formatMenu = try #require(mainMenu.item(withTitle: "Format")?.submenu)
+        #expect(formatMenu.item(withTitle: "Toggle Heading Fold")?.keyEquivalent == "[")
+        #expect(formatMenu.item(withTitle: "Unfold Heading Section")?.keyEquivalent == "]")
+        #expect(formatMenu.item(withTitle: "Cycle Outline Folding")?.keyEquivalent == "[")
+        #expect(formatMenu.item(withTitle: "Unfold All Headings")?.keyEquivalent == "]")
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 480),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 720, height: 480))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        defer { window.orderOut(nil) }
+
+        let markdown = """
+        # Part One
+        Intro paragraph line 1.
+        Intro paragraph line 2.
+        ## Subsection 1.1
+        Details inside subsection 1.1.
+        More details inside 1.1.
+        # Part Two
+        Second part prose line.
+        """
+        editor.text = markdown
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+
+        let textView = editor.textView
+        let lm = try #require(textView.layoutManager)
+        let tc = try #require(textView.textContainer)
+        #expect(textView.headingGutterItems.count == 3)
+        let h1PartOne = textView.headingGutterItems[0]
+        let h2Sub = textView.headingGutterItems[1]
+        let h1PartTwo = textView.headingGutterItems[2]
+
+        func yOfHeading(_ item: MarkdownTextView.HeadingGutter) -> CGFloat {
+            let gr = lm.glyphRange(forCharacterRange: item.range, actualCharacterRange: nil)
+            return lm.boundingRect(forGlyphRange: gr, in: tc).minY
+        }
+
+        let partTwoUnfoldedY = yOfHeading(h1PartTwo)
+        #expect(partTwoUnfoldedY > yOfHeading(h1PartOne) + 80)
+
+        // 1. Place cursor on "# Part One" and press Tab -> folds Part One's entire subtree (including ## Subsection 1.1) up to "# Part Two"
+        textView.setSelectedRange(NSRange(location: h1PartOne.range.location + 2, length: 0))
+        textView.insertTab(nil)
+        window.displayIfNeeded()
+
+        #expect(textView.foldedSections.count == 1)
+        #expect(textView.foldedSections[0].headingLocation == h1PartOne.range.location)
+        #expect(textView.foldedSections[0].hiddenLineCount == 5)
+        #expect(textView.isCharacterFolded(h2Sub.range.location))
+        #expect(!textView.isCharacterFolded(h1PartTwo.range.location))
+        #expect(editor.text == markdown, "Folding must never alter underlying Markdown text")
+
+        let partTwoFoldedY = yOfHeading(h1PartTwo)
+        #expect(partTwoFoldedY < partTwoUnfoldedY - 40, "Folding Part One must visually pull Part Two up directly beneath Part One")
+
+        // Pressing Tab again on "# Part One" unfolds it
+        textView.insertTab(nil)
+        #expect(textView.foldedSections.isEmpty)
+        #expect(abs(yOfHeading(h1PartTwo) - partTwoUnfoldedY) < 1.0)
+
+        // 2. Shift+Tab on a heading cycles Org-mode global outline states: Overview -> Headings Only -> Show All
+        textView.insertBacktab(nil)
+        #expect(textView.outlineFoldMode == .overview)
+        #expect(textView.foldedSections.count == 2) // Both H1 sections folded
+        #expect(textView.isCharacterFolded(h2Sub.range.location))
+
+        textView.insertBacktab(nil)
+        #expect(textView.outlineFoldMode == .headingsOnly)
+        #expect(textView.foldedSections.count == 3) // Body under each heading folded, all headings visible
+        #expect(!textView.isCharacterFolded(h2Sub.range.location))
+
+        textView.insertBacktab(nil)
+        #expect(textView.outlineFoldMode == .showAll)
+        #expect(textView.foldedSections.isEmpty)
+
+        // 3. Auto-unfold on edit: folding a section and editing inside/on it automatically unfolds
+        textView.toggleFold(forHeadingAt: h2Sub.range.location)
+        #expect(textView.foldedSections.count == 1)
+        textView.insertText("!", replacementRange: NSRange(location: NSMaxRange(h2Sub.range), length: 0))
+        #expect(textView.foldedSections.isEmpty, "Editing a folded heading automatically unfolds its section")
+    }
 }
 #endif
