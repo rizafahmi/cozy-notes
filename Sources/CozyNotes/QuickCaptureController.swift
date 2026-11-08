@@ -5,6 +5,7 @@ import CozyCore
     let editor = CaptureEditor(frame: .zero)
     private let vault: Vault
     var onCapture: (() -> Void)?
+    var onOpenWikiLink: ((WikiLink) -> Void)?
     private var previousApp: NSRunningApplication?
 
     init(vault: Vault) {
@@ -27,6 +28,8 @@ import CozyCore
         panel.minSize = NSSize(width: 440, height: 260)
         super.init(window: panel)
         panel.delegate = self
+        editor.noteRecordsProvider = { [weak self] in (try? self?.vault.notes()) ?? [] }
+        editor.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
 
         let headerLabel = Theme.label("Quick capture", size: 11.5, color: Theme.muted)
         let header = NSView()

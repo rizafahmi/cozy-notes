@@ -45,6 +45,12 @@ import CozyCore
         let nextQuick = QuickCaptureController(vault: vault)
         nextWorkspace.onChooseFolder = { [weak self] in self?.chooseFolder() }
         nextQuick.onCapture = { [weak nextWorkspace] in nextWorkspace?.refresh() }
+        nextQuick.onOpenWikiLink = { [weak nextWorkspace, weak nextQuick] link in
+            guard nextQuick?.persistDraft() != false else { return }
+            nextQuick?.hide()
+            nextWorkspace?.showAndFocus()
+            nextWorkspace?.openWikiLink(link)
+        }
         workspace?.shutdown()
         workspace?.window?.orderOut(nil)
         quickCapture?.window?.orderOut(nil)
@@ -70,8 +76,19 @@ import CozyCore
     @objc private func newCapture() { workspace?.newCapture(); workspace?.showAndFocus() }
     @objc private func quick() { quickCapture?.summon() }
     @objc private func save() {
-        if NSApp.keyWindow === quickCapture?.window { quickCapture?.save() }
-        else { workspace?.saveCurrent() }
+        if NSApp.keyWindow === quickCapture?.window {
+            if let link = quickCapture?.editor.textView.wikiLinkAtCursor() {
+                quickCapture?.editor.onOpenWikiLink?(link)
+                return
+            }
+            quickCapture?.save()
+        } else {
+            if let link = workspace?.editor.textView.wikiLinkAtCursor() {
+                workspace?.openWikiLink(link)
+                return
+            }
+            workspace?.saveCurrent()
+        }
     }
     @objc private func deleteNote() { workspace?.deleteCurrentNote() }
     @objc private func search() { workspace?.focusSearch(); workspace?.showAndFocus() }
@@ -150,6 +167,8 @@ import CozyCore
         addResponder("Inline Code", action: #selector(MarkdownTextView.toggleInlineCode(_:)), key: "e", to: format)
         addResponder("Code Block", action: #selector(MarkdownTextView.toggleCodeBlock(_:)), key: "c", modifiers: [.command, .shift], to: format)
         addResponder("Insert Link", action: #selector(MarkdownTextView.insertMarkdownLink(_:)), key: "k", to: format)
+        addResponder("Insert Note Link", action: #selector(MarkdownTextView.insertWikiLink(_:)), key: "k", modifiers: [.command, .option], to: format)
+        addResponder("Open Note Link", action: #selector(MarkdownTextView.openWikiLinkAtCursor(_:)), key: "\r", modifiers: [.command, .option], to: format)
         format.addItem(.separator())
         addResponder("Heading 1", action: #selector(MarkdownTextView.toggleHeading1(_:)), key: "1", modifiers: [.command, .option], to: format)
         addResponder("Heading 2", action: #selector(MarkdownTextView.toggleHeading2(_:)), key: "2", modifiers: [.command, .option], to: format)

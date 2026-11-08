@@ -618,5 +618,142 @@ struct MobyDickWorkoutSuite {
         textView.insertText("!", replacementRange: NSRange(location: NSMaxRange(h2Sub.range), length: 0))
         #expect(textView.foldedSections.isEmpty, "Editing a folded heading automatically unfolds its section")
     }
+
+    @Test("Wiki-links highlight, trigger floating [[ autocomplete, and navigate or create notes on ⌘-Click and ⌥⌘Return")
+    @MainActor
+    func wikiLinksAutocompleteAndNavigation() throws {
+        _ = NSApplication.shared
+        let tempRoot = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("CozyNotesWikiTests-\(UUID().uuidString)", isDirectory: true)
+        let vaultRoot = tempRoot.appendingPathComponent("Vault", isDirectory: true)
+        let historyRoot = tempRoot.appendingPathComponent("History", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let vault = try Vault(root: vaultRoot, historyRoot: historyRoot)
+        let targetNote = try vault.capture(text: "# Field Research\n Botanical observations and sketches.")
+        let secondNote = try vault.capture(text: "# Reading List\n Books to read.")
+
+        let workspace = WorkspaceController(vault: vault)
+        workspace.showWindow(nil)
+        defer {
+            workspace.shutdown()
+            workspace.window?.orderOut(nil)
+        }
+
+        let editor = workspace.editor
+        let textView = editor.textView
+        workspace.openNote(secondNote.url)
+        #expect(workspace.noteURL == secondNote.url)
+
+        // 1. Typing `[[` at the end of the note triggers the floating autocomplete popup
+        let endLoc = editor.nsText.length
+        textView.setSelectedRange(NSRange(location: endLoc, length: 0))
+        textView.insertText("\nSee [[", replacementRange: NSRange(location: endLoc, length: 0))
+        #expect(editor.isWikiAutocompleteVisible)
+        #expect(editor.wikiCompletionItems.contains { $0.title == "Field Research" && !$0.isCreateNew })
+
+        // 2. Typing filter query narrows completion items to matching note
+        textView.insertText("Field", replacementRange: textView.selectedRange())
+        #expect(editor.isWikiAutocompleteVisible)
+        #expect(editor.wikiCompletionItems.first?.title == "Field Research")
+
+        // 3. Pressing Return commits `[[Field Research]]` and dismisses the popup
+        textView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        #expect(!editor.isWikiAutocompleteVisible)
+        #expect(editor.text.hasSuffix("See [[Field Research]]"))
+        #expect(textView.wikiLinkItems.count == 1)
+        #expect(textView.wikiLinkItems[0].target == "Field Research")
+
+        // 4. ⌘-Clicking the `[[Field Research]]` link navigates WorkspaceController to Field Research
+        let linkItem = textView.wikiLinkItems[0]
+        let lm = try #require(textView.layoutManager)
+        let tc = try #require(textView.textContainer)
+        lm.ensureLayout(for: tc)
+        let gr = lm.glyphRange(forCharacterRange: linkItem.innerRange, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: gr, in: tc)
+        let clickPointInTextView = NSPoint(
+            x: textView.textContainerOrigin.x + rect.midX,
+            y: textView.textContainerOrigin.y + rect.midY
+        )
+        let clickPointInWindow = textView.convert(clickPointInTextView, to: nil)
+        let cmdClick = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: clickPointInWindow,
+            modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1.0
+        ))
+        textView.mouseDown(with: cmdClick)
+        #expect(workspace.noteURL == targetNote.url)
+
+        // 5. Typing a link to a non-existent note `[[Uncharted Territory]]` and activating via `openWikiLinkAtCursor` creates & opens it
+        let targetEnd = editor.nsText.length
+        textView.setSelectedRange(NSRange(location: targetEnd, length: 0))
+        textView.insertText("\nNext: [[Uncharted Territory", replacementRange: NSRange(location: targetEnd, length: 0))
+        #expect(editor.isWikiAutocompleteVisible)
+        #expect(editor.wikiCompletionItems.contains { $0.title == "Uncharted Territory" && $0.isCreateNew })
+
+        // Commit via Tab
+        textView.insertTab(nil)
+        #expect(!editor.isWikiAutocompleteVisible)
+        #expect(editor.text.hasSuffix("[[Uncharted Territory]]"))
+
+        // Place cursor inside the new link and open via ⌘Return (Command + Return) keyboard shortcut
+        textView.setSelectedRange(NSRange(location: editor.nsText.length - 3, length: 0))
+        let cmdReturn = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
+            isARepeat: false,
+            keyCode: 36
+        ))
+        #expect(textView.performKeyEquivalent(with: cmdReturn))
+        let createdURL = try #require(workspace.noteURL)
+        #expect(createdURL != targetNote.url)
+        #expect(createdURL != secondNote.url)
+        #expect(editor.text == "# Uncharted Territory\n\n")
+
+        // Also verify ⌥⌘K wraps selection in [[...]] and ⌥⌘Return / ⌘O open it
+        textView.insertText("Back to Reading List", replacementRange: textView.selectedRange())
+        textView.setSelectedRange(NSRange(location: editor.nsText.length - 12, length: 12)) // "Reading List"
+        let optCmdK = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .option],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            characters: "k",
+            charactersIgnoringModifiers: "k",
+            isARepeat: false,
+            keyCode: 40
+        ))
+        #expect(textView.performKeyEquivalent(with: optCmdK))
+        #expect(editor.text.hasSuffix("[[Reading List]]"))
+
+        let optCmdReturn = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command, .option],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: workspace.window?.windowNumber ?? 0,
+            context: nil,
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
+            isARepeat: false,
+            keyCode: 36
+        ))
+        #expect(textView.performKeyEquivalent(with: optCmdReturn))
+        #expect(workspace.noteURL == secondNote.url)
+    }
 }
 #endif

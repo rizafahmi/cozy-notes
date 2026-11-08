@@ -189,6 +189,9 @@ import CozyCore
         editor.onAttachFiles = { [weak self] urls in self?.attachFilesToCurrentNote(urls) }
         editor.onRemoveLinkedAttachment = { [weak self] item in self?.removeLinkedAttachment(item) }
         editor.onHorizontalInsetChange = { [weak self] inset in self?.syncFolioMargins(inset) }
+        editor.noteRecordsProvider = { [weak self] in (try? self?.vault.notes()) ?? [] }
+        editor.currentNoteURLProvider = { [weak self] in self?.noteURL }
+        editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         searchPanel.onNewNote = { [weak self] in self?.newCapture() }
         searchPanel.onDeleteNote = { [weak self] url in self?.confirmAndDeleteNote(url) }
@@ -302,6 +305,7 @@ import CozyCore
     func refresh() {
         refreshNoteIfClean()
         searchPanel.refresh()
+        editor.invalidateNoteRecordsCache()
     }
 
     private func editorDidChange() {
@@ -490,6 +494,30 @@ import CozyCore
         searchPanel.makeSearchable()
     }
 
+    func openWikiLink(_ link: WikiLink) {
+        openWikiLink(target: link.target)
+    }
+
+    func openWikiLink(target: String) {
+        guard persistCurrent() else {
+            searchPanel.selectNote(noteURL)
+            return
+        }
+        do {
+            let (record, created) = try vault.openOrCreateNote(matching: target)
+            editor.invalidateNoteRecordsCache()
+            openNote(record.url)
+            if created {
+                let end = editor.nsText.length
+                editor.textView.setSelectedRange(NSRange(location: end, length: 0))
+                editor.status.stringValue = "Created “\(record.title)”"
+                searchPanel.refresh()
+            }
+        } catch {
+            showError(error, in: window)
+        }
+    }
+
     func openNote(_ url: URL) {
         if noteURL == url && !noteConflicted {
             editor.focus()
@@ -626,6 +654,7 @@ import CozyCore
                 updateEditorChrome()
                 editor.focus()
             }
+            editor.invalidateNoteRecordsCache()
             searchPanel.refresh()
             return true
         } catch {
