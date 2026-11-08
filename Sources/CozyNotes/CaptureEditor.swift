@@ -36,16 +36,25 @@ import CozyCore
     var onShowInNoteFind: (() -> Void)?
     var onFindNextInNote: (() -> Void)?
     var onFindPreviousInNote: (() -> Void)?
+    var onToggleOutline: (() -> Void)?
     var placeholder = "Begin a note, paste a clipping, or drop a file…" { didSet { needsDisplay = true } }
     struct FencedBlock {
         let fullRange: NSRange
         let headerRange: NSRange
         let bodyRange: NSRange
     }
-    struct HeadingGutter {
+    struct HeadingGutter: Equatable {
         let range: NSRange
         let label: String
         let level: Int
+        let title: String
+
+        init(range: NSRange, label: String, level: Int, title: String = "") {
+            self.range = range
+            self.label = label
+            self.level = level
+            self.title = title
+        }
     }
     struct BulletItem: Equatable {
         enum Kind: Equatable {
@@ -83,10 +92,10 @@ import CozyCore
     var activeInNoteFindIndex: Int = -1
     var headingGutterItems: [HeadingGutter] = []
     var bulletItems: [BulletItem] = []
+    var externalChangeRanges: [NSRange] = []
     private(set) var foldedSections: [FoldedSection] = []
     private(set) var outlineFoldMode: OutlineFoldMode = .showAll
     private var foldHitTargets: [FoldHitTarget] = []
-
     struct EditRecord {
         let affectedRange: NSRange
         let replacementLength: Int
@@ -161,7 +170,7 @@ import CozyCore
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty else { return }
+        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         guard let layoutManager = layoutManager, let textContainer = textContainer, let storage = textStorage else { return }
         let totalLength = storage.length
         guard totalLength > 0 else { return }
@@ -175,6 +184,33 @@ import CozyCore
         let visStart = visibleChars.location
         let visEnd = NSMaxRange(visibleChars)
 
+        if !externalChangeRanges.isEmpty {
+            for changeRange in externalChangeRanges {
+                if changeRange.location > visEnd { break }
+                guard NSMaxRange(changeRange) >= visStart, NSMaxRange(changeRange) <= totalLength else { continue }
+                if isCharacterFolded(changeRange.location) { continue }
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: changeRange, actualCharacterRange: nil)
+                let raw = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                let bandRect = NSRect(
+                    x: origin.x - 8,
+                    y: origin.y + raw.minY - 1,
+                    width: columnWidth + 16,
+                    height: max(16, raw.height - 2)
+                )
+                let bandPath = NSBezierPath(roundedRect: bandRect, xRadius: 5, yRadius: 5)
+                Theme.sage.withAlphaComponent(0.11).setFill()
+                bandPath.fill()
+                let barRect = NSRect(
+                    x: max(4, origin.x - 10),
+                    y: origin.y + raw.minY + 1,
+                    width: 3,
+                    height: max(12, raw.height - 6)
+                )
+                let barPath = NSBezierPath(roundedRect: barRect, xRadius: 1.5, yRadius: 1.5)
+                Theme.sage.withAlphaComponent(0.85).setFill()
+                barPath.fill()
+            }
+        }
         for block in fencedBlocks {
             if block.fullRange.location > visEnd { break }
             if isCharacterFolded(block.fullRange.location) { continue }
@@ -761,6 +797,9 @@ import CozyCore
             case "[":
                 toggleHeadingFoldAtCursor(self)
                 return true
+            case "\\":
+                onToggleOutline?()
+                return true
             case "]":
                 unfoldHeadingAtCursor(self)
                 return true
@@ -1078,7 +1117,7 @@ import CozyCore
         return false
     }
 
-    private func foldedSection(forHeadingAt headingLocation: Int) -> FoldedSection? {
+    func foldedSection(forHeadingAt headingLocation: Int) -> FoldedSection? {
         guard !foldedSections.isEmpty else { return nil }
         var lo = 0
         var hi = foldedSections.count - 1
@@ -1233,6 +1272,22 @@ import CozyCore
                 hiddenLineCount: s.hiddenLineCount
             )
         }
+    }
+
+    func shiftExternalChangeRanges(for editRange: NSRange, delta: Int) {
+        guard !externalChangeRanges.isEmpty else { return }
+        let editEnd = NSMaxRange(editRange)
+        var updated: [NSRange] = []
+        updated.reserveCapacity(externalChangeRanges.count)
+        for r in externalChangeRanges {
+            if NSMaxRange(r) <= editRange.location {
+                updated.append(r)
+            } else if r.location >= editEnd {
+                let nextLoc = max(0, r.location + delta)
+                updated.append(NSRange(location: nextLoc, length: r.length))
+            }
+        }
+        externalChangeRanges = updated
     }
 
     func toggleFold(forHeadingAt headingLocation: Int) {
@@ -1975,6 +2030,7 @@ import CozyCore
         hasCaretOrigin = false
         minimumOverscrollHeight = 0
         foldedSections.removeAll()
+        externalChangeRanges.removeAll()
         outlineFoldMode = .showAll
         foldHitTargets.removeAll()
         caretLayer.removeAllAnimations()
@@ -2653,6 +2709,310 @@ import CozyCore
     @objc private func closeTapped() { onClose?() }
 }
 
+@MainActor final class DocumentOutlineView: NSView {
+    struct Item: Equatable {
+        let headingLocation: Int
+        let range: NSRange
+        let level: Int
+        let label: String
+        let title: String
+        let isFolded: Bool
+        let hiddenLineCount: Int
+    }
+
+    static let railWidth: CGFloat = 228
+    static let rowHeight: CGFloat = 30
+
+    var items: [Item] = [] {
+        didSet {
+            if items != oldValue {
+                reloadCanvas()
+            }
+        }
+    }
+    var activeIndex: Int = -1 {
+        didSet {
+            if activeIndex != oldValue {
+                canvas.activeIndex = activeIndex
+                scrollActiveRowIntoView()
+            }
+        }
+    }
+    var foldMode: MarkdownTextView.OutlineFoldMode = .showAll {
+        didSet {
+            if foldMode != oldValue {
+                updateFoldButtonTitle()
+            }
+        }
+    }
+    var onSelectItem: ((Int) -> Void)?
+    var onToggleFoldItem: ((Int) -> Void)?
+    var onCycleFoldMode: (() -> Void)?
+    var onClose: (() -> Void)?
+
+    private let headerTitle = Theme.label("OUTLINE", size: 10, color: Theme.subtle)
+    private var foldButton: QuietButton!
+    private var closeButton: QuietButton!
+    private let headerDivider = HairlineView()
+    private let scroll = NSScrollView()
+    private let canvas = OutlineCanvasView(frame: .zero)
+    private let emptyLabel = Theme.label("No headings yet\nUse # to structure sections", size: 11.5, color: Theme.muted)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("Document Outline")
+        headerTitle.font = Theme.monoFont(10, weight: .semibold)
+
+        foldButton = QuietButton(title: "Fold", target: self, action: #selector(cycleFoldTapped))
+        foldButton.font = Theme.monoFont(9.5, weight: .semibold)
+        foldButton.toolTip = "Cycle section folding (Overview / Headings / All)"
+
+        closeButton = QuietButton(symbol: "xmark", target: self, action: #selector(closeTapped))
+        closeButton.toolTip = "Hide Outline (⇧⌘O)"
+        closeButton.setAccessibilityLabel("Hide Outline")
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let headerRow = Theme.stack([headerTitle, spacer, foldButton, closeButton], spacing: 4)
+
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.verticalScroller = CozyScroller()
+        scroll.documentView = canvas
+
+        canvas.onSelectRow = { [weak self] idx in self?.onSelectItem?(idx) }
+        canvas.onToggleFoldRow = { [weak self] idx in self?.onToggleFoldItem?(idx) }
+
+        emptyLabel.alignment = .center
+        emptyLabel.maximumNumberOfLines = 3
+
+        for v in [headerRow, headerDivider, scroll, emptyLabel] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            headerRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            headerRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            headerRow.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            headerRow.heightAnchor.constraint(equalToConstant: 26),
+            headerDivider.leadingAnchor.constraint(equalTo: leadingAnchor),
+            headerDivider.trailingAnchor.constraint(equalTo: trailingAnchor),
+            headerDivider.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 4),
+            headerDivider.heightAnchor.constraint(equalToConstant: 1),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: headerDivider.bottomAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            emptyLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            emptyLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor)
+        ])
+        reloadCanvas()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func layout() {
+        super.layout()
+        updateCanvasFrame()
+    }
+
+    private func updateFoldButtonTitle() {
+        switch foldMode {
+        case .showAll: foldButton.title = "Fold"
+        case .overview: foldButton.title = "Overview"
+        case .headingsOnly: foldButton.title = "Headings"
+        }
+    }
+
+    private func reloadCanvas() {
+        emptyLabel.isHidden = !items.isEmpty
+        foldButton.isEnabled = !items.isEmpty
+        canvas.items = items
+        canvas.activeIndex = activeIndex
+        updateCanvasFrame()
+    }
+
+    private func updateCanvasFrame() {
+        let w = max(160, scroll.contentSize.width)
+        let h = max(scroll.contentSize.height, CGFloat(items.count) * Self.rowHeight + 12)
+        if abs(canvas.frame.width - w) > 0.5 || abs(canvas.frame.height - h) > 0.5 {
+            canvas.frame = NSRect(x: 0, y: 0, width: w, height: h)
+        }
+        canvas.needsDisplay = true
+    }
+
+    private func scrollActiveRowIntoView() {
+        guard items.indices.contains(activeIndex) else { return }
+        let rowRect = canvas.rectForRow(activeIndex).insetBy(dx: 0, dy: -8)
+        canvas.scrollToVisible(rowRect)
+    }
+
+    @objc private func cycleFoldTapped() { onCycleFoldMode?() }
+    @objc private func closeTapped() { onClose?() }
+
+    @MainActor private final class OutlineCanvasView: NSView {
+        var items: [Item] = [] { didSet { needsDisplay = true } }
+        var activeIndex: Int = -1 { didSet { needsDisplay = true } }
+        var hoveredIndex: Int = -1 { didSet { if hoveredIndex != oldValue { needsDisplay = true } } }
+        var onSelectRow: ((Int) -> Void)?
+        var onToggleFoldRow: ((Int) -> Void)?
+        private var tracking: NSTrackingArea?
+
+        override var isFlipped: Bool { true }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let tracking { removeTrackingArea(tracking) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            )
+            addTrackingArea(area)
+            tracking = area
+        }
+
+        func rectForRow(_ index: Int) -> NSRect {
+            NSRect(
+                x: 6,
+                y: 6 + CGFloat(index) * DocumentOutlineView.rowHeight,
+                width: max(0, bounds.width - 12),
+                height: DocumentOutlineView.rowHeight - 2
+            )
+        }
+
+        private func rowIndex(at pt: NSPoint) -> Int? {
+            let idx = Int(floor((pt.y - 6) / DocumentOutlineView.rowHeight))
+            guard items.indices.contains(idx) else { return nil }
+            return idx
+        }
+
+        override func mouseMoved(with event: NSEvent) {
+            let pt = convert(event.locationInWindow, from: nil)
+            hoveredIndex = rowIndex(at: pt) ?? -1
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            hoveredIndex = -1
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            let pt = convert(event.locationInWindow, from: nil)
+            guard let idx = rowIndex(at: pt) else { return }
+            let minLevel = items.map(\.level).min() ?? 1
+            let indent = CGFloat(min(items[idx].level - minLevel, 5)) * 11
+            let chevronMaxX = 12 + indent + 20
+            if event.modifierFlags.contains(.option) || pt.x <= chevronMaxX {
+                onToggleFoldRow?(idx)
+            } else {
+                onSelectRow?(idx)
+            }
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            guard !items.isEmpty else { return }
+            let minLevel = items.map(\.level).min() ?? 1
+            for (idx, item) in items.enumerated() {
+                let rowRect = rectForRow(idx)
+                guard rowRect.intersects(dirtyRect) else { continue }
+                let isActive = (idx == activeIndex)
+                let isHover = (idx == hoveredIndex)
+                if isActive {
+                    let bg = NSBezierPath(roundedRect: rowRect, xRadius: 6, yRadius: 6)
+                    Theme.accentSoft.withAlphaComponent(0.85).setFill()
+                    bg.fill()
+                    let bar = NSBezierPath(
+                        roundedRect: NSRect(x: rowRect.minX + 2, y: rowRect.minY + 5, width: 2.5, height: max(8, rowRect.height - 10)),
+                        xRadius: 1.25,
+                        yRadius: 1.25
+                    )
+                    Theme.accent.setFill()
+                    bar.fill()
+                } else if isHover {
+                    let bg = NSBezierPath(roundedRect: rowRect, xRadius: 6, yRadius: 6)
+                    Theme.elevated.withAlphaComponent(0.75).setFill()
+                    bg.fill()
+                }
+
+                let indent = CGFloat(min(item.level - minLevel, 5)) * 11
+                var cursorX = rowRect.minX + 8 + indent
+                let chevron = (item.isFolded ? "▸" : "▾") as NSString
+                let chevronAttrs: [NSAttributedString.Key: Any] = [
+                    .font: Theme.monoFont(9.5, weight: .bold),
+                    .foregroundColor: item.isFolded ? Theme.accent : Theme.subtle
+                ]
+                let chevronSize = chevron.size(withAttributes: chevronAttrs)
+                chevron.draw(
+                    at: NSPoint(x: cursorX, y: rowRect.minY + (rowRect.height - chevronSize.height) / 2),
+                    withAttributes: chevronAttrs
+                )
+                cursorX += 11
+
+                let badge = item.label as NSString
+                let badgeAttrs: [NSAttributedString.Key: Any] = [
+                    .font: Theme.monoFont(9, weight: .semibold),
+                    .foregroundColor: isActive ? Theme.accent : Theme.subtle
+                ]
+                let badgeSize = badge.size(withAttributes: badgeAttrs)
+                badge.draw(
+                    at: NSPoint(x: cursorX, y: rowRect.minY + (rowRect.height - badgeSize.height) / 2),
+                    withAttributes: badgeAttrs
+                )
+                cursorX += badgeSize.width + 6
+
+                var rightLimit = rowRect.maxX - 8
+                if item.isFolded && item.hiddenLineCount > 0 {
+                    let pillStr = "⋯\(item.hiddenLineCount)" as NSString
+                    let pillAttrs: [NSAttributedString.Key: Any] = [
+                        .font: Theme.monoFont(9, weight: .semibold),
+                        .foregroundColor: Theme.muted
+                    ]
+                    let pillSize = pillStr.size(withAttributes: pillAttrs)
+                    let pillRect = NSRect(
+                        x: rightLimit - pillSize.width - 8,
+                        y: rowRect.minY + (rowRect.height - pillSize.height) / 2 - 1,
+                        width: pillSize.width + 8,
+                        height: pillSize.height + 2
+                    )
+                    let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 4, yRadius: 4)
+                    Theme.elevated.setFill()
+                    pillPath.fill()
+                    pillStr.draw(at: NSPoint(x: pillRect.minX + 4, y: pillRect.minY + 1), withAttributes: pillAttrs)
+                    rightLimit = pillRect.minX - 6
+                }
+
+                let titleWidth = max(20, rightLimit - cursorX)
+                let pStyle = NSMutableParagraphStyle()
+                pStyle.lineBreakMode = .byTruncatingTail
+                let titleFont = NSFont.systemFont(
+                    ofSize: item.level == 1 ? 12.5 : 12.0,
+                    weight: isActive || item.level == 1 ? .semibold : .regular
+                )
+                let titleAttrs: [NSAttributedString.Key: Any] = [
+                    .font: titleFont,
+                    .foregroundColor: isActive ? Theme.headingInk : Theme.ink,
+                    .paragraphStyle: pStyle
+                ]
+                let displayTitle = (item.title.isEmpty ? "Untitled section" : item.title) as NSString
+                let titleHeight = ceil(titleFont.ascender - titleFont.descender) + 2
+                displayTitle.draw(
+                    in: NSRect(
+                        x: cursorX,
+                        y: rowRect.minY + (rowRect.height - titleHeight) / 2,
+                        width: titleWidth,
+                        height: titleHeight
+                    ),
+                    withAttributes: titleAttrs
+                )
+            }
+        }
+    }
+}
+
 @MainActor final class CaptureEditor: NSView, NSTextViewDelegate {
     override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     let textView = MarkdownTextView()
@@ -2666,6 +3026,7 @@ import CozyCore
     var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
     var onOpenCurrentNoteInNewWindow: (() -> Void)?
     var onQuickSwitcher: (() -> Void)?
+    var onOutlineVisibilityChange: ((Bool) -> Void)?
     var noteRecordsProvider: (() -> [NoteRecord])?
     var currentNoteURLProvider: (() -> URL?)?
     var compactLayout = false { didSet { needsLayout = true } }
@@ -2702,6 +3063,13 @@ import CozyCore
     private var lastCursorLine = NSRange(location: NSNotFound, length: 0)
     private let wikiCompletionView = WikiLinkCompletionView(frame: .zero)
     let inNoteFindBar = InNoteFindBar(frame: .zero)
+    let outlineView = DocumentOutlineView(frame: .zero)
+    private let outlineDivider = HairlineView()
+    private var scrollTrailingToEditorConstraint: NSLayoutConstraint?
+    private var scrollTrailingToOutlineConstraint: NSLayoutConstraint?
+    private(set) var isOutlineVisible = false
+    var outlineItems: [DocumentOutlineView.Item] { outlineView.items }
+    var activeOutlineIndex: Int { outlineView.activeIndex }
     var isInNoteFindVisible: Bool { !inNoteFindBar.isHidden }
     var inNoteFindQuery: String {
         get { inNoteFindBar.query }
@@ -2771,7 +3139,10 @@ import CozyCore
         textView.onFiles = { [weak self] in self?.addAttachments($0) }
         textView.onClipboardImage = { [weak self] in self?.addClipboardImage($0) }
         textView.onFocusChange = { [weak self] in self?.handleFocusChange() }
-        textView.onFoldStatusChange = { [weak self] msg in self?.status.stringValue = msg }
+        textView.onFoldStatusChange = { [weak self] msg in
+            self?.status.stringValue = msg
+            self?.refreshOutline()
+        }
         textView.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
         textView.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
         textView.onOpenCurrentNoteInNewWindow = { [weak self] in self?.onOpenCurrentNoteInNewWindow?() }
@@ -2780,11 +3151,21 @@ import CozyCore
         textView.onShowInNoteFind = { [weak self] in self?.showInNoteFind() }
         textView.onFindNextInNote = { [weak self] in self?.findNextInNote() }
         textView.onFindPreviousInNote = { [weak self] in self?.findPreviousInNote() }
+        textView.onToggleOutline = { [weak self] in self?.toggleOutline() }
         inNoteFindBar.isHidden = true
         inNoteFindBar.onQueryChange = { [weak self] _ in self?.updateInNoteFindMatches(scrollToMatch: true) }
         inNoteFindBar.onNext = { [weak self] in self?.findNextInNote() }
         inNoteFindBar.onPrevious = { [weak self] in self?.findPreviousInNote() }
         inNoteFindBar.onClose = { [weak self] in self?.hideInNoteFind() }
+        outlineView.isHidden = true
+        outlineDivider.isHidden = true
+        outlineView.onSelectItem = { [weak self] idx in self?.jumpToHeading(at: idx) }
+        outlineView.onToggleFoldItem = { [weak self] idx in self?.toggleFoldForOutlineItem(at: idx) }
+        outlineView.onCycleFoldMode = { [weak self] in
+            self?.textView.cycleOutlineFolding(nil)
+            self?.refreshOutline()
+        }
+        outlineView.onClose = { [weak self] in self?.setOutlineVisible(false) }
         textView.onWikiAutocompleteCommand = { [weak self] selector in
             self?.handleWikiAutocompleteCommand(selector) ?? false
         }
@@ -2827,7 +3208,7 @@ import CozyCore
         footer.spacing = 10
         for item in [add, status, spacer, wordCount] { footer.addArrangedSubview(item) }
 
-        for view in [scroll, attachmentScroll, footerRule, footer, inNoteFindBar] {
+        for view in [scroll, outlineDivider, outlineView, attachmentScroll, footerRule, footer, inNoteFindBar] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
@@ -2838,18 +3219,30 @@ import CozyCore
         let footTrail = footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -36)
         let attachHeight = attachmentScroll.heightAnchor.constraint(equalToConstant: 0)
         let attachBottom = attachmentScroll.bottomAnchor.constraint(equalTo: footerRule.topAnchor, constant: 0)
+        let scrollTrailEditor = scroll.trailingAnchor.constraint(equalTo: trailingAnchor)
+        let scrollTrailOutline = scroll.trailingAnchor.constraint(equalTo: outlineDivider.leadingAnchor)
         attachmentLeading = attachLead
         attachmentTrailing = attachTrail
         attachmentHeight = attachHeight
         attachmentBottom = attachBottom
         footerLeading = footLead
         footerTrailing = footTrail
+        scrollTrailingToEditorConstraint = scrollTrailEditor
+        scrollTrailingToOutlineConstraint = scrollTrailOutline
 
         NSLayoutConstraint.activate([
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollTrailEditor,
             scroll.topAnchor.constraint(equalTo: topAnchor),
             scroll.bottomAnchor.constraint(equalTo: attachmentScroll.topAnchor, constant: -4),
+            outlineDivider.topAnchor.constraint(equalTo: topAnchor),
+            outlineDivider.bottomAnchor.constraint(equalTo: footerRule.topAnchor),
+            outlineDivider.widthAnchor.constraint(equalToConstant: 1),
+            outlineDivider.trailingAnchor.constraint(equalTo: outlineView.leadingAnchor),
+            outlineView.topAnchor.constraint(equalTo: topAnchor),
+            outlineView.bottomAnchor.constraint(equalTo: footerRule.topAnchor),
+            outlineView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            outlineView.widthAnchor.constraint(equalToConstant: DocumentOutlineView.railWidth),
             attachLead,
             attachTrail,
             attachHeight,
@@ -2862,7 +3255,7 @@ import CozyCore
             footTrail,
             footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             inNoteFindBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            inNoteFindBar.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            inNoteFindBar.trailingAnchor.constraint(equalTo: scroll.trailingAnchor, constant: -24),
             inNoteFindBar.leadingAnchor.constraint(greaterThanOrEqualTo: footer.leadingAnchor),
             inNoteFindBar.widthAnchor.constraint(lessThanOrEqualToConstant: 380),
             inNoteFindBar.heightAnchor.constraint(equalToConstant: 40),
@@ -3006,6 +3399,9 @@ import CozyCore
                 if isInNoteFindVisible {
                     updateInNoteFindMatches(scrollToMatch: false)
                 }
+                if isOutlineVisible {
+                    refreshOutline()
+                }
             }
         }
     }
@@ -3037,6 +3433,9 @@ import CozyCore
             let edit = textView.pendingEdit
             textView.pendingEdit = nil
             let didTouchAttributes: Bool
+            if let edit {
+                textView.shiftExternalChangeRanges(for: edit.affectedRange, delta: edit.delta)
+            }
             if let edit, !edit.requiresFullFormat {
                 didTouchAttributes = formatIncrementalEdit(edit)
             } else {
@@ -3065,6 +3464,9 @@ import CozyCore
             if isInNoteFindVisible {
                 updateInNoteFindMatches(scrollToMatch: false)
             }
+            if isOutlineVisible {
+                refreshOutline()
+            }
             onChange?()
         }
     }
@@ -3083,6 +3485,9 @@ import CozyCore
         }
         let clamped = NSRange(location: min(sel.location, ns.length), length: 0)
         let line = ns.lineRange(for: clamped)
+        if isOutlineVisible {
+            updateActiveOutlineHeading()
+        }
         guard line != lastCursorLine else { return }
         let prevLine = lastCursorLine
         lastCursorLine = line
@@ -3248,6 +3653,196 @@ import CozyCore
         cachedAutocompleteNotes = nil
     }
 
+
+    @objc func toggleOutline() {
+        setOutlineVisible(!isOutlineVisible)
+    }
+
+    func setOutlineVisible(_ visible: Bool) {
+        guard isOutlineVisible != visible else { return }
+        isOutlineVisible = visible
+        outlineView.isHidden = !visible
+        outlineDivider.isHidden = !visible
+        scrollTrailingToEditorConstraint?.isActive = !visible
+        scrollTrailingToOutlineConstraint?.isActive = visible
+        if visible {
+            refreshOutline()
+        }
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        onOutlineVisibilityChange?(visible)
+    }
+
+    func refreshOutline() {
+        let ns = nsText
+        let totalLen = ns.length
+        var items: [DocumentOutlineView.Item] = []
+        items.reserveCapacity(textView.headingGutterItems.count)
+        for h in textView.headingGutterItems {
+            let resolvedTitle: String
+            if !h.title.isEmpty {
+                resolvedTitle = h.title
+            } else if NSMaxRange(h.range) <= totalLen {
+                resolvedTitle = Vault.title(from: ns.substring(with: h.range))
+            } else {
+                resolvedTitle = ""
+            }
+            let fold = textView.foldedSection(forHeadingAt: h.range.location)
+            items.append(DocumentOutlineView.Item(
+                headingLocation: h.range.location,
+                range: h.range,
+                level: h.level,
+                label: h.label,
+                title: resolvedTitle,
+                isFolded: fold != nil,
+                hiddenLineCount: fold?.hiddenLineCount ?? 0
+            ))
+        }
+        outlineView.items = items
+        outlineView.foldMode = textView.outlineFoldMode
+        updateActiveOutlineHeading()
+    }
+
+    func updateActiveOutlineHeading() {
+        let headings = textView.headingGutterItems
+        guard !headings.isEmpty else {
+            outlineView.activeIndex = -1
+            return
+        }
+        let cursorLoc = textView.selectedRange().location
+        if let idx = headings.lastIndex(where: { $0.range.location <= cursorLoc }) {
+            outlineView.activeIndex = idx
+        } else {
+            outlineView.activeIndex = 0
+        }
+    }
+
+    func jumpToHeading(at index: Int) {
+        guard textView.headingGutterItems.indices.contains(index) else { return }
+        let heading = textView.headingGutterItems[index]
+        if textView.isCharacterFolded(heading.range.location) {
+            textView.unfoldSectionsIntersecting(heading.range)
+        }
+        let targetLoc = min(nsText.length, NSMaxRange(heading.range))
+        textView.setSelectedRange(NSRange(location: targetLoc, length: 0))
+        if let lm = textView.layoutManager, let tc = textView.textContainer {
+            lm.ensureLayout(forCharacterRange: heading.range)
+            let glyphRange = lm.glyphRange(forCharacterRange: heading.range, actualCharacterRange: nil)
+            let box = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
+            let clipView = scroll.contentView
+            let visHeight = clipView.bounds.height
+            let targetY = max(0, round(box.minY + textView.textContainerOrigin.y - max(24, visHeight * 0.16)))
+            textView.cancelScrollSpring()
+            clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
+            scroll.reflectScrolledClipView(clipView)
+        }
+        textView.updateCaret(animated: false)
+        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        refreshOutline()
+        focus()
+    }
+
+    func toggleFoldForOutlineItem(at index: Int) {
+        guard textView.headingGutterItems.indices.contains(index) else { return }
+        let heading = textView.headingGutterItems[index]
+        textView.toggleFold(forHeadingAt: heading.range.location)
+        refreshOutline()
+    }
+
+    func clearExternalChangeHighlights() {
+        guard !textView.externalChangeRanges.isEmpty else { return }
+        textView.externalChangeRanges.removeAll()
+        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+    }
+
+    @discardableResult
+    func applyExternalReload(_ newText: String, previousText: String, highlightChanges: Bool = true) -> Int {
+        let clipView = scroll.contentView
+        let savedOriginY = clipView.bounds.origin.y
+        var anchorChar: Int?
+        if savedOriginY > 40, let lm = textView.layoutManager, let tc = textView.textContainer, let storage = textView.textStorage, storage.length > 0 {
+            let visRect = clipView.documentVisibleRect.offsetBy(dx: -textView.textContainerOrigin.x, dy: -textView.textContainerOrigin.y)
+            let visGlyphs = lm.glyphRange(forBoundingRectWithoutAdditionalLayout: visRect, in: tc)
+            if visGlyphs.length > 0 {
+                anchorChar = lm.characterIndexForGlyph(at: visGlyphs.location)
+            }
+        }
+        let changedRanges = highlightChanges ? Self.changedLineRanges(from: previousText, to: newText) : []
+        self.text = newText
+        textView.externalChangeRanges = changedRanges
+        if let anchorChar, let lm = textView.layoutManager, let tc = textView.textContainer, let storage = textView.textStorage, storage.length > 0 {
+            let ns = storage.mutableString as NSString
+            let clampedAnchor = min(anchorChar, ns.length - 1)
+            let start = max(0, clampedAnchor - 600)
+            let end = min(ns.length, clampedAnchor + 2400)
+            let windowRange = ns.lineRange(for: NSRange(location: start, length: end - start))
+            lm.ensureLayout(forCharacterRange: windowRange)
+            let glyphIdx = lm.glyphIndexForCharacter(at: clampedAnchor)
+            let rect = lm.boundingRect(forGlyphRange: NSRange(location: glyphIdx, length: 0), in: tc)
+            let targetY = max(0, rect.minY + textView.textContainerOrigin.y)
+            clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
+            scroll.reflectScrolledClipView(clipView)
+        }
+        if isOutlineVisible {
+            refreshOutline()
+        }
+        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        return changedRanges.count
+    }
+
+    static func changedLineRanges(from oldText: String, to newText: String) -> [NSRange] {
+        guard oldText != newText, !newText.isEmpty else { return [] }
+        let oldLines = oldText.components(separatedBy: "\n")
+        let newLines = newText.components(separatedBy: "\n")
+        var lineRanges: [NSRange] = []
+        lineRanges.reserveCapacity(newLines.count)
+        var utf16Cursor = 0
+        for (idx, line) in newLines.enumerated() {
+            let len = (line as NSString).length
+            let newlineLen = idx + 1 < newLines.count ? 1 : 0
+            lineRanges.append(NSRange(location: utf16Cursor, length: len + newlineLen))
+            utf16Cursor += len + newlineLen
+        }
+        var prefix = 0
+        let minCount = min(oldLines.count, newLines.count)
+        while prefix < minCount && oldLines[prefix] == newLines[prefix] {
+            prefix += 1
+        }
+        var oldSuffix = oldLines.count
+        var newSuffix = newLines.count
+        while oldSuffix > prefix && newSuffix > prefix && oldLines[oldSuffix - 1] == newLines[newSuffix - 1] {
+            oldSuffix -= 1
+            newSuffix -= 1
+        }
+        var changedIndices = IndexSet()
+        let middleOldCount = oldSuffix - prefix
+        let middleNewCount = newSuffix - prefix
+        if middleNewCount > 0 {
+            if middleOldCount + middleNewCount <= 4_000 {
+                let oldSlice = Array(oldLines[prefix..<oldSuffix])
+                let newSlice = Array(newLines[prefix..<newSuffix])
+                for change in newSlice.difference(from: oldSlice) {
+                    if case let .insert(offset, _, _) = change {
+                        changedIndices.insert(prefix + offset)
+                    }
+                }
+            } else {
+                changedIndices.insert(integersIn: prefix..<newSuffix)
+            }
+        }
+        var merged: [NSRange] = []
+        for idx in changedIndices {
+            guard lineRanges.indices.contains(idx) else { continue }
+            let r = lineRanges[idx]
+            guard r.length > 0 else { continue }
+            if let last = merged.last, NSMaxRange(last) == r.location {
+                merged[merged.count - 1] = NSRange(location: last.location, length: last.length + r.length)
+            } else {
+                merged.append(r)
+            }
+        }
+        return merged
+    }
     @objc func showInNoteFind() {
         let sel = textView.selectedRange()
         if sel.length > 0 && sel.length <= 80, NSMaxRange(sel) <= nsText.length {
@@ -3861,7 +4456,8 @@ import CozyCore
                     textView.headingGutterItems[i] = MarkdownTextView.HeadingGutter(
                         range: NSRange(location: r.location + delta, length: r.length),
                         label: textView.headingGutterItems[i].label,
-                        level: textView.headingGutterItems[i].level
+                        level: textView.headingGutterItems[i].level,
+                        title: textView.headingGutterItems[i].title
                     )
                 }
                 for i in textView.blockquoteRanges.indices where textView.blockquoteRanges[i].location >= shiftStart {
@@ -3918,7 +4514,8 @@ import CozyCore
                 updatedHeadings.append(MarkdownTextView.HeadingGutter(
                     range: NSRange(location: item.range.location + delta, length: item.range.length),
                     label: item.label,
-                    level: item.level
+                    level: item.level,
+                    title: item.title
                 ))
             }
         }
@@ -4153,7 +4750,19 @@ import CozyCore
             }
         }
 
-        if !parsedFences.isEmpty && !wikiLinks.isEmpty {
+        if !parsedFences.isEmpty {
+            headings.removeAll { item in
+                parsedFences.contains { NSIntersectionRange($0.fullRange, item.range).length > 0 }
+            }
+            bullets.removeAll { item in
+                parsedFences.contains { NSIntersectionRange($0.fullRange, item.lineRange).length > 0 }
+            }
+            quotes.removeAll { r in
+                parsedFences.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
+            }
+            inlinePills.removeAll { r in
+                parsedFences.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
+            }
             wikiLinks.removeAll { link in
                 parsedFences.contains { NSIntersectionRange($0.fullRange, link.fullRange).length > 0 }
             }
@@ -4432,7 +5041,8 @@ import CozyCore
                     let titleRange = NSRange(location: lineRange.location + h + 1, length: contentEnd - (lineRange.location + h + 1))
                     let prefixRange = NSRange(location: hashes.location, length: min(totalLen - hashes.location, h + 1))
                     let level = h
-                    headings.append(MarkdownTextView.HeadingGutter(range: matchRange, label: "H\(level)", level: level))
+                    let headingTitle = ns.substring(with: titleRange).trimmingCharacters(in: .whitespacesAndNewlines)
+                    headings.append(MarkdownTextView.HeadingGutter(range: matchRange, label: "H\(level)", level: level, title: headingTitle))
                     let headingFont = Theme.headingFont(level: level)
                     let headingParagraph = NSMutableParagraphStyle()
                     let headingKern: CGFloat
