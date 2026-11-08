@@ -48,27 +48,58 @@ public struct SearchSnapshot: Sendable {
     }
 
     public func search(_ query: String) -> [SearchHit] {
-        let terms = query.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        var hits: [SearchHit] = []
-        for entry in entries {
-            if terms.isEmpty {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let terms = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        if terms.isEmpty {
+            var hits: [SearchHit] = []
+            hits.reserveCapacity(entries.count)
+            for entry in entries {
                 let page = entry.pages.first
                 let snippet = Self.snippet(page?.text ?? entry.source.detail, terms: [])
                 hits.append(SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page?.number))
-                continue
             }
+            return hits
+        }
+
+        var scored: [(score: Int, order: Int, hit: SearchHit)] = []
+        for entry in entries {
+            let score = Self.titleScore(for: entry.source, query: trimmed, terms: terms)
             var matched = false
             for page in entry.pages where Self.matches(page.text, terms: terms) {
                 let snippet = Self.snippet(page.text, terms: terms)
-                hits.append(SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page.number))
+                let hit = SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page.number)
+                scored.append((score, scored.count, hit))
                 matched = true
             }
-            if !matched && Self.matches(entry.source.relativePath, terms: terms) {
-                let snippet = Self.snippet(entry.source.relativePath, terms: terms)
-                hits.append(SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: nil))
+            if !matched && (Self.matches(entry.source.title, terms: terms) || Self.matches(entry.source.relativePath, terms: terms)) {
+                let targetText = Self.matches(entry.source.title, terms: terms) ? entry.source.title : entry.source.relativePath
+                let snippet = Self.snippet(targetText, terms: terms)
+                let hit = SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: nil)
+                scored.append((score, scored.count, hit))
             }
         }
-        return hits
+        scored.sort { a, b in
+            if a.score != b.score { return a.score > b.score }
+            return a.order < b.order
+        }
+        return scored.map(\.hit)
+    }
+
+    private static func titleScore(for source: SearchSource, query: String, terms: [String]) -> Int {
+        let kindBonus = source.kind == .note ? 10 : 0
+        if source.title.caseInsensitiveCompare(query) == .orderedSame {
+            return 400 + kindBonus
+        }
+        if source.title.lowercased().hasPrefix(query.lowercased()) {
+            return 300 + kindBonus
+        }
+        if matches(source.title, terms: terms) {
+            return 200 + kindBonus
+        }
+        if terms.contains(where: { source.title.range(of: $0, options: .caseInsensitive) != nil }) {
+            return 100 + kindBonus
+        }
+        return kindBonus
     }
 
     private static func matches(_ text: String, terms: [String]) -> Bool {
