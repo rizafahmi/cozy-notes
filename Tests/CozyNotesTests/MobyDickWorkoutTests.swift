@@ -1241,5 +1241,113 @@ struct MobyDickWorkoutSuite {
         #expect(delegate.workspaces.count == 1)
         #expect(delegate.workspace === primaryWS)
     }
+
+    @Test("Markdown pipe tables align columns horizontally, indent wrapped multi-line cells under their column, collapse delimiter rows, and draw per-fragment inline code pills")
+    @MainActor
+    func markdownTableRenderingAndAlignment() throws {
+        _ = NSApplication.shared
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 760, height: 540))
+        editor.layoutSubtreeIfNeeded()
+        let markdown = """
+        ## Diagnosa skrip DB (sebelum)
+
+        | Script | Masalah |
+        |--------|---------|
+        | `db:migrate` (`migration up`) | Hanya DB **local** Docker; sering dikira apply ke production |
+        | `db:migrate:remote` / `--linked` | **Tidak didukung** CLI stabil untuk `migration up` |
+        | `db:push` vs `db:push:remote` | Duplikatif / membingungkan; cukup `db:push` setelah link |
+        | `db:types` | Gagal diam-diam tanpa project id / token; tidak ada jalur `--local` |
+        | Tidak ada preflight | User tidak tahu Docker / link / env kurang |
+        """
+        editor.text = markdown
+        let textView = editor.textView
+        #expect(textView.tableBlocks.count == 1)
+        let table = try #require(textView.tableBlocks.first)
+        #expect(table.rows.count == 7)
+        #expect(table.columnDividerOffsets.count == 1)
+
+        let lm = try #require(textView.layoutManager)
+        let tc = try #require(textView.textContainer)
+        lm.ensureLayout(for: tc)
+        let ns = editor.nsText
+
+        func glyphMinX(for substring: String) throws -> CGFloat {
+            let r = ns.range(of: substring)
+            #expect(r.location != NSNotFound)
+            let g = lm.glyphIndexForCharacter(at: r.location)
+            return lm.boundingRect(forGlyphRange: NSRange(location: g, length: 1), in: tc).minX
+        }
+
+        // Column 1 ("Masalah") cells across header and all 5 data rows must start at the same X coordinate
+        let headerCol1X = try glyphMinX(for: "Masalah")
+        let row1Col1X = try glyphMinX(for: "Hanya DB")
+        let row2Col1X = try glyphMinX(for: "Tidak didukung")
+        let row3Col1X = try glyphMinX(for: "Duplikatif")
+        let row4Col1X = try glyphMinX(for: "Gagal diam-diam")
+        let row5Col1X = try glyphMinX(for: "User tidak tahu")
+
+        #expect(abs(row1Col1X - headerCol1X) <= 1.5)
+        #expect(abs(row2Col1X - headerCol1X) <= 1.5)
+        #expect(abs(row3Col1X - headerCol1X) <= 1.5)
+        #expect(abs(row4Col1X - headerCol1X) <= 1.5)
+        #expect(abs(row5Col1X - headerCol1X) <= 1.5)
+
+        // Wrapped continuation line in Column 1 must indent under Column 1 rather than wrapping to x = 0
+        let prodRange = ns.range(of: "production")
+        let prodGlyph = lm.glyphIndexForCharacter(at: prodRange.location)
+        var wrappedLineGlyphRange = NSRange(location: 0, length: 0)
+        _ = lm.lineFragmentUsedRect(forGlyphAt: prodGlyph, effectiveRange: &wrappedLineGlyphRange)
+        let wrappedFirstGlyphX = lm.boundingRect(forGlyphRange: NSRange(location: wrappedLineGlyphRange.location, length: 1), in: tc).minX
+        #expect(abs(wrappedFirstGlyphX - headerCol1X) <= 1.5)
+
+        let hostWin = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        let bgView = PaperSurface(cornerRadius: 0, color: Theme.paper, bordered: false)
+        Theme.fill(editor, in: bgView)
+        hostWin.contentView = bgView
+        for appName in [NSAppearance.Name.darkAqua, NSAppearance.Name.aqua] {
+            hostWin.appearance = NSAppearance(named: appName)
+            editor.refreshTypography()
+            bgView.layoutSubtreeIfNeeded()
+            let rep = try #require(bgView.bitmapImageRepForCachingDisplay(in: bgView.bounds))
+            bgView.cacheDisplay(in: bgView.bounds, to: rep)
+            #expect(rep.pixelsWide > 0 && rep.pixelsHigh > 0)
+        }
+
+        // Delimiter row (|--------|---------|) must be collapsed when unfocused
+        let delimGlyphs = lm.glyphRange(forCharacterRange: table.delimiterRange, actualCharacterRange: nil)
+        let delimRect = lm.boundingRect(forGlyphRange: delimGlyphs, in: tc)
+        #expect(delimRect.height <= 3.0)
+
+        // Per-fragment inline code pill rects must stay tight around each code token rather than spanning full column width
+        for inner in textView.inlineCodeRanges {
+            let gr = lm.glyphRange(forCharacterRange: inner, actualCharacterRange: nil)
+            var gIdx = gr.location
+            while gIdx < NSMaxRange(gr) {
+                var lineGR = NSRange(location: 0, length: 0)
+                _ = lm.lineFragmentRect(forGlyphAt: gIdx, effectiveRange: &lineGR)
+                let sub = NSIntersectionRange(gr, lineGR)
+                let rect = lm.boundingRect(forGlyphRange: sub, in: tc)
+                #expect(rect.width < 180.0)
+                gIdx = max(gIdx + 1, NSMaxRange(lineGR))
+            }
+        }
+
+        // Wide 4-column table in a narrow editor falls back cleanly without overflowing vertical column dividers
+        let narrowEditor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 380, height: 420))
+        narrowEditor.compactLayout = true
+        narrowEditor.layoutSubtreeIfNeeded()
+        narrowEditor.text = """
+        | Component | Responsibility | Failure Mode | Mitigation Strategy |
+        |-----------|----------------|--------------|---------------------|
+        | Migration Runner | Applies SQL schema migrations | Silent failure without token | Add preflight verification |
+        """
+        let narrowTable = try #require(narrowEditor.textView.tableBlocks.first)
+        #expect(narrowTable.columnDividerOffsets.isEmpty, "Wide multi-column table exceeding narrow width must omit vertical dividers rather than overflowing across them")
+    }
 }
 #endif

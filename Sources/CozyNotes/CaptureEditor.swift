@@ -43,6 +43,19 @@ import CozyCore
         let headerRange: NSRange
         let bodyRange: NSRange
     }
+    struct TableRowItem: Equatable {
+        let lineRange: NSRange
+        let fullLineRange: NSRange
+        let isHeader: Bool
+        let isDelimiter: Bool
+    }
+    struct TableBlock: Equatable {
+        let fullRange: NSRange
+        let headerRange: NSRange
+        let delimiterRange: NSRange
+        let rows: [TableRowItem]
+        let columnDividerOffsets: [CGFloat]
+    }
     struct HeadingGutter: Equatable {
         let range: NSRange
         let label: String
@@ -86,6 +99,7 @@ import CozyCore
 
     var blockquoteRanges: [NSRange] = []
     var fencedBlocks: [FencedBlock] = []
+    var tableBlocks: [TableBlock] = []
     var inlineCodeRanges: [NSRange] = []
     var wikiLinkItems: [WikiLink] = []
     var inNoteFindRanges: [NSRange] = []
@@ -170,7 +184,7 @@ import CozyCore
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard !fencedBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
+        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         guard let layoutManager = layoutManager, let textContainer = textContainer, let storage = textStorage else { return }
         let totalLength = storage.length
         guard totalLength > 0 else { return }
@@ -236,6 +250,64 @@ import CozyCore
             NSRect(x: box.minX, y: box.minY, width: box.width, height: headerHeight).fill()
             Theme.codeBorder.setFill()
             NSRect(x: box.minX, y: dividerY, width: box.width, height: 1).fill()
+            NSGraphicsContext.restoreGraphicsState()
+
+            Theme.codeBorder.setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+        for table in tableBlocks {
+            if table.fullRange.location > visEnd { break }
+            if isCharacterFolded(table.fullRange.location) { continue }
+            guard NSMaxRange(table.fullRange) >= visStart,
+                  NSMaxRange(table.fullRange) <= totalLength,
+                  NSMaxRange(table.headerRange) <= totalLength else { continue }
+            let fullGlyphs = layoutManager.glyphRange(forCharacterRange: table.fullRange, actualCharacterRange: nil)
+            let fullRect = layoutManager.boundingRect(forGlyphRange: fullGlyphs, in: textContainer)
+            let headerGlyphs = layoutManager.glyphRange(forCharacterRange: table.headerRange, actualCharacterRange: nil)
+            let headerRect = layoutManager.boundingRect(forGlyphRange: headerGlyphs, in: textContainer)
+            let topY = round(origin.y + fullRect.minY - 6)
+            let bottomY = round(origin.y + fullRect.maxY + 4)
+            let headerBottomY = round(origin.y + headerRect.maxY + 2)
+            let box = NSRect(x: origin.x, y: topY, width: columnWidth, height: max(32, bottomY - topY))
+
+            let path = NSBezierPath(roundedRect: box, xRadius: 8, yRadius: 8)
+            Theme.codeBackground.setFill()
+            path.fill()
+
+            NSGraphicsContext.saveGraphicsState()
+            path.addClip()
+            Theme.codeHeaderFill.setFill()
+            NSRect(x: box.minX, y: box.minY, width: box.width, height: max(22, headerBottomY - box.minY)).fill()
+
+            var dataIdx = 0
+            for row in table.rows where !row.isHeader && !row.isDelimiter {
+                guard NSMaxRange(row.lineRange) <= totalLength else { continue }
+                let rowGlyphs = layoutManager.glyphRange(forCharacterRange: row.lineRange, actualCharacterRange: nil)
+                let rowRect = layoutManager.boundingRect(forGlyphRange: rowGlyphs, in: textContainer)
+                let rowTop = dataIdx == 0 ? headerBottomY : round(origin.y + rowRect.minY - 5)
+                let rowBottom = round(origin.y + rowRect.maxY + 2)
+                if dataIdx % 2 == 1 {
+                    Theme.elevated.withAlphaComponent(0.32).setFill()
+                    NSRect(x: box.minX, y: rowTop, width: box.width, height: max(0, rowBottom - rowTop)).fill()
+                }
+                if dataIdx > 0 {
+                    Theme.codeBorder.withAlphaComponent(0.6).setFill()
+                    NSRect(x: box.minX, y: rowTop, width: box.width, height: 1).fill()
+                }
+                dataIdx += 1
+            }
+
+            Theme.codeBorder.setFill()
+            NSRect(x: box.minX, y: headerBottomY, width: box.width, height: 1).fill()
+
+            Theme.codeBorder.withAlphaComponent(0.75).setFill()
+            for divOffset in table.columnDividerOffsets {
+                let divX = round(origin.x + divOffset)
+                if divX > box.minX + 8 && divX < box.maxX - 8 {
+                    NSRect(x: divX, y: box.minY, width: 1, height: box.height).fill()
+                }
+            }
             NSGraphicsContext.restoreGraphicsState()
 
             Theme.codeBorder.setStroke()
@@ -593,16 +665,18 @@ import CozyCore
         let delta = repLen - affectedCharRange.length
         let isLargeEdit = affectedCharRange.length > 4096 || repLen > 4096
         lastEditWasLarge = isLargeEdit
-        var requiresFullFormat = isLargeEdit || !fencedBlocks.isEmpty
+        var requiresFullFormat = isLargeEdit || !fencedBlocks.isEmpty || !tableBlocks.isEmpty
         if !requiresFullFormat {
             if affectedCharRange.length > 0 {
                 let checkRange = ns.lineRange(for: affectedCharRange)
-                if ns.range(of: "```", options: .literal, range: checkRange).location != NSNotFound {
+                if ns.range(of: "```", options: .literal, range: checkRange).location != NSNotFound
+                    || ns.range(of: "|", options: .literal, range: checkRange).location != NSNotFound {
                     requiresFullFormat = true
                 }
             }
-            if !requiresFullFormat && repLen >= 3 {
-                if repNS.range(of: "```", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound {
+            if !requiresFullFormat && repLen >= 1 {
+                if (repLen >= 3 && repNS.range(of: "```", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound)
+                    || repNS.range(of: "|", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound {
                     requiresFullFormat = true
                 }
             }
@@ -3320,6 +3394,9 @@ import CozyCore
                 }
             }
             container.containerSize = NSSize(width: columnWidth, height: CGFloat.greatestFiniteMagnitude)
+            if !textView.tableBlocks.isEmpty {
+                formatMarkdown()
+            }
             if let anchorChar, let lm = textView.layoutManager, let storage = textView.textStorage, storage.length > 0 {
                 let ns = storage.mutableString as NSString
                 let start = max(0, anchorChar - 600)
@@ -4177,6 +4254,7 @@ import CozyCore
         let hasTripleBacktick: Bool
         let hasLinkOpen: Bool
         let hasWikiLink: Bool
+        let hasPipe: Bool
     }
     private var lastScanResult: DocumentScanResult?
 
@@ -4211,7 +4289,8 @@ import CozyCore
                 hasBacktick: false,
                 hasTripleBacktick: false,
                 hasLinkOpen: false,
-                hasWikiLink: false
+                hasWikiLink: false,
+                hasPipe: false
             )
         }
         let cfStr = ns as CFString
@@ -4226,6 +4305,7 @@ import CozyCore
         var hasTripleBacktick = false
         var hasLinkOpen = false
         var hasWikiLink = false
+        var hasPipe = false
         var prevChar: UniChar = 0
         var runBackticks = 0
 
@@ -4287,7 +4367,9 @@ import CozyCore
                             runBackticks &+= 1
                             if runBackticks >= 3 { hasTripleBacktick = true }
                         } else {
-                            if u == 0x28 && prevChar == 0x5D {
+                            if u == 0x7C {
+                                hasPipe = true
+                            } else if u == 0x28 && prevChar == 0x5D {
                                 hasLinkOpen = true
                             } else if u == 0x5B && prevChar == 0x5B {
                                 hasWikiLink = true
@@ -4311,7 +4393,8 @@ import CozyCore
             hasBacktick: hasBacktick,
             hasTripleBacktick: hasTripleBacktick,
             hasLinkOpen: hasLinkOpen,
-            hasWikiLink: hasWikiLink
+            hasWikiLink: hasWikiLink,
+            hasPipe: hasPipe
         )
     }
 
@@ -4331,7 +4414,8 @@ import CozyCore
                 hasBacktick: false,
                 hasTripleBacktick: false,
                 hasLinkOpen: false,
-                hasWikiLink: false
+                hasWikiLink: false,
+                hasPipe: false
             )
         }
         if length == lastFullCountLength, sig == lastFullCountSampleHash, let cached = lastScanResult {
@@ -4381,8 +4465,9 @@ import CozyCore
     private func lineHasCursorSensitiveSyntax(_ ns: NSString, lineRange: NSRange) -> Bool {
         guard lineRange.location != NSNotFound, lineRange.length > 0, NSMaxRange(lineRange) <= ns.length else { return false }
         let first = ns.character(at: lineRange.location)
-        if first == 0x23 || first == 0x60 { return true }
+        if first == 0x23 || first == 0x60 || first == 0x7C { return true }
         if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
+        if ns.range(of: "|", options: .literal, range: lineRange).location != NSNotFound { return true }
         return false
     }
 
@@ -4392,7 +4477,7 @@ import CozyCore
         let oldNeeds = lineHasCursorSensitiveSyntax(ns, lineRange: oldLine)
         let newNeeds = lineHasCursorSensitiveSyntax(ns, lineRange: newLine)
         guard oldNeeds || newNeeds else { return }
-        if !textView.fencedBlocks.isEmpty {
+        if !textView.fencedBlocks.isEmpty || !textView.tableBlocks.isEmpty {
             formatMarkdown()
             textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
             return
@@ -4669,6 +4754,7 @@ import CozyCore
             textView.inlineCodeRanges = []
             textView.wikiLinkItems = []
             textView.fencedBlocks = []
+            textView.tableBlocks = []
             textView.bulletItems = []
             hasPotentialLinks = false
             return
@@ -4779,13 +4865,472 @@ import CozyCore
                 parsedFences.contains { NSIntersectionRange($0.fullRange, link.fullRange).length > 0 }
             }
         }
+        var parsedTables: [MarkdownTextView.TableBlock] = []
+        if scan.hasPipe {
+            parsedTables = parseAndFormatTables(
+                in: storage,
+                ns: ns,
+                cursor: cursor,
+                fencedBlocks: parsedFences,
+                inlineCodeRanges: inlinePills
+            )
+            if !parsedTables.isEmpty {
+                bullets.removeAll { item in
+                    parsedTables.contains { NSIntersectionRange($0.fullRange, item.lineRange).length > 0 }
+                }
+                quotes.removeAll { r in
+                    parsedTables.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
+                }
+                headings.removeAll { item in
+                    parsedTables.contains { NSIntersectionRange($0.fullRange, item.range).length > 0 }
+                }
+            }
+        }
 
         textView.blockquoteRanges = quotes
         textView.headingGutterItems = headings
         textView.inlineCodeRanges = inlinePills
         textView.wikiLinkItems = wikiLinks
         textView.fencedBlocks = parsedFences
+        textView.tableBlocks = parsedTables
         textView.bulletItems = bullets
+    }
+
+    private struct ParsedTableCell {
+        let openPipeLocation: Int?
+        let leadingSyntaxRange: NSRange
+        let contentRange: NSRange
+        let trailingSyntaxRange: NSRange
+    }
+
+    private struct ParsedTableRow {
+        let lineRange: NSRange
+        let fullLineRange: NSRange
+        let isHeader: Bool
+        let isDelimiter: Bool
+        let cells: [ParsedTableCell]
+        let closingSyntaxRange: NSRange
+    }
+
+    private func parseAndFormatTables(
+        in storage: NSTextStorage,
+        ns: NSString,
+        cursor: NSRange,
+        fencedBlocks: [MarkdownTextView.FencedBlock],
+        inlineCodeRanges: [NSRange]
+    ) -> [MarkdownTextView.TableBlock] {
+        let totalLen = ns.length
+        guard totalLen > 0 else { return [] }
+        let isFocused = textView.window?.firstResponder === textView
+        let proseSize = Theme.baseProseSize
+        let hiddenAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 0.1),
+            .foregroundColor: NSColor.clear,
+            .kern: 0.0
+        ]
+
+        var lineInfos: [(lineRange: NSRange, fullLineRange: NSRange)] = []
+        var pos = 0
+        while pos < totalLen {
+            let fullLine = ns.lineRange(for: NSRange(location: pos, length: 0))
+            let nextPos = max(pos + 1, NSMaxRange(fullLine))
+            var contentEnd = min(NSMaxRange(fullLine), totalLen)
+            while contentEnd > fullLine.location {
+                let ch = ns.character(at: contentEnd - 1)
+                if ch == 10 || ch == 13 { contentEnd -= 1 } else { break }
+            }
+            lineInfos.append((
+                lineRange: NSRange(location: fullLine.location, length: max(0, contentEnd - fullLine.location)),
+                fullLineRange: fullLine
+            ))
+            pos = nextPos
+        }
+
+        func lineInFence(_ r: NSRange) -> Bool {
+            fencedBlocks.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
+        }
+
+        var result: [MarkdownTextView.TableBlock] = []
+        var idx = 0
+        while idx + 1 < lineInfos.count {
+            let headerInfo = lineInfos[idx]
+            let delimInfo = lineInfos[idx + 1]
+            if headerInfo.lineRange.length == 0 || delimInfo.lineRange.length == 0
+                || lineInFence(headerInfo.lineRange) || lineInFence(delimInfo.lineRange)
+                || !Self.isTableDelimiterRow(in: ns, lineRange: delimInfo.lineRange) {
+                idx += 1
+                continue
+            }
+            guard let headerParsed = Self.parseTableRow(
+                in: ns,
+                lineRange: headerInfo.lineRange,
+                fullLineRange: headerInfo.fullLineRange,
+                isHeader: true,
+                isDelimiter: false
+            ), !headerParsed.cells.isEmpty else {
+                idx += 1
+                continue
+            }
+            let delimParsed = ParsedTableRow(
+                lineRange: delimInfo.lineRange,
+                fullLineRange: delimInfo.fullLineRange,
+                isHeader: false,
+                isDelimiter: true,
+                cells: [],
+                closingSyntaxRange: NSRange(location: NSMaxRange(delimInfo.lineRange), length: 0)
+            )
+            var parsedRows: [ParsedTableRow] = [headerParsed, delimParsed]
+            var scanIdx = idx + 2
+            while scanIdx < lineInfos.count {
+                let rowInfo = lineInfos[scanIdx]
+                if rowInfo.lineRange.length == 0 || lineInFence(rowInfo.lineRange) { break }
+                if Self.isTableDelimiterRow(in: ns, lineRange: rowInfo.lineRange) { break }
+                guard let bodyRow = Self.parseTableRow(
+                    in: ns,
+                    lineRange: rowInfo.lineRange,
+                    fullLineRange: rowInfo.fullLineRange,
+                    isHeader: false,
+                    isDelimiter: false
+                ), !bodyRow.cells.isEmpty else {
+                    break
+                }
+                parsedRows.append(bodyRow)
+                scanIdx += 1
+            }
+            idx = scanIdx
+
+            let colCount = max(1, headerParsed.cells.count)
+            let headerFont = Theme.bodyFont(proseSize - 0.5, weight: .semibold)
+            let cellBodyFont = Theme.bodyFont(proseSize - 0.5)
+            let cellBoldFont = Theme.bodyFont(proseSize - 0.5, weight: .semibold)
+            let cellItalicFont = Theme.italicBodyFont(proseSize - 0.5)
+
+            // Format delimiter row (collapse to 1pt border height unless cursor is directly on it)
+            let cursorOnDelimiter = isFocused && cursor.location >= delimInfo.lineRange.location && cursor.location <= NSMaxRange(delimInfo.lineRange)
+            if cursorOnDelimiter {
+                let editDelimPara = NSMutableParagraphStyle()
+                editDelimPara.firstLineHeadIndent = 14
+                editDelimPara.headIndent = 14
+                editDelimPara.lineSpacing = 2.0
+                editDelimPara.paragraphSpacingBefore = 2.0
+                editDelimPara.paragraphSpacing = 4.0
+                storage.addAttributes([
+                    .font: Theme.monoFont(proseSize - 3.0),
+                    .foregroundColor: Theme.subtle,
+                    .paragraphStyle: editDelimPara,
+                    .kern: 0.0
+                ], range: delimInfo.fullLineRange)
+            } else {
+                let collapsedDelimPara = NSMutableParagraphStyle()
+                collapsedDelimPara.lineSpacing = 0.0
+                collapsedDelimPara.paragraphSpacing = 0.0
+                collapsedDelimPara.paragraphSpacingBefore = 0.0
+                collapsedDelimPara.minimumLineHeight = 1.0
+                collapsedDelimPara.maximumLineHeight = 1.0
+                storage.addAttributes([
+                    .font: NSFont.systemFont(ofSize: 0.1),
+                    .foregroundColor: NSColor.clear,
+                    .paragraphStyle: collapsedDelimPara,
+                    .kern: 0.0
+                ], range: delimInfo.fullLineRange)
+            }
+
+            // Format cells and measure each cell's natural rendered width
+            var measuredWidths: [[CGFloat]] = Array(repeating: Array(repeating: 0, count: colCount), count: parsedRows.count)
+            for (rIdx, row) in parsedRows.enumerated() where !row.isDelimiter {
+                let cursorOnRow = isFocused && cursor.location >= row.lineRange.location && cursor.location <= NSMaxRange(row.lineRange)
+                let lineStr = ns.substring(with: row.lineRange)
+                let localRange = NSRange(location: 0, length: row.lineRange.length)
+
+                for cell in row.cells {
+                    if cell.leadingSyntaxRange.length > 0 {
+                        storage.addAttributes(hiddenAttrs, range: cell.leadingSyntaxRange)
+                    }
+                    if cell.trailingSyntaxRange.length > 0 {
+                        storage.addAttributes(hiddenAttrs, range: cell.trailingSyntaxRange)
+                    }
+                    if cell.contentRange.length > 0 {
+                        storage.addAttributes([
+                            .font: row.isHeader ? headerFont : cellBodyFont,
+                            .foregroundColor: row.isHeader ? Theme.headingInk : Theme.ink
+                        ], range: cell.contentRange)
+                        for codeRange in inlineCodeRanges {
+                            let inter = NSIntersectionRange(codeRange, cell.contentRange)
+                            if inter.length > 0 {
+                                storage.addAttributes([
+                                    .font: Theme.monoFont(proseSize - 2.5, weight: .medium),
+                                    .foregroundColor: Theme.inlineCodeInk,
+                                    .kern: 0.1
+                                ], range: inter)
+                                let tickAttrs: [NSAttributedString.Key: Any] = [
+                                    .foregroundColor: cursorOnRow ? Theme.subtle : NSColor.clear,
+                                    .font: Theme.monoFont(11)
+                                ]
+                                if codeRange.location > row.lineRange.location {
+                                    let openTick = NSRange(location: codeRange.location - 1, length: 1)
+                                    storage.addAttributes(tickAttrs, range: openTick)
+                                }
+                                if NSMaxRange(codeRange) < NSMaxRange(row.lineRange) {
+                                    let closeTick = NSRange(location: NSMaxRange(codeRange), length: 1)
+                                    storage.addAttributes(tickAttrs, range: closeTick)
+                                }
+                            }
+                        }
+                    }
+                }
+                if row.closingSyntaxRange.length > 0 {
+                    storage.addAttributes(hiddenAttrs, range: row.closingSyntaxRange)
+                }
+
+                // Re-apply bold/italic/strikethrough inside the row and hide markers when cursor is not on the row
+                for match in bold.matches(in: lineStr, range: localRange) {
+                    let full = NSRange(location: row.lineRange.location + match.range.location, length: match.range.length)
+                    storage.addAttributes([.font: cellBoldFont, .foregroundColor: Theme.headingInk], range: full)
+                    let openM = NSRange(location: full.location, length: 2)
+                    let closeM = NSRange(location: NSMaxRange(full) - 2, length: 2)
+                    if cursorOnRow {
+                        storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(11.5)], range: openM)
+                        storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(11.5)], range: closeM)
+                    } else {
+                        storage.addAttributes(hiddenAttrs, range: openM)
+                        storage.addAttributes(hiddenAttrs, range: closeM)
+                    }
+                }
+                for match in italic.matches(in: lineStr, range: localRange) {
+                    let full = NSRange(location: row.lineRange.location + match.range.location, length: match.range.length)
+                    let inner = NSRange(location: row.lineRange.location + match.range(at: 1).location, length: match.range(at: 1).length)
+                    storage.addAttributes([.font: cellItalicFont], range: inner)
+                    let openM = NSRange(location: full.location, length: 1)
+                    let closeM = NSRange(location: NSMaxRange(full) - 1, length: 1)
+                    if cursorOnRow {
+                        storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(11.5)], range: openM)
+                        storage.addAttributes([.foregroundColor: Theme.subtle, .font: Theme.monoFont(11.5)], range: closeM)
+                    } else {
+                        storage.addAttributes(hiddenAttrs, range: openM)
+                        storage.addAttributes(hiddenAttrs, range: closeM)
+                    }
+                }
+
+                for (cIdx, cell) in row.cells.prefix(colCount).enumerated() where cell.contentRange.length > 0 {
+                    let w = ceil(storage.attributedSubstring(from: cell.contentRange).size().width)
+                    measuredWidths[rIdx][cIdx] = w
+                }
+            }
+
+            let linePad = textView.textContainer?.lineFragmentPadding ?? 5.0
+            let containerWidth = max(240.0, textView.textContainer?.containerSize.width ?? 640.0)
+            let leftPad: CGFloat = 14.0
+            let rightPad: CGFloat = 14.0
+            let gapBeforeDivider: CGFloat = 12.0
+            let gapAfterDivider: CGFloat = 12.0
+            let interColGap = gapBeforeDivider + gapAfterDivider
+            let usableWidth = max(120.0, containerWidth - 2.0 * linePad - leftPad - rightPad - CGFloat(max(0, colCount - 1)) * interColGap)
+
+            var naturalMax = Array(repeating: CGFloat(32.0), count: colCount)
+            for rIdx in parsedRows.indices where !parsedRows[rIdx].isDelimiter {
+                for cIdx in 0..<colCount {
+                    if measuredWidths[rIdx][cIdx] > naturalMax[cIdx] {
+                        naturalMax[cIdx] = measuredWidths[rIdx][cIdx]
+                    }
+                }
+            }
+
+            let leadingSum = colCount > 1 ? naturalMax[0..<(colCount - 1)].reduce(0, +) : 0
+            let canAlignColumns = colCount == 1 || (leadingSum <= usableWidth - 72.0)
+
+            var dividerOffsets: [CGFloat] = []
+            if canAlignColumns {
+                var colWidths = naturalMax
+                if colCount > 1 {
+                    colWidths[colCount - 1] = max(72.0, usableWidth - leadingSum)
+                } else {
+                    colWidths[0] = usableWidth
+                }
+                var columnStartIndents: [CGFloat] = Array(repeating: leftPad, count: colCount)
+                for cIdx in 1..<colCount {
+                    columnStartIndents[cIdx] = columnStartIndents[cIdx - 1] + colWidths[cIdx - 1] + interColGap
+                    dividerOffsets.append(round(linePad + columnStartIndents[cIdx] - gapAfterDivider))
+                }
+                let lastColIndent = columnStartIndents.last ?? leftPad
+                for (rIdx, row) in parsedRows.enumerated() where !row.isDelimiter {
+                    let isLastRow = (rIdx == parsedRows.count - 1)
+                    let rowPara = NSMutableParagraphStyle()
+                    rowPara.firstLineHeadIndent = leftPad
+                    rowPara.headIndent = lastColIndent
+                    rowPara.tailIndent = -rightPad
+                    rowPara.lineSpacing = 4.0
+                    rowPara.paragraphSpacingBefore = row.isHeader ? 8.0 : 5.0
+                    rowPara.paragraphSpacing = row.isHeader ? 7.0 : (isLastRow ? 14.0 : 6.0)
+                    storage.addAttribute(.paragraphStyle, value: rowPara, range: row.fullLineRange)
+
+                    let limit = min(colCount - 1, row.cells.count - 1)
+                    if limit >= 0 {
+                        for cIdx in 0..<limit {
+                            let nextCell = row.cells[cIdx + 1]
+                            if let pipeLoc = nextCell.openPipeLocation, pipeLoc < totalLen {
+                                let w = measuredWidths[rIdx][cIdx]
+                                let advance = max(8.0, (colWidths[cIdx] - w) + interColGap)
+                                storage.addAttribute(.kern, value: advance, range: NSRange(location: pipeLoc, length: 1))
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback for wide multi-column tables in narrow windows: show subtle pipe separators and wrap cleanly without overflowing column dividers
+                let pipeSeparatorAttrs: [NSAttributedString.Key: Any] = [
+                    .font: Theme.monoFont(proseSize - 2.5, weight: .semibold),
+                    .foregroundColor: Theme.subtle,
+                    .kern: 6.0
+                ]
+                for (rIdx, row) in parsedRows.enumerated() where !row.isDelimiter {
+                    let isLastRow = (rIdx == parsedRows.count - 1)
+                    let rowPara = NSMutableParagraphStyle()
+                    rowPara.firstLineHeadIndent = leftPad
+                    rowPara.headIndent = leftPad + 12.0
+                    rowPara.tailIndent = -rightPad
+                    rowPara.lineSpacing = 4.0
+                    rowPara.paragraphSpacingBefore = row.isHeader ? 8.0 : 5.0
+                    rowPara.paragraphSpacing = row.isHeader ? 7.0 : (isLastRow ? 14.0 : 6.0)
+                    storage.addAttribute(.paragraphStyle, value: rowPara, range: row.fullLineRange)
+                    for cIdx in 1..<row.cells.count {
+                        if let pipeLoc = row.cells[cIdx].openPipeLocation, pipeLoc < totalLen {
+                            storage.addAttributes(pipeSeparatorAttrs, range: NSRange(location: pipeLoc, length: 1))
+                            if pipeLoc > row.lineRange.location {
+                                storage.addAttribute(.kern, value: CGFloat(6.0), range: NSRange(location: pipeLoc - 1, length: 1))
+                            }
+                        }
+                    }
+                }
+            }
+
+            let lastRow = parsedRows.last!
+            let tableFullRange = NSRange(
+                location: headerInfo.lineRange.location,
+                length: NSMaxRange(lastRow.lineRange) - headerInfo.lineRange.location
+            )
+            let rowItems = parsedRows.map {
+                MarkdownTextView.TableRowItem(
+                    lineRange: $0.lineRange,
+                    fullLineRange: $0.fullLineRange,
+                    isHeader: $0.isHeader,
+                    isDelimiter: $0.isDelimiter
+                )
+            }
+            result.append(MarkdownTextView.TableBlock(
+                fullRange: tableFullRange,
+                headerRange: headerInfo.lineRange,
+                delimiterRange: delimInfo.lineRange,
+                rows: rowItems,
+                columnDividerOffsets: dividerOffsets
+            ))
+        }
+        return result
+    }
+
+    private static func isTableDelimiterRow(in ns: NSString, lineRange: NSRange) -> Bool {
+        guard lineRange.length >= 3, NSMaxRange(lineRange) <= ns.length else { return false }
+        var pipeCount = 0
+        var dashCount = 0
+        var hasOther = false
+        for idx in lineRange.location..<NSMaxRange(lineRange) {
+            let ch = ns.character(at: idx)
+            if ch == 0x7C { pipeCount += 1 }
+            else if ch == 0x2D { dashCount += 1 }
+            else if ch == 0x3A || ch == 0x20 || ch == 0x09 { continue }
+            else { hasOther = true; break }
+        }
+        return !hasOther && pipeCount >= 1 && dashCount >= 3
+    }
+
+    private static func parseTableRow(
+        in ns: NSString,
+        lineRange: NSRange,
+        fullLineRange: NSRange,
+        isHeader: Bool,
+        isDelimiter: Bool
+    ) -> ParsedTableRow? {
+        guard lineRange.length > 0, NSMaxRange(lineRange) <= ns.length else { return nil }
+        var start = lineRange.location
+        var end = NSMaxRange(lineRange)
+        while start < end && (ns.character(at: start) == 0x20 || ns.character(at: start) == 0x09) {
+            start += 1
+        }
+        while end > start && (ns.character(at: end - 1) == 0x20 || ns.character(at: end - 1) == 0x09) {
+            end -= 1
+        }
+        guard end > start else { return nil }
+
+        var pipeLocs: [Int] = []
+        var inBackticks = false
+        var escaped = false
+        for idx in start..<end {
+            let ch = ns.character(at: idx)
+            if escaped {
+                escaped = false
+                continue
+            }
+            if ch == 0x5C {
+                escaped = true
+                continue
+            }
+            if ch == 0x60 {
+                inBackticks.toggle()
+                continue
+            }
+            if !inBackticks && ch == 0x7C {
+                pipeLocs.append(idx)
+            }
+        }
+        guard !pipeLocs.isEmpty else { return nil }
+        let startsWithPipe = (pipeLocs.first == start)
+        let endsWithPipe = (pipeLocs.last == end - 1)
+        guard startsWithPipe || endsWithPipe || pipeLocs.count >= 2 else { return nil }
+
+        var boundaries: [Int] = []
+        if !startsWithPipe { boundaries.append(start - 1) }
+        boundaries.append(contentsOf: pipeLocs)
+        if !endsWithPipe { boundaries.append(end) }
+        guard boundaries.count >= 2 else { return nil }
+
+        var cells: [ParsedTableCell] = []
+        cells.reserveCapacity(boundaries.count - 1)
+        for bIdx in 0..<(boundaries.count - 1) {
+            let leftBoundary = boundaries[bIdx]
+            let rightBoundary = boundaries[bIdx + 1]
+            let hasOpenPipe = leftBoundary >= start && leftBoundary < end && ns.character(at: leftBoundary) == 0x7C
+            let openPipeLoc: Int? = hasOpenPipe ? leftBoundary : nil
+            let rawStart = hasOpenPipe ? (leftBoundary + 1) : start
+            let rawEnd = rightBoundary
+            var cStart = rawStart
+            var cEnd = rawEnd
+            while cStart < cEnd && (ns.character(at: cStart) == 0x20 || ns.character(at: cStart) == 0x09) {
+                cStart += 1
+            }
+            while cEnd > cStart && (ns.character(at: cEnd - 1) == 0x20 || ns.character(at: cEnd - 1) == 0x09) {
+                cEnd -= 1
+            }
+            let leadLoc = (bIdx == 0) ? lineRange.location : (openPipeLoc ?? rawStart)
+            let leadingSyntax = NSRange(location: leadLoc, length: max(0, cStart - leadLoc))
+            let content = NSRange(location: cStart, length: max(0, cEnd - cStart))
+            let trailingSyntax = NSRange(location: cEnd, length: max(0, rawEnd - cEnd))
+            cells.append(ParsedTableCell(
+                openPipeLocation: openPipeLoc,
+                leadingSyntaxRange: leadingSyntax,
+                contentRange: content,
+                trailingSyntaxRange: trailingSyntax
+            ))
+        }
+
+        let closingStart = endsWithPipe ? pipeLocs.last! : end
+        let closingSyntax = NSRange(location: closingStart, length: max(0, NSMaxRange(lineRange) - closingStart))
+        return ParsedTableRow(
+            lineRange: lineRange,
+            fullLineRange: fullLineRange,
+            isHeader: isHeader,
+            isDelimiter: isDelimiter,
+            cells: cells,
+            closingSyntaxRange: closingSyntax
+        )
     }
 
     private static func shiftWikiLink(_ item: WikiLink, by delta: Int) -> WikiLink {
