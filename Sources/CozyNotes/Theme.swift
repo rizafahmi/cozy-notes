@@ -4,11 +4,13 @@ import AppKit
     enum Atmosphere: String, CaseIterable {
         case study = "study"
         case botanical = "botanical"
+        case neoAcid = "neoAcid"
 
         var title: String {
             switch self {
             case .study: return "Obsidian & Ivory"
             case .botanical: return "Midnight Ink & Porcelain"
+            case .neoAcid: return "Neo-Acid & Plaster"
             }
         }
 
@@ -16,6 +18,7 @@ import AppKit
             switch self {
             case .study: return "OBSIDIAN"
             case .botanical: return "MIDNIGHT"
+            case .neoAcid: return "NEO-ACID"
             }
         }
     }
@@ -24,6 +27,7 @@ import AppKit
         case bookSerif = "bookSerif"
         case editorial = "editorial"
         case typewriter = "typewriter"
+        case neoAcid = "neoAcid"
 
         var title: String {
             switch self {
@@ -31,6 +35,7 @@ import AppKit
             case .bookSerif: return "Book Serif (Charter)"
             case .editorial: return "Classic Essay (Iowan Old Style)"
             case .typewriter: return "Typewriter Draft (SF Mono)"
+            case .neoAcid: return "Neo-Acid Display (Unbounded & Avenir)"
             }
         }
 
@@ -40,6 +45,7 @@ import AppKit
             case .bookSerif: return "CHARTER"
             case .editorial: return "IOWAN"
             case .typewriter: return "MONO"
+            case .neoAcid: return "UNBOUNDED"
             }
         }
     }
@@ -83,7 +89,9 @@ import AppKit
         studyLight: (CGFloat, CGFloat, CGFloat),
         studyDark: (CGFloat, CGFloat, CGFloat),
         botanicalLight: (CGFloat, CGFloat, CGFloat)? = nil,
-        botanicalDark: (CGFloat, CGFloat, CGFloat)? = nil
+        botanicalDark: (CGFloat, CGFloat, CGFloat)? = nil,
+        neoAcidLight: (CGFloat, CGFloat, CGFloat)? = nil,
+        neoAcidDark: (CGFloat, CGFloat, CGFloat)? = nil
     ) -> NSColor {
         NSColor(name: NSColor.Name("Cozy.\(name)")) { appearance in
             let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -93,26 +101,32 @@ import AppKit
                 rgb = isDark ? studyDark : studyLight
             case .botanical:
                 rgb = isDark ? (botanicalDark ?? studyDark) : (botanicalLight ?? studyLight)
+            case .neoAcid:
+                rgb = isDark ? (neoAcidDark ?? studyDark) : (neoAcidLight ?? studyLight)
             }
             return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
         }
     }
 
-    /// Outer desk & sidebar surface — soft stone-alabaster in light mode, deep velvet obsidian (#131417) or midnight (#0E1218) in dark mode.
+    /// Outer desk & sidebar surface — soft stone-alabaster / plaster in light mode, deep velvet obsidian (#131417), midnight (#0E1218), or obsidian clay (#121519) in dark mode.
     static let canvas = adaptive(
         "desk",
         studyLight: (0.942, 0.938, 0.925),
         studyDark: (0.075, 0.078, 0.090),
         botanicalLight: (0.928, 0.938, 0.955),
-        botanicalDark: (0.055, 0.070, 0.098)
+        botanicalDark: (0.055, 0.070, 0.098),
+        neoAcidLight: (0.925, 0.925, 0.902),
+        neoAcidDark: (0.071, 0.082, 0.098)
     )
-    /// Inset folio page — clean ivory (#FAF9F6) in light mode, elevated graphite-slate (#1B1D22) or nocturnal navy (#141923) in dark mode.
+    /// Inset folio page — clean ivory (#FAF9F6) or raw plaster (#F7F7F5) in light mode, elevated graphite-slate (#1B1D22), nocturnal navy (#141923), or obsidian surface (#1B2026) in dark mode.
     static let paper = adaptive(
         "paper",
         studyLight: (0.988, 0.985, 0.976),
         studyDark: (0.106, 0.112, 0.130),
         botanicalLight: (0.984, 0.988, 0.996),
-        botanicalDark: (0.080, 0.100, 0.138)
+        botanicalDark: (0.080, 0.100, 0.138),
+        neoAcidLight: (0.969, 0.969, 0.961),
+        neoAcidDark: (0.106, 0.125, 0.149)
     )
     /// Recessed search bar, code blocks, and attachment cards.
     static let elevated = adaptive(
@@ -120,7 +134,9 @@ import AppKit
         studyLight: (0.958, 0.954, 0.942),
         studyDark: (0.138, 0.145, 0.168),
         botanicalLight: (0.950, 0.958, 0.974),
-        botanicalDark: (0.110, 0.136, 0.186)
+        botanicalDark: (0.110, 0.136, 0.186),
+        neoAcidLight: (1.000, 1.000, 1.000),
+        neoAcidDark: (0.133, 0.157, 0.192)
     )
     /// Distinct recessed surface for fenced code blocks and inline code pills.
     static let codeBackground = adaptive(
@@ -128,7 +144,9 @@ import AppKit
         studyLight: (0.932, 0.928, 0.915),
         studyDark: (0.068, 0.072, 0.086),
         botanicalLight: (0.924, 0.935, 0.955),
-        botanicalDark: (0.050, 0.064, 0.092)
+        botanicalDark: (0.050, 0.064, 0.092),
+        neoAcidLight: (0.925, 0.925, 0.902),
+        neoAcidDark: (0.071, 0.082, 0.098)
     )
     /// Top header strip inside fenced code blocks.
     static let codeHeaderFill = adaptive(
@@ -136,7 +154,9 @@ import AppKit
         studyLight: (0.902, 0.896, 0.882),
         studyDark: (0.132, 0.140, 0.164),
         botanicalLight: (0.892, 0.908, 0.935),
-        botanicalDark: (0.105, 0.130, 0.180)
+        botanicalDark: (0.105, 0.130, 0.180),
+        neoAcidLight: (0.886, 0.890, 0.863),
+        neoAcidDark: (0.133, 0.157, 0.192)
     )
     /// Crisp border around fenced code blocks and inline code pills.
     static let codeBorder = adaptive(
@@ -144,7 +164,9 @@ import AppKit
         studyLight: (0.825, 0.818, 0.800),
         studyDark: (0.215, 0.228, 0.265),
         botanicalLight: (0.805, 0.828, 0.870),
-        botanicalDark: (0.180, 0.222, 0.300)
+        botanicalDark: (0.180, 0.222, 0.300),
+        neoAcidLight: (0.784, 0.796, 0.761),
+        neoAcidDark: (0.263, 0.290, 0.337)
     )
     /// Dedicated semantic ink and tinted capsule surface for inline `code` tokens so they stand out from prose.
     static let inlineCodeInk = adaptive(
@@ -152,21 +174,27 @@ import AppKit
         studyLight: (0.755, 0.245, 0.195),
         studyDark: (0.955, 0.565, 0.485),
         botanicalLight: (0.180, 0.380, 0.780),
-        botanicalDark: (0.555, 0.755, 0.990)
+        botanicalDark: (0.555, 0.755, 0.990),
+        neoAcidLight: (0.102, 0.231, 0.961),
+        neoAcidDark: (0.549, 0.878, 1.000)
     )
     static let inlineCodeFill = adaptive(
         "inlineCodeFill",
         studyLight: (0.958, 0.928, 0.918),
         studyDark: (0.176, 0.146, 0.156),
         botanicalLight: (0.915, 0.938, 0.978),
-        botanicalDark: (0.125, 0.165, 0.240)
+        botanicalDark: (0.125, 0.165, 0.240),
+        neoAcidLight: (0.925, 0.925, 0.902),
+        neoAcidDark: (0.133, 0.157, 0.192)
     )
     static let inlineCodeBorder = adaptive(
         "inlineCodeBorder",
         studyLight: (0.885, 0.815, 0.795),
         studyDark: (0.295, 0.225, 0.235),
         botanicalLight: (0.805, 0.855, 0.940),
-        botanicalDark: (0.215, 0.285, 0.410)
+        botanicalDark: (0.215, 0.285, 0.410),
+        neoAcidLight: (0.847, 0.855, 0.827),
+        neoAcidDark: (0.263, 0.290, 0.337)
     )
     /// Active commonplace index slip in the sidebar.
     static let selectionFill = adaptive(
@@ -174,7 +202,9 @@ import AppKit
         studyLight: (0.988, 0.985, 0.976),
         studyDark: (0.158, 0.166, 0.192),
         botanicalLight: (0.984, 0.988, 0.996),
-        botanicalDark: (0.128, 0.158, 0.216)
+        botanicalDark: (0.128, 0.158, 0.216),
+        neoAcidLight: (0.969, 0.969, 0.961),
+        neoAcidDark: (0.133, 0.157, 0.192)
     )
     /// High-presence ink for headings and **bold** spans so structure pops by both luminance and weight.
     static let headingInk = adaptive(
@@ -182,7 +212,9 @@ import AppKit
         studyLight: (0.085, 0.092, 0.108),
         studyDark: (0.952, 0.958, 0.974),
         botanicalLight: (0.075, 0.095, 0.135),
-        botanicalDark: (0.945, 0.960, 0.985)
+        botanicalDark: (0.945, 0.960, 0.985),
+        neoAcidLight: (0.039, 0.043, 0.051),
+        neoAcidDark: (0.906, 0.925, 0.949)
     )
     /// Primary body prose ink — velvety, zero-halation contrast (~11:1 in dark mode) for multi-hour writing comfort.
     static let ink = adaptive(
@@ -190,14 +222,18 @@ import AppKit
         studyLight: (0.165, 0.175, 0.195),
         studyDark: (0.848, 0.862, 0.890),
         botanicalLight: (0.140, 0.168, 0.215),
-        botanicalDark: (0.838, 0.868, 0.912)
+        botanicalDark: (0.838, 0.868, 0.912),
+        neoAcidLight: (0.247, 0.271, 0.302),
+        neoAcidDark: (0.761, 0.792, 0.839)
     )
     static let muted = adaptive(
         "muted",
         studyLight: (0.420, 0.430, 0.455),
         studyDark: (0.585, 0.605, 0.650),
         botanicalLight: (0.380, 0.420, 0.485),
-        botanicalDark: (0.560, 0.615, 0.700)
+        botanicalDark: (0.560, 0.615, 0.700),
+        neoAcidLight: (0.322, 0.357, 0.396),
+        neoAcidDark: (0.549, 0.588, 0.639)
     )
     /// Whisper-quiet Markdown syntax markers (#, *, `) and folio stamps.
     static let subtle = adaptive(
@@ -205,31 +241,39 @@ import AppKit
         studyLight: (0.595, 0.605, 0.630),
         studyDark: (0.395, 0.412, 0.455),
         botanicalLight: (0.555, 0.595, 0.655),
-        botanicalDark: (0.365, 0.415, 0.495)
+        botanicalDark: (0.365, 0.415, 0.495),
+        neoAcidLight: (0.365, 0.404, 0.447),
+        neoAcidDark: (0.388, 0.427, 0.478)
     )
-    /// Primary accent — refined coral-rose in Obsidian, periwinkle-indigo in Midnight.
+    /// Primary accent — refined coral-rose in Obsidian, periwinkle-indigo in Midnight, cobalt/acid in Neo-Acid.
     static let accent = adaptive(
         "inkAccent",
         studyLight: (0.820, 0.310, 0.270),
         studyDark: (0.925, 0.465, 0.420),
         botanicalLight: (0.245, 0.420, 0.825),
-        botanicalDark: (0.455, 0.635, 0.965)
+        botanicalDark: (0.455, 0.635, 0.965),
+        neoAcidLight: (0.102, 0.231, 0.961),
+        neoAcidDark: (0.773, 0.973, 0.165)
     )
-    /// Secondary accent for completed tasks, saved seal, and file badges — cool celadon/seafoam.
+    /// Secondary accent for completed tasks, saved seal, and file badges — cool celadon/seafoam or Neo-Acid mint.
     static let sage = adaptive(
         "sage",
         studyLight: (0.235, 0.525, 0.455),
         studyDark: (0.425, 0.745, 0.655),
         botanicalLight: (0.195, 0.535, 0.495),
-        botanicalDark: (0.385, 0.765, 0.695)
+        botanicalDark: (0.385, 0.765, 0.695),
+        neoAcidLight: (0.082, 0.451, 0.278),
+        neoAcidDark: (0.353, 0.902, 0.478)
     )
-    /// Tertiary list-level accent — warm burnished amber in Obsidian, soft amethyst-lavender in Midnight.
+    /// Tertiary list-level accent — warm burnished amber in Obsidian, soft amethyst-lavender in Midnight, highlighter violet in Neo-Acid.
     static let bulletTertiary = adaptive(
         "bulletTertiary",
         studyLight: (0.765, 0.495, 0.145),
         studyDark: (0.945, 0.725, 0.345),
         botanicalLight: (0.485, 0.335, 0.785),
-        botanicalDark: (0.725, 0.595, 0.965)
+        botanicalDark: (0.725, 0.595, 0.965),
+        neoAcidLight: (0.357, 0.129, 0.714),
+        neoAcidDark: (0.663, 0.518, 1.000)
     )
     /// Highlight wash behind search matches.
     static let accentSoft = adaptive(
@@ -237,7 +281,9 @@ import AppKit
         studyLight: (0.965, 0.895, 0.885),
         studyDark: (0.255, 0.165, 0.175),
         botanicalLight: (0.885, 0.920, 0.985),
-        botanicalDark: (0.145, 0.205, 0.320)
+        botanicalDark: (0.145, 0.205, 0.320),
+        neoAcidLight: (0.890, 0.976, 0.608),
+        neoAcidDark: (0.165, 0.212, 0.094)
     )
     /// Subtle tint for blockquote callout blocks inside the journal page.
     static let quoteWash = adaptive(
@@ -245,14 +291,18 @@ import AppKit
         studyLight: (0.962, 0.958, 0.948),
         studyDark: (0.126, 0.133, 0.154),
         botanicalLight: (0.956, 0.964, 0.980),
-        botanicalDark: (0.098, 0.122, 0.168)
+        botanicalDark: (0.098, 0.122, 0.168),
+        neoAcidLight: (0.925, 0.925, 0.902),
+        neoAcidDark: (0.133, 0.157, 0.192)
     )
     static let border = adaptive(
         "edge",
         studyLight: (0.855, 0.850, 0.835),
         studyDark: (0.188, 0.198, 0.226),
         botanicalLight: (0.835, 0.855, 0.890),
-        botanicalDark: (0.155, 0.190, 0.255)
+        botanicalDark: (0.155, 0.190, 0.255),
+        neoAcidLight: (0.847, 0.855, 0.827),
+        neoAcidDark: (0.204, 0.231, 0.275)
     )
     /// Delicate notebook margin line and dateline rule on the journal page.
     static let marginLine = adaptive(
@@ -260,7 +310,9 @@ import AppKit
         studyLight: (0.910, 0.905, 0.890),
         studyDark: (0.152, 0.160, 0.184),
         botanicalLight: (0.895, 0.910, 0.938),
-        botanicalDark: (0.122, 0.150, 0.205)
+        botanicalDark: (0.122, 0.150, 0.205),
+        neoAcidLight: (0.886, 0.894, 0.867),
+        neoAcidDark: (0.149, 0.173, 0.212)
     )
     /// 1px top catch-light along elevated cards and the folio sheet.
     static let topHighlight = adaptive(
@@ -268,7 +320,9 @@ import AppKit
         studyLight: (1.0, 1.0, 1.0),
         studyDark: (0.235, 0.248, 0.282),
         botanicalLight: (1.0, 1.0, 1.0),
-        botanicalDark: (0.195, 0.240, 0.320)
+        botanicalDark: (0.195, 0.240, 0.320),
+        neoAcidLight: (1.0, 1.0, 1.0),
+        neoAcidDark: (0.263, 0.290, 0.337)
     )
     /// Calm text-selection highlight inside the editor.
     static let selectionHighlight = adaptive(
@@ -276,18 +330,22 @@ import AppKit
         studyLight: (0.865, 0.895, 0.955),
         studyDark: (0.215, 0.250, 0.335),
         botanicalLight: (0.845, 0.890, 0.965),
-        botanicalDark: (0.185, 0.260, 0.395)
+        botanicalDark: (0.185, 0.260, 0.395),
+        neoAcidLight: (0.863, 0.894, 1.000),
+        neoAcidDark: (0.176, 0.231, 0.102)
     )
     fileprivate static let onAccent = adaptive(
         "onAccent",
         studyLight: (1, 0.99, 0.99),
-        studyDark: (0.10, 0.10, 0.12)
+        studyDark: (0.10, 0.10, 0.12),
+        neoAcidLight: (1.0, 1.0, 1.0),
+        neoAcidDark: (0.039, 0.043, 0.051)
     )
 
     static var baseProseSize: CGFloat {
         let base: CGFloat
         switch voice {
-        case .humanist: base = 17.0
+        case .humanist, .neoAcid: base = 17.0
         case .bookSerif: base = 17.5
         case .editorial: base = 17.5
         case .typewriter: base = 15.5
@@ -297,7 +355,7 @@ import AppKit
 
     static var proseTracking: CGFloat {
         switch voice {
-        case .humanist: return 0.12
+        case .humanist, .neoAcid: return 0.12
         case .bookSerif: return 0.08
         case .editorial: return 0.10
         case .typewriter: return 0.0
@@ -307,6 +365,21 @@ import AppKit
     static func displayFont(_ size: CGFloat, weight: NSFont.Weight = .semibold) -> NSFont {
         let base = NSFont.systemFont(ofSize: size, weight: weight)
         return base.fontDescriptor.withDesign(.serif).flatMap { NSFont(descriptor: $0, size: size) } ?? base
+    }
+
+    private static func unboundedHeadingFont(level: Int, size: CGFloat) -> NSFont {
+        let scaled = max(14, size - 1.5)
+        let preferredName: String
+        switch level {
+        case 1: preferredName = "Unbounded-ExtraBold"
+        case 2: preferredName = "Unbounded-Bold"
+        default: preferredName = "Unbounded-SemiBold"
+        }
+        let fallbackName = level == 1 ? "AvenirNext-Bold" : "AvenirNext-DemiBold"
+        return NSFont(name: preferredName, size: scaled)
+            ?? NSFont(name: "Unbounded-ExtraBold", size: scaled)
+            ?? NSFont(name: fallbackName, size: size)
+            ?? NSFont.systemFont(ofSize: size, weight: .heavy)
     }
 
     static func headingFont(level: Int) -> NSFont {
@@ -320,8 +393,13 @@ import AppKit
         }
         switch voice {
         case .humanist:
+            if atmosphere == .neoAcid {
+                return unboundedHeadingFont(level: level, size: size)
+            }
             let name = level == 1 ? "AvenirNext-Bold" : "AvenirNext-DemiBold"
             return NSFont(name: name, size: size) ?? NSFont.systemFont(ofSize: size, weight: .bold)
+        case .neoAcid:
+            return unboundedHeadingFont(level: level, size: size)
         case .bookSerif:
             return NSFont(name: "Charter-Bold", size: size) ?? displayFont(size, weight: .bold)
         case .editorial:
@@ -350,7 +428,7 @@ import AppKit
         let bold = weight == .semibold || weight == .bold || weight == .heavy
         let medium = weight == .medium
         switch voice {
-        case .humanist:
+        case .humanist, .neoAcid:
             let name = bold ? "AvenirNext-DemiBold" : (medium ? "AvenirNext-Medium" : "AvenirNext-Regular")
             return NSFont(name: name, size: pt) ?? NSFont.systemFont(ofSize: pt, weight: weight)
         case .bookSerif:
@@ -367,7 +445,7 @@ import AppKit
     static func italicBodyFont(_ size: CGFloat? = nil) -> NSFont {
         let pt = size ?? baseProseSize
         switch voice {
-        case .humanist:
+        case .humanist, .neoAcid:
             return NSFont(name: "AvenirNext-Italic", size: pt) ?? NSFont.systemFont(ofSize: pt)
         case .bookSerif:
             return NSFont(name: "Charter-Italic", size: pt) ?? displayFont(pt)

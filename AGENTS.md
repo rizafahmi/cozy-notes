@@ -108,7 +108,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ## Code Conventions & Common Patterns
 
 - **Programmatic AppKit Only**: No SwiftUI, XIBs, or Storyboards. Construct views in code using Auto Layout and layout helpers in `Sources/CozyNotes/Theme.swift` (`Theme.fill(_:in:inset:)`, `Theme.stack(_:axis:spacing:alignment:)`).
-- **Dynamic Semantic Theming**: Never hardcode raw RGB values in view controllers. Use `Theme` tokens (`Theme.canvasBackground`, `Theme.inkPrimary`, `Theme.accent`, `Theme.font(...)`), which use `NSColor(name:) { appearance in ... }` to adapt live to Light/Dark mode, atmospheres (`Obsidian & Ivory`, `Midnight Ink & Porcelain`), and typography voices (`humanist`, `bookSerif`, `editorial`, `typewriter`).
+- **Dynamic Semantic Theming**: Never hardcode raw RGB values in view controllers. Use `Theme` tokens (`Theme.canvasBackground`, `Theme.inkPrimary`, `Theme.accent`, `Theme.font(...)`), which use `NSColor(name:) { appearance in ... }` to adapt live to Light/Dark mode, atmospheres (`Obsidian & Ivory`, `Midnight Ink & Porcelain`, `Neo-Acid & Plaster`), and typography voices (`humanist`, `bookSerif`, `editorial`, `typewriter`, `neoAcid`).
 - **Concurrency & Thread Isolation**:
   - Decorate all UI controllers, views, and `AppDelegate` with `@MainActor`.
   - Domain engines (`Vault`, `CaptureSearch`) are `@unchecked Sendable` guarded internally by `NSRecursiveLock` / `NSLock`.
@@ -134,7 +134,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - `Sources/CozyNotes/main.swift` — `AppDelegate`, menu bar construction, CLI flag parsing (`--vault`, `--moby-dick-workout`), and lifecycle coordination.
 - `Sources/CozyNotes/WorkspaceController.swift` — Two-pane split workspace, autosave debounce (`0.8s`), conflict recovery banner, and mode/theme switching.
 - `Sources/CozyNotes/CaptureEditor.swift` — `MarkdownTextView` with live Markdown styling, `H1`–`H3` gutter badges, checklist toggling, `[[WikiLink]]` autocomplete, and spring-physics caret.
-- `Sources/CozyNotes/Theme.swift` — Atmosphere palettes, four writing voices, and reusable AppKit controls (`ActionButton`, `SurfaceView`).
+- `Sources/CozyNotes/Theme.swift` — Atmosphere palettes, five writing voices, and reusable AppKit controls (`ActionButton`, `SurfaceView`).
 - `android/app/src/main/java/app/cozynotes/capture/VaultWriter.kt` — Android SAF implementation of the exact same `Inbox/` + `Attachments/<UUID>/` file contract.
 
 ---

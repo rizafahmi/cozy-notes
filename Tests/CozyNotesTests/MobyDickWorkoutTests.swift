@@ -61,6 +61,23 @@ final class MobyDickWorkoutTests: XCTestCase {
             XCTAssertLessThan(growthPerCycle, 5.0, "Memory growth per cycle should be < 5 MB/cycle")
         }
     }
+
+    func testNeoAcidAtmosphereAndVoice() throws {
+        _ = NSApplication.shared
+        let savedAtmosphere = Theme.atmosphere
+        let savedVoice = Theme.voice
+        defer {
+            Theme.atmosphere = savedAtmosphere
+            Theme.voice = savedVoice
+        }
+        Theme.atmosphere = .neoAcid
+        Theme.voice = .neoAcid
+        let report = try MobyDickWorkout.run(repeatCycles: 1, typingSample: "Whale")
+        XCTAssertLessThan(report.step1.cpu.cpuTimeMs, 150.0)
+        XCTAssertLessThan(report.step2.resizeAvgMs, 16.0)
+        XCTAssertLessThan(report.step3.resizeAvgMs, 16.0)
+        XCTAssertLessThan(report.step5.p95KeystrokeMs, 8.0)
+    }
 }
 #endif
 
@@ -1415,6 +1432,144 @@ struct MobyDickWorkoutSuite {
             #expect(textView.preparedContentRect == textView.visibleRect)
         }
         #expect(textView.blockquoteRanges.count == 1)
+    }
+
+    @Test("Neo-Acid atmosphere and voice resolve H1-H3 Unbounded/Avenir typography, satisfy WCAG contrast in light and dark appearances, and cycle across workspace controls")
+    @MainActor
+    func neoAcidAtmosphereAndVoiceTypographyContrastAndCycling() throws {
+        _ = NSApplication.shared
+        let savedAtmosphere = Theme.atmosphere
+        let savedVoice = Theme.voice
+        let savedScale = Theme.fontScale
+        defer {
+            Theme.atmosphere = savedAtmosphere
+            Theme.voice = savedVoice
+            Theme.fontScale = savedScale
+        }
+
+        Theme.fontScale = 0
+        Theme.atmosphere = .study
+        Theme.voice = .humanist
+        let baselineH1 = Theme.headingFont(level: 1)
+        let baselineH2 = Theme.headingFont(level: 2)
+        let baselineH3 = Theme.headingFont(level: 3)
+        let baselineBody = Theme.bodyFont()
+        let baselineItalic = Theme.italicBodyFont()
+
+        // Switching atmosphere to .neoAcid with default .humanist voice activates scaled H1-H3 display headings while keeping Midnight/Avenir body
+        Theme.atmosphere = .neoAcid
+        let neoH1 = Theme.headingFont(level: 1)
+        let neoH2 = Theme.headingFont(level: 2)
+        let neoH3 = Theme.headingFont(level: 3)
+        #expect(abs(neoH1.pointSize - (baselineH1.pointSize - 1.5)) < 0.01)
+        #expect(abs(neoH2.pointSize - (baselineH2.pointSize - 1.5)) < 0.01)
+        #expect(abs(neoH3.pointSize - (baselineH3.pointSize - 1.5)) < 0.01)
+        #expect( neoH1.pointSize > neoH2.pointSize && neoH2.pointSize > neoH3.pointSize )
+        if NSFont(name: "Unbounded-ExtraBold", size: 20) != nil {
+            #expect(neoH1.fontName.contains("Unbounded"))
+            #expect(neoH2.fontName.contains("Unbounded"))
+            #expect(neoH3.fontName.contains("Unbounded"))
+        }
+
+        // Explicit .neoAcid voice preserves Midnight/humanist body & italic typography and H1-H3 display headings even in other atmospheres
+        Theme.atmosphere = .botanical
+        Theme.voice = .neoAcid
+        #expect(Theme.bodyFont().fontName == baselineBody.fontName)
+        #expect(Theme.bodyFont(weight: .bold).fontName == Theme.bodyFont(weight: .semibold).fontName)
+        #expect(Theme.italicBodyFont().fontName == baselineItalic.fontName)
+        #expect(Theme.headingFont(level: 1).fontName == neoH1.fontName)
+        #expect(Theme.headingFont(level: 2).fontName == neoH2.fontName)
+        #expect(Theme.headingFont(level: 3).fontName == neoH3.fontName)
+
+        // Verify WCAG 2.1 contrast ratios for Neo-Acid tokens across Dark (.darkAqua) and Light (.aqua) appearances
+        func relativeLuminance(_ color: NSColor, in appearance: NSAppearance) -> Double {
+            var resolved: NSColor = color
+            appearance.performAsCurrentDrawingAppearance {
+                resolved = color.usingColorSpace(.sRGB) ?? color
+            }
+            func linear(_ c: CGFloat) -> Double {
+                let v = Double(max(0, min(1, c)))
+                return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(resolved.redComponent)
+                + 0.7152 * linear(resolved.greenComponent)
+                + 0.0722 * linear(resolved.blueComponent)
+        }
+        func contrastRatio(_ a: NSColor, _ b: NSColor, in appearance: NSAppearance) -> Double {
+            let l1 = relativeLuminance(a, in: appearance)
+            let l2 = relativeLuminance(b, in: appearance)
+            return (max(l1, l2) + 0.05) / (min(l1, l2) + 0.05)
+        }
+
+        Theme.atmosphere = .neoAcid
+        let darkApp = try #require(NSAppearance(named: .darkAqua))
+        let lightApp = try #require(NSAppearance(named: .aqua))
+
+        #expect(contrastRatio(Theme.headingInk, Theme.paper, in: darkApp) >= 12.0)
+        #expect(contrastRatio(Theme.ink, Theme.paper, in: darkApp) >= 9.0)
+        #expect(contrastRatio(Theme.muted, Theme.paper, in: darkApp) >= 4.5)
+        #expect(contrastRatio(Theme.muted, Theme.canvas, in: darkApp) >= 4.5)
+        #expect(contrastRatio(Theme.accent, Theme.paper, in: darkApp) >= 10.0)
+
+        #expect(contrastRatio(Theme.headingInk, Theme.paper, in: lightApp) >= 15.0)
+        #expect(contrastRatio(Theme.ink, Theme.paper, in: lightApp) >= 8.0)
+        #expect(contrastRatio(Theme.muted, Theme.paper, in: lightApp) >= 5.0)
+        #expect(contrastRatio(Theme.muted, Theme.canvas, in: lightApp) >= 5.0)
+        #expect(contrastRatio(Theme.subtle, Theme.canvas, in: lightApp) >= 4.5)
+        #expect(contrastRatio(Theme.accent, Theme.paper, in: lightApp) >= 5.5)
+
+        // Verify CaptureEditor applies H1, H2, H3, inline code, and WikiLink attributes under Neo-Acid and cycles cleanly in WorkspaceController
+        let tempBase = FileManager.default.temporaryDirectory
+            .resolvingSymlinksInPath()
+            .appendingPathComponent("cozy-neo-acid-\(UUID().uuidString)", isDirectory: true)
+        let vaultRoot = tempBase.appendingPathComponent("Vault", isDirectory: true)
+        let historyRoot = tempBase.appendingPathComponent("History", isDirectory: true)
+        try FileManager.default.createDirectory(at: vaultRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: historyRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+
+        let vault = try Vault(root: vaultRoot, historyRoot: historyRoot)
+        Theme.atmosphere = .study
+        Theme.voice = .humanist
+        let workspace = WorkspaceController(vault: vault)
+        defer { workspace.close() }
+
+        workspace.cycleAtmosphere()
+        #expect(Theme.atmosphere == .botanical)
+        workspace.cycleAtmosphere()
+        #expect(Theme.atmosphere == .neoAcid)
+        workspace.cycleAtmosphere()
+        #expect(Theme.atmosphere == .study)
+
+        for expected in [Theme.Voice.bookSerif, .editorial, .typewriter, .neoAcid, .humanist] {
+            workspace.cycleVoice()
+            #expect(Theme.voice == expected)
+        }
+
+        workspace.switchAtmosphere(.neoAcid)
+        workspace.switchVoice(.neoAcid)
+        workspace.editor.text = "# Heading One\n\n## Heading Two\n\n### Heading Three\n\nBody prose with `inlineCode` and [[TargetNote]]."
+        let storage = try #require(workspace.editor.textView.textStorage)
+        let ns = storage.string as NSString
+        let h1Font = try #require(storage.attribute(.font, at: ns.range(of: "Heading One").location, effectiveRange: nil) as? NSFont)
+        let h2Font = try #require(storage.attribute(.font, at: ns.range(of: "Heading Two").location, effectiveRange: nil) as? NSFont)
+        let h3Font = try #require(storage.attribute(.font, at: ns.range(of: "Heading Three").location, effectiveRange: nil) as? NSFont)
+        let proseFont = try #require(storage.attribute(.font, at: ns.range(of: "Body prose").location, effectiveRange: nil) as? NSFont)
+        #expect(h1Font.fontName == neoH1.fontName && abs(h1Font.pointSize - neoH1.pointSize) < 0.01)
+        #expect(h2Font.fontName == neoH2.fontName && abs(h2Font.pointSize - neoH2.pointSize) < 0.01)
+        #expect(h3Font.fontName == neoH3.fontName && abs(h3Font.pointSize - neoH3.pointSize) < 0.01)
+        #expect(proseFont.fontName == baselineBody.fontName)
+
+        // Verify Neo-Acid atmosphere + Unbounded H1-H3 headings meet Moby-Dick layout, resize, typing, and memory budgets
+        let report = try MobyDickWorkout.run(repeatCycles: 1, typingSample: "Whale")
+        #expect(report.step1.cpu.cpuTimeMs < 150.0)
+        #expect(report.step2.resizeAvgMs < 16.0)
+        #expect(report.step3.resizeAvgMs < 16.0)
+        #expect(report.step5.p95KeystrokeMs < 8.0)
+        if !report.repeats.isEmpty {
+            let growthPerCycle = (report.memoryFinal.physFootprintMB - report.memoryAfterFirstPass.physFootprintMB) / Double(report.repeats.count)
+            #expect(growthPerCycle < 5.0)
+        }
     }
 }
 #endif

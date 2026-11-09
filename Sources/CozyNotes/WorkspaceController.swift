@@ -195,12 +195,12 @@ import CozyCore
         voiceButton.target = self
         voiceButton.action = #selector(cycleVoice)
         voiceButton.font = Theme.monoFont(10, weight: .semibold)
-        voiceButton.toolTip = "Cycle writing typeface (Avenir / Charter / Iowan / Mono)"
+        voiceButton.toolTip = "Cycle writing typeface (Avenir / Charter / Iowan / Mono / Unbounded)"
 
         atmosphereButton.target = self
         atmosphereButton.action = #selector(cycleAtmosphere)
         atmosphereButton.font = Theme.monoFont(10, weight: .semibold)
-        atmosphereButton.toolTip = "Switch journal atmosphere (Obsidian / Midnight)"
+        atmosphereButton.toolTip = "Switch journal atmosphere (Obsidian / Midnight / Neo-Acid)"
         outlineButton.target = self
         outlineButton.action = #selector(toggleOutline)
         outlineButton.toolTip = "Toggle Document Outline (⌥⌘\\)"
@@ -403,8 +403,9 @@ import CozyCore
     }
 
     @objc func cycleAtmosphere() {
-        let next: Theme.Atmosphere = Theme.atmosphere == .study ? .botanical : .study
-        switchAtmosphere(next)
+        let cases = Theme.Atmosphere.allCases
+        let idx = cases.firstIndex(of: Theme.atmosphere) ?? 0
+        switchAtmosphere(cases[(idx + 1) % cases.count])
     }
 
     func switchAtmosphere(_ preset: Theme.Atmosphere) {

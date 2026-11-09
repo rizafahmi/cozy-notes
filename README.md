@@ -27,15 +27,15 @@ open '.build-app/Cozy Notes.app' --args --vault '/path/to/notes'
 
 The workspace is designed as a tactile commonplace book: an index desk on the left with lifted index slips, and an inset journal folio page on the right with a scholarly vertical margin rule, monospace dateline header, and a centered ~640pt reading column.
 
-Two curated atmospheres (**Obsidian & Ivory** and **Midnight Ink & Porcelain**) and four long-form writing voices (**Avenir Next + New York**, **Charter Book Serif**, **Iowan Old Style**, and **SF Mono Typewriter**) are built in. The editor uses a three-tier ink luminance hierarchy (luminous heading/bold ink, zero-halation body prose ink, and muted callout ink), element-specific paragraph rhythm (airy prose leading, grouped checklists with hanging indents, and compact code blocks), scholarly `H1`–`H3` left-gutter badges, custom-drawn blockquote ink bars, and monospace reading-time telemetry.
+Three curated atmospheres (**Obsidian & Ivory**, **Midnight Ink & Porcelain**, and **Neo-Acid & Plaster**) and five long-form writing voices (**Avenir Next + New York**, **Charter Book Serif**, **Iowan Old Style**, **SF Mono Typewriter**, and **Unbounded + Avenir Neo-Acid Display**) are built in. The editor uses a three-tier ink luminance hierarchy (luminous heading/bold ink, zero-halation body prose ink, and muted callout ink), element-specific paragraph rhythm (airy prose leading, grouped checklists with hanging indents, and compact code blocks), scholarly `H1`–`H3` left-gutter badges, custom-drawn blockquote ink bars, and monospace reading-time telemetry.
 
 - **Live continuous writing:** typing in the main editor writes and autosaves directly to the active note in place—your note never vanishes after saving, and there is no read-only lock on Markdown notes.
 - **Command–N:** save any pending edits and start a fresh note in the editor.
 - **Command–\\:** toggle the index sidebar to enter or leave distraction-free Focus Mode.
-- **Command–Shift–Y (or click `Aa AVENIR` / `CHARTER` / `IOWAN` / `MONO` in the folio header):** cycle through the four writing voices.
+- **Command–Shift–Y (or click `Aa AVENIR` / `CHARTER` / `IOWAN` / `MONO` / `UNBOUNDED` in the folio header):** cycle through the five writing voices.
 - **Command–Plus / Command–Minus / Command–0:** scale the editor writing size up, down, or back to default.
 - **Command–Shift–D:** toggle Light / Dark appearance directly inside Cozy Notes.
-- **Command–Shift–T (or click `OBSIDIAN` / `MIDNIGHT` in the folio header):** switch between **Obsidian & Ivory** and **Midnight Ink & Porcelain** atmospheres.
+- **Command–Shift–T (or click `OBSIDIAN` / `MIDNIGHT` / `NEO-ACID` in the folio header):** switch between **Obsidian & Ivory**, **Midnight Ink & Porcelain**, and **Neo-Acid & Plaster** atmospheres.
 - **Command–F (or Command–2):** reveal the sidebar and focus the search bar. **Command–1** focuses the note editor.
 - **Command–S / Command–Return:** save the active note immediately (or keep the capture in Quick Capture).
 - **Attachments in any note:** paste an image, drop files, or click **Attach** on either a brand-new note or an existing note. Files are copied into `Attachments/<note-uuid>/`, relative Markdown links are appended, and interactive preview pills appear at the bottom of the editor. Clicking an attachment pill opens the file; clicking `×` removes the link from the note without deleting the file on disk.
