@@ -169,35 +169,45 @@ import CozyCore
         super.setFrameSize(NSSize(width: newSize.width, height: clampedHeight))
     }
 
+    private(set) var lastInvalidatedRect: NSRect = .zero
+
+    override var preparedContentRect: NSRect {
+        get { visibleRect }
+        set { super.preparedContentRect = visibleRect }
+    }
+
     override func setNeedsDisplay(_ invalidRect: NSRect, avoidAdditionalLayout flag: Bool) {
         if enclosingScrollView != nil {
             let vis = visibleRect
             if vis.width > 0 && vis.height > 0 {
-                let clipped = invalidRect.intersection(vis)
-                guard !clipped.isNull && clipped.width > 0 && clipped.height > 0 else { return }
-                super.setNeedsDisplay(clipped, avoidAdditionalLayout: true)
+                guard !invalidRect.isNull && invalidRect.width > 0 && invalidRect.height > 0 else { return }
+                lastInvalidatedRect = vis
+                super.setNeedsDisplay(vis, avoidAdditionalLayout: true)
                 return
             }
         }
+        lastInvalidatedRect = invalidRect
         super.setNeedsDisplay(invalidRect, avoidAdditionalLayout: flag)
     }
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         guard let layoutManager = layoutManager, let textContainer = textContainer, let storage = textStorage else { return }
         let totalLength = storage.length
         guard totalLength > 0 else { return }
         let origin = textContainerOrigin
+        let queryRect = rect.offsetBy(dx: -origin.x, dy: -origin.y).insetBy(dx: 0, dy: -96)
+        if queryRect.width > 0 && queryRect.height > 0 {
+            layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
+        }
+        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         let columnWidth = max(0, bounds.width - 2 * origin.x)
 
-        let queryRect = rect.offsetBy(dx: -origin.x, dy: -origin.y).insetBy(dx: 0, dy: -96)
         let visibleGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: queryRect, in: textContainer)
         guard visibleGlyphs.length > 0 else { return }
         let visibleChars = layoutManager.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
         let visStart = visibleChars.location
         let visEnd = NSMaxRange(visibleChars)
-
         if !externalChangeRanges.isEmpty {
             for changeRange in externalChangeRanges {
                 if changeRange.location > visEnd { break }
@@ -611,8 +621,19 @@ import CozyCore
         windowFocusObservers.removeAll()
         wantsLayer = true
         ensureCaretSublayer()
+        let nc = NotificationCenter.default
+        if let clipView = enclosingScrollView?.contentView {
+            clipView.postsBoundsChangedNotifications = true
+            windowFocusObservers.append(
+                nc.addObserver(forName: NSView.boundsDidChangeNotification, object: clipView, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.setNeedsDisplay(self.visibleRect, avoidAdditionalLayout: true)
+                    }
+                }
+            )
+        }
         if let window {
-            let nc = NotificationCenter.default
             windowFocusObservers.append(
                 nc.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
                     MainActor.assumeIsolated { self?.updateCaret(animated: false) }
@@ -624,7 +645,6 @@ import CozyCore
                 }
             )
         }
-        updateCaret(animated: false)
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -1547,7 +1567,7 @@ import CozyCore
         }
         minimumOverscrollHeight = 0
         updateCaret(animated: false)
-        setNeedsDisplay(visibleRect, avoidAdditionalLayout: true)
+        setNeedsDisplay(bounds, avoidAdditionalLayout: true)
     }
 
     private static let listLineCheckRegex = try! NSRegularExpression(pattern: "(?m)^[ \\t]*(?:[-*+]|\\d+\\.)(?:\\s+\\[[ xX]\\])? ")
@@ -3418,7 +3438,7 @@ import CozyCore
         onHorizontalInsetChange?(insetX)
         if geometryChanged {
             textView.updateCaret(animated: false)
-            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             if isWikiAutocompleteVisible {
                 positionWikiCompletionView()
             }
@@ -3484,7 +3504,7 @@ import CozyCore
                 lastCursorLine = ns.length > 0 ? ns.lineRange(for: NSRange(location: min(clampedLocation, ns.length), length: 0)) : NSRange(location: 0, length: 0)
                 textView.suppressCaretUpdates = false
                 textView.updateCaret(animated: false)
-                textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+                textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
                 if isInNoteFindVisible {
                     updateInNoteFindMatches(scrollToMatch: false)
                 }
@@ -3546,8 +3566,8 @@ import CozyCore
             if let edit, edit.mayHaveLink {
                 hasPotentialLinks = true
             }
-            if didTouchAttributes {
-                textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            if didTouchAttributes || edit != nil {
+                textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             }
             updateWikiAutocompleteAfterEdit(force: false)
             if isInNoteFindVisible {
@@ -3723,7 +3743,7 @@ import CozyCore
     func refreshTypography() {
         formatMarkdown()
         textView.updateCaret(animated: false)
-        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
     private func handleFocusChange() {
@@ -3826,7 +3846,7 @@ import CozyCore
             scroll.reflectScrolledClipView(clipView)
         }
         textView.updateCaret(animated: false)
-        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
         refreshOutline()
         focus()
     }
@@ -3841,7 +3861,7 @@ import CozyCore
     func clearExternalChangeHighlights() {
         guard !textView.externalChangeRanges.isEmpty else { return }
         textView.externalChangeRanges.removeAll()
-        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
     @discardableResult
@@ -3875,7 +3895,7 @@ import CozyCore
         if isOutlineVisible {
             refreshOutline()
         }
-        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
         return changedRanges.count
     }
 
@@ -3951,7 +3971,7 @@ import CozyCore
         textView.inNoteFindRanges = []
         textView.activeInNoteFindIndex = -1
         inNoteFindBar.countLabel.stringValue = ""
-        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
         window?.makeFirstResponder(textView)
     }
 
@@ -3984,7 +4004,7 @@ import CozyCore
             textView.inNoteFindRanges = []
             textView.activeInNoteFindIndex = -1
             inNoteFindBar.countLabel.stringValue = ""
-            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             return
         }
         var ranges: [NSRange] = []
@@ -4005,7 +4025,7 @@ import CozyCore
         guard !ranges.isEmpty else {
             textView.activeInNoteFindIndex = -1
             inNoteFindBar.countLabel.stringValue = "0 MATCHES"
-            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             return
         }
         let cursorLoc = textView.selectedRange().location
@@ -4018,7 +4038,7 @@ import CozyCore
         if scrollToMatch {
             revealActiveInNoteFindMatch()
         } else {
-            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
         }
     }
 
@@ -4032,7 +4052,7 @@ import CozyCore
         inNoteFindBar.countLabel.stringValue = "\(idx + 1) OF \(textView.inNoteFindRanges.count)"
         textView.setSelectedRange(matchRange)
         textView.scrollRangeToVisible(matchRange)
-        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
     func hideWikiAutocomplete() {
@@ -4479,7 +4499,7 @@ import CozyCore
         guard oldNeeds || newNeeds else { return }
         if !textView.fencedBlocks.isEmpty || !textView.tableBlocks.isEmpty {
             formatMarkdown()
-            textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+            textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             return
         }
         isFormatting = true
@@ -4503,7 +4523,7 @@ import CozyCore
             formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c, wikiLinks: &w, bullets: &b)
         }
         storage.endEditing()
-        textView.setNeedsDisplay(textView.visibleRect, avoidAdditionalLayout: true)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
     private func lineHasMarkdownSyntax(_ ns: NSString, lineRange: NSRange) -> Bool {

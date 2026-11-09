@@ -1349,5 +1349,72 @@ struct MobyDickWorkoutSuite {
         let narrowTable = try #require(narrowEditor.textView.tableBlocks.first)
         #expect(narrowTable.columnDividerOffsets.isEmpty, "Wide multi-column table exceeding narrow width must omit vertical dividers rather than overflowing across them")
     }
+
+    @Test("Scrolling down and up after heading cursor transitions and newline edits above blockquotes invalidates full visible viewport without stale tile artifacts")
+    @MainActor
+    func scrollAfterHeadingAndBlockquoteEditsInvalidatesFullViewport() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 420),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 780, height: 420))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        defer { window.orderOut(nil) }
+
+        var paragraphs: [String] = [
+            "**Create a staging environment with fictional agencies and travelers**. You will need at least **two agencies to test data separation**.",
+            "Your first deliverable should be a **reproducible setup** and an explicit list of unknowns.",
+            "## 3. Learn the system one complete business workflow at a time.",
+            "Reading every file sequentially would be slow and would obscure how the pieces interact. Start with this UConnect workflow.",
+            "> Agency receives a lead → creates a booking group → assigns a departure → issues an invoice → receives payment → updates commission eligibility → gives the jamaah portal access."
+        ]
+        for i in 1...18 {
+            paragraphs.append("Paragraph \(i): demonstrate how the app handles a new inquiry, a family booking, an installment payment, a cancellation, and missing travel documents.")
+        }
+        editor.text = paragraphs.joined(separator: "\n\n")
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+
+        let textView = editor.textView
+        let scrollView = try #require(textView.enclosingScrollView)
+        let clipView = scrollView.contentView
+        #expect(textView.preparedContentRect == textView.visibleRect)
+
+        // Requesting display of a narrow left-tile rect (x < 512) must expand to the full visibleRect (crossing x = 512)
+        textView.setNeedsDisplay(NSRect(x: 180, y: 240, width: 10, height: 24), avoidAdditionalLayout: false)
+        #expect(textView.lastInvalidatedRect == textView.visibleRect)
+        #expect(textView.lastInvalidatedRect.maxX > 512, "Full-viewport invalidation must span across the 512pt tile boundary")
+
+        // Move cursor onto the H2 heading, then onto the blank line before the blockquote and insert a newline
+        let ns = editor.nsText
+        let headingRange = ns.range(of: "## 3. Learn")
+        #expect(headingRange.location != NSNotFound)
+        textView.setSelectedRange(NSRange(location: headingRange.location + 3, length: 0))
+        #expect(textView.lastInvalidatedRect == textView.visibleRect)
+        window.displayIfNeeded()
+
+        let quoteRange = ns.range(of: "> Agency receives")
+        #expect(quoteRange.location != NSNotFound)
+        textView.setSelectedRange(NSRange(location: quoteRange.location - 1, length: 0))
+        textView.insertText("\n", replacementRange: textView.selectedRange())
+        #expect(textView.lastInvalidatedRect == textView.visibleRect)
+        window.displayIfNeeded()
+
+        // Scrolling down and back up must immediately invalidate the new visibleRect via clipView bounds observer
+        for targetY in [CGFloat(140), CGFloat(280), CGFloat(90), CGFloat(0)] {
+            clipView.scroll(to: NSPoint(x: 0, y: targetY))
+            scrollView.reflectScrolledClipView(clipView)
+            #expect(textView.lastInvalidatedRect == textView.visibleRect)
+            #expect(abs(textView.lastInvalidatedRect.minY - targetY) <= 1.0)
+            window.displayIfNeeded()
+            #expect(textView.preparedContentRect == textView.visibleRect)
+        }
+        #expect(textView.blockquoteRanges.count == 1)
+    }
 }
 #endif
