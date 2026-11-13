@@ -12,6 +12,8 @@ import CozyCore
 
     private let card = PaperSurface(cornerRadius: 8, color: Theme.accentSoft, bordered: true)
     private let icon = Theme.symbol("arrow.triangle.2.circlepath", size: 12, color: Theme.accent)
+    private var exitOverlay: FeedbackOverlay?
+
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -42,8 +44,15 @@ import CozyCore
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let row = Theme.stack([icon, messageLabel, spacer, reloadButton, overwriteButton, keepCopyButton], spacing: 6)
-        Theme.fill(row, in: card, inset: 6)
+        card.wantsLayer = true
         Theme.fill(card, in: self)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -53,6 +62,52 @@ import CozyCore
             messageLabel.stringValue = "Modified on disk while editing · Reload disk, overwrite disk, or keep a copy"
         } else {
             messageLabel.stringValue = "Modified on disk · Reload to view & highlight external changes"
+        }
+    }
+
+    func setPresented(_ presented: Bool, editor: CaptureEditor, updateLayout: () -> Void) {
+        guard isHidden == presented else { return }
+        exitOverlay?.removeFromSuperview()
+        exitOverlay = nil
+        if presented {
+            editor.preserveReadingPosition {
+                isHidden = false
+                updateLayout()
+            }
+            if window?.isVisible == true, let layer = card.layer {
+                Theme.fade(layer, to: 1, duration: 0.16, from: 0)
+            }
+        } else {
+            if window?.isVisible == true, let parent = superview {
+                let overlay = FeedbackOverlay(frame: frame)
+                let backing = PaperSurface(cornerRadius: 8, color: Theme.accentSoft, bordered: true)
+                backing.frame = overlay.bounds
+                backing.wantsLayer = true
+                overlay.addSubview(backing)
+                overlay.setAccessibilityElement(false)
+                parent.addSubview(overlay, positioned: .above, relativeTo: self)
+                exitOverlay = overlay
+                if let layer = backing.layer {
+                    Theme.fade(layer, to: 0, duration: 0.12) { [weak self, weak overlay] in
+                        overlay?.removeFromSuperview()
+                        if self?.exitOverlay === overlay { self?.exitOverlay = nil }
+                    }
+                }
+            }
+            editor.preserveReadingPosition {
+                isHidden = true
+                updateLayout()
+            }
+            card.layer?.removeAnimation(forKey: "feedback.opacity")
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            exitOverlay?.removeFromSuperview()
+            exitOverlay = nil
+            card.layer?.removeAnimation(forKey: "feedback.opacity")
         }
     }
 
@@ -988,13 +1043,12 @@ import CozyCore
 
     private func updateEditorChrome() {
         let showBanner = hasExternalDiskChange || noteConflicted
-        if reviewBanner.isHidden == showBanner {
-            reviewBanner.isHidden = !showBanner
-            bannerTopConstraint?.constant = showBanner ? 8 : 0
-            bannerHeightConstraint?.constant = showBanner ? 38 : 0
-        }
         if showBanner {
             reviewBanner.configure(hasLocalEdits: noteDirty || noteConflicted)
+        }
+        reviewBanner.setPresented(showBanner, editor: editor) {
+            bannerTopConstraint?.constant = showBanner ? 8 : 0
+            bannerHeightConstraint?.constant = showBanner ? 38 : 0
         }
         if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
         let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted
@@ -1741,13 +1795,12 @@ import CozyCore
 
     private func updateEditorChrome() {
         let showBanner = hasExternalDiskChange || noteConflicted
-        if reviewBanner.isHidden == showBanner {
-            reviewBanner.isHidden = !showBanner
-            bannerTopConstraint?.constant = showBanner ? 8 : 0
-            bannerHeightConstraint?.constant = showBanner ? 38 : 0
-        }
         if showBanner {
             reviewBanner.configure(hasLocalEdits: noteDirty || noteConflicted)
+        }
+        reviewBanner.setPresented(showBanner, editor: editor) {
+            bannerTopConstraint?.constant = showBanner ? 8 : 0
+            bannerHeightConstraint?.constant = showBanner ? 38 : 0
         }
         if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
         let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted

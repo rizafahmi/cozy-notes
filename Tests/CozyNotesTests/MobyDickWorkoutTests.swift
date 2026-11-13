@@ -511,6 +511,98 @@ struct MobyDickWorkoutSuite {
         #expect(editor.textView.bulletItems.first?.level == 0)
     }
 
+    @Test("Quick Capture deduplicates repeated URLs within one attachment batch before copying files")
+    @MainActor
+    func quickCaptureDeduplicatesAttachmentBatch() throws {
+        _ = NSApplication.shared
+        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("CozyQuickCaptureAttachments-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let vault = try Vault(root: base.appendingPathComponent("Vault"), historyRoot: base.appendingPathComponent("History"))
+        let source = base.appendingPathComponent("reference.txt")
+        let bytes = Data("Preserve this attachment once.".utf8)
+        try bytes.write(to: source)
+        let quick = QuickCaptureController(vault: vault)
+        defer { quick.window?.orderOut(nil) }
+
+        quick.editor.addAttachments([source, source])
+        #expect(quick.editor.attachments == [source])
+        quick.editor.addAttachments([source, source])
+        #expect(quick.editor.attachments == [source])
+        quick.save()
+
+        let record = try #require(vault.notes().first)
+        let links = vault.linkedAttachments(in: try vault.read(record.url), relativeTo: record.url)
+        #expect(links.map { $0.url.lastPathComponent } == ["reference.txt"])
+        let attachment = try #require(links.first)
+        let files = try FileManager.default.contentsOfDirectory(at: attachment.url.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+        #expect(files.map(\.lastPathComponent) == ["reference.txt"])
+        #expect(try Data(contentsOf: attachment.url) == bytes)
+    }
+
+    @Test("Attachment removal keeps the surviving file and reading position, including repeated links and updated button targets")
+    @MainActor
+    func attachmentRemovalPreservesIdentityAndViewport() throws {
+        _ = NSApplication.shared
+        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("CozyAttachmentFeedback-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let vault = try Vault(root: base.appendingPathComponent("Vault"), historyRoot: base.appendingPathComponent("History"))
+        let firstFile = base.appendingPathComponent("first.txt")
+        let secondFile = base.appendingPathComponent("second.txt")
+        try "First attachment".write(to: firstFile, atomically: true, encoding: .utf8)
+        try "Second attachment".write(to: secondFile, atomically: true, encoding: .utf8)
+        let prose = (1...80).map { "Reading anchor line \($0)." }.joined(separator: "\n")
+        let record = try vault.capture(text: prose, attachments: [firstFile, secondFile])
+        let initialText = try vault.read(record.url)
+        let links = vault.linkedAttachments(in: initialText, relativeTo: record.url)
+        let firstLink = try #require(links.first)
+        let duplicate = (initialText as NSString).substring(with: firstLink.markdownRange)
+        try vault.save(initialText + "\n" + duplicate + "\n", to: record.url, expectedContent: initialText)
+        let workspace = WorkspaceController(vault: vault)
+        workspace.showAndFocus()
+        defer {
+            workspace.shutdown()
+            workspace.window?.orderOut(nil)
+        }
+        workspace.openNote(record.url)
+        workspace.window?.contentView?.layoutSubtreeIfNeeded()
+        let editor = workspace.editor
+        let strip = try #require(editor.subviews.compactMap { $0 as? NSScrollView }.first { $0.documentView is NSStackView })
+        let chips = try #require(strip.documentView as? NSStackView)
+        #expect(editor.linkedAttachments.map(\.url) == [links[0].url, links[1].url, links[0].url])
+        let secondCard = chips.arrangedSubviews[1]
+        let repeatedCard = chips.arrangedSubviews[2]
+        let textScroll = try #require(editor.textView.enclosingScrollView)
+        let clip = textScroll.contentView
+        clip.setBoundsOrigin(NSPoint(x: 0, y: 500))
+        textScroll.reflectScrolledClipView(clip)
+        let anchor = editor.textView.convert(NSPoint(x: 0, y: 560), to: nil)
+
+        func removeButton(in card: NSView) throws -> NSButton {
+            let row = try #require(card.subviews.first as? NSStackView)
+            return try #require(row.arrangedSubviews.compactMap { $0 as? NSButton }.last)
+        }
+        func activate(_ button: NSButton) throws {
+            let action = try #require(button.action)
+            _ = NSApp.sendAction(action, to: button.target, from: button)
+        }
+        try activate(try removeButton(in: chips.arrangedSubviews[0]))
+        #expect(editor.linkedAttachments.map(\.url) == [links[1].url, links[0].url])
+        #expect(chips.arrangedSubviews[0] === secondCard)
+        #expect(chips.arrangedSubviews[1] === repeatedCard)
+        #expect(editor.textView.convert(NSPoint(x: 0, y: 560), to: nil) == anchor)
+        try activate(try removeButton(in: secondCard))
+        #expect(editor.linkedAttachments.map(\.url) == [links[0].url])
+        #expect(chips.arrangedSubviews[0] === repeatedCard)
+        try activate(try removeButton(in: repeatedCard))
+        #expect(editor.linkedAttachments.isEmpty)
+        #expect(strip.isHidden)
+        #expect(editor.textView.convert(NSPoint(x: 0, y: 560), to: nil) == anchor)
+        #expect((try vault.read(record.url)).hasPrefix(prose))
+        for link in links { #expect(FileManager.default.fileExists(atPath: link.url.path)) }
+    }
+
     @Test("Checking and unchecking tasks near viewport edges preserves the caret line, indentation, and scroll position", arguments: [false, true])
     @MainActor
     func checklistMarkerEditsPreserveViewport(includesCodeFence: Bool) throws {
@@ -553,7 +645,6 @@ struct MobyDickWorkoutSuite {
                 let savedOrigin = clipView.bounds.origin
                 let caretY = textView.currentCaretRect().minY - savedOrigin.y
                 textView.insertText(state, replacementRange: stateRange)
-                textView.completeScrollSpringImmediately()
 
                 #expect(editor.nsText.substring(with: NSRange(location: marker.location, length: 3)) == "[\(state)]")
                 #expect(textView.selectedRange() == NSRange(location: NSMaxRange(stateRange), length: 0))
@@ -602,7 +693,6 @@ struct MobyDickWorkoutSuite {
         scrollView.reflectScrolledClipView(clipView)
         textView.setSelectedRange(NSRange(location: 0, length: 0))
         textView.doCommand(by: #selector(NSResponder.moveToEndOfDocument(_:)))
-        textView.completeScrollSpringImmediately()
 
         // Navigating to the end below the fold must scroll clipView up so the caret sits at ~70% of visHeight (~30% breathing room below)
         let caretAfterNav = textView.currentCaretRect()
@@ -616,7 +706,6 @@ struct MobyDickWorkoutSuite {
         for i in 1...4 {
             textView.insertText("\nAppended line \(i) below the fold", replacementRange: textView.selectedRange())
         }
-        textView.completeScrollSpringImmediately()
         let caretAfterTyping = textView.currentCaretRect()
         let originAfterTyping = clipView.bounds.origin.y
         #expect(originAfterTyping > originBeforeNewlines, "Typing new lines at the bottom must continue scrolling up")

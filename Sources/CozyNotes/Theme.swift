@@ -479,6 +479,34 @@ import AppKit
         button.contentTintColor = ink
         return button
     }
+    static let feedbackTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+
+    static func fade(_ layer: CALayer, to opacity: Float, duration: TimeInterval, from initialOpacity: Float? = nil, completion: (() -> Void)? = nil) {
+        let start = initialOpacity ?? layer.presentation()?.opacity ?? layer.opacity
+        let fadeDuration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? min(duration, 0.08) : duration
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = opacity
+        if fadeDuration > 0, abs(start - opacity) > 0.001 {
+            if let completion {
+                CATransaction.setCompletionBlock {
+                    MainActor.assumeIsolated { completion() }
+                }
+            }
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = start
+            fade.toValue = opacity
+            fade.duration = fadeDuration
+            fade.timingFunction = feedbackTimingFunction
+            layer.add(fade, forKey: "feedback.opacity")
+            CATransaction.commit()
+        } else {
+            layer.removeAnimation(forKey: "feedback.opacity")
+            CATransaction.commit()
+            completion?()
+        }
+    }
+
     static func stack(_ views: [NSView], orientation: NSUserInterfaceLayoutOrientation = .horizontal, spacing: CGFloat = 10) -> NSStackView {
         let stack = NSStackView(views: views)
         stack.orientation = orientation
@@ -497,6 +525,11 @@ import AppKit
             view.bottomAnchor.constraint(equalTo: parent.bottomAnchor, constant: -inset)
         ])
     }
+}
+
+/// Exit feedback must never intercept input in the space the removed content occupied.
+@MainActor final class FeedbackOverlay: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 /// Keep native button tracking, keyboard activation, and accessibility; draw the ink treatment ourselves.

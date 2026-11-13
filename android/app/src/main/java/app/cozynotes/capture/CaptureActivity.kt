@@ -8,20 +8,23 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
-import android.view.Choreographer
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.ViewConfiguration
+import android.view.animation.PathInterpolator
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
-import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -38,8 +41,8 @@ import java.util.Locale
 
 class CaptureActivity : ComponentActivity() {
     private lateinit var worker: CaptureWorker
-    private lateinit var text: EditText
-    private lateinit var note: EditText
+    private lateinit var text: SpringCaretEditText
+    private lateinit var note: SpringCaretEditText
     private lateinit var folder: TextView
     private lateinit var wordCountLabel: TextView
     private lateinit var sealDot: View
@@ -48,6 +51,10 @@ class CaptureActivity : ComponentActivity() {
     private lateinit var save: Button
     private lateinit var choose: Button
     private lateinit var fresh: Button
+    private var captureSaved = false
+    private var actionInitialized = false
+    private var actionShowsSaved = false
+    private var animateSaveCompletion = false
     private val attachments = mutableListOf<Uri>()
     private val preferences by lazy { getSharedPreferences("capture", MODE_PRIVATE) }
 
@@ -89,9 +96,8 @@ class CaptureActivity : ComponentActivity() {
             note.setText(savedInstanceState.getString("note", ""))
             savedInstanceState.getStringArrayList("attachments")?.mapTo(attachments, Uri::parse)
             if (savedInstanceState.getBoolean("saved", false) && worker.result == null) {
+                captureSaved = true
                 status.text = "Your previous capture was saved. Start a new capture below."
-                save.visibility = View.GONE
-                fresh.visibility = View.VISIBLE
             } else if (savedInstanceState.getBoolean("saving", false) && !worker.busy && worker.result == null) {
                 status.text = "Android interrupted the previous save. Check Inbox for the capture before retrying. Any .pending file is incomplete."
             }
@@ -103,11 +109,14 @@ class CaptureActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        worker.listener = { render() }
+        worker.listener = { render(animateCompletion = animateSaveCompletion) }
         render()
     }
 
     override fun onStop() {
+        animateSaveCompletion = false
+        actionInitialized = false
+        showCaptureAction(captureSaved || worker.result != null, animated = false)
         worker.listener = null
         super.onStop()
     }
@@ -117,7 +126,7 @@ class CaptureActivity : ComponentActivity() {
         outState.putString("note", note.text.toString())
         outState.putStringArrayList("attachments", ArrayList(attachments.map(Uri::toString)))
         outState.putBoolean("saving", worker.busy)
-        outState.putBoolean("saved", worker.result != null || save.visibility == View.GONE)
+        outState.putBoolean("saved", captureSaved || worker.result != null)
         super.onSaveInstanceState(outState)
     }
 
@@ -159,16 +168,14 @@ class CaptureActivity : ComponentActivity() {
             setTextColor(mutedInk)
             topBar.addView(this, LinearLayout.LayoutParams(0, -2, 1f))
         }
-        choose = Button(this).apply {
+        choose = FeedbackButton(this, recessedColor, borderColor, dp(8)).apply {
             this.text = "Choose vault…"
             textSize = 12f
             isAllCaps = false
             setTextColor(headingInk)
-            background = surfaceDrawable(recessedColor, borderColor, dp(8))
             setPadding(dp(12), dp(6), dp(12), dp(6))
             minHeight = dp(32)
             minimumHeight = dp(32)
-            stateListAnimator = null
             setOnClickListener { chooseFolder() }
             topBar.addView(this, LinearLayout.LayoutParams(-2, dp(34)))
         }
@@ -223,7 +230,7 @@ class CaptureActivity : ComponentActivity() {
             override fun afterTextChanged(s: Editable?) { updateWordCount() }
         }
 
-        text = SmoothCaretEditText(this, accentColor).apply {
+        text = SpringCaretEditText(this, accentColor).apply {
             id = 1001
             hint = "Begin a note, paste a link, or jot a thought…"
             minLines = 7
@@ -258,7 +265,7 @@ class CaptureActivity : ComponentActivity() {
             folioCard.addView(this, LinearLayout.LayoutParams(-1, -2))
         }
 
-        note = SmoothCaretEditText(this, accentColor).apply {
+        note = SpringCaretEditText(this, accentColor).apply {
             id = 1002
             hint = "Add context or a note for shared links & files…"
             minLines = 2
@@ -286,38 +293,37 @@ class CaptureActivity : ComponentActivity() {
         outer.addView(folioCard, LinearLayout.LayoutParams(-1, -2))
 
         // 3. Primary & Secondary Actions below the Folio
-        save = Button(this).apply {
+        val actionSlot = FrameLayout(this)
+        outer.addView(actionSlot, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(16) })
+        save = FeedbackButton(this, accentColor, accentColor, dp(12)).apply {
             this.text = "Keep in Inbox"
             textSize = 15f
             isAllCaps = false
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             setTextColor(onAccentColor)
-            background = surfaceDrawable(accentColor, accentColor, dp(12))
-            stateListAnimator = null
-            setOnClickListener { saveCapture() }
-            outer.addView(this, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(16) })
+            setOnClickListener { saveCapture(animated = (it as FeedbackButton).isTouchClick) }
+            actionSlot.addView(this, FrameLayout.LayoutParams(-1, -1))
         }
 
-        fresh = Button(this).apply {
+        fresh = FeedbackButton(this, recessedColor, borderColor, dp(12)).apply {
             this.text = "New Folio Capture"
             textSize = 15f
             isAllCaps = false
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             setTextColor(headingInk)
-            background = surfaceDrawable(recessedColor, borderColor, dp(12))
-            stateListAnimator = null
-            visibility = View.GONE
+            visibility = View.INVISIBLE
             setOnClickListener {
                 this@CaptureActivity.text.setText("")
                 note.setText("")
                 attachments.clear()
                 status.text = ""
-                save.visibility = View.VISIBLE
+                captureSaved = false
+                animateSaveCompletion = false
                 worker.reset()
                 render()
                 this@CaptureActivity.text.requestFocus()
             }
-            outer.addView(this, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(16) })
+            actionSlot.addView(this, FrameLayout.LayoutParams(-1, -1))
         }
 
         status = TextView(this).apply {
@@ -408,7 +414,7 @@ class CaptureActivity : ComponentActivity() {
         it.uri == uri && it.isReadPermission && it.isWritePermission
     }
 
-    private fun saveCapture() {
+    private fun saveCapture(animated: Boolean) {
         val selected = root
         if (selected == null || !hasPermission(selected)) {
             status.text = "Choose the vault folder again to grant writable access. Your input is kept."
@@ -420,6 +426,7 @@ class CaptureActivity : ComponentActivity() {
             status.text = "Add text, a link, or share an attachment first."
             return
         }
+        animateSaveCompletion = animated
         worker.start(CaptureRequest(selected, combined, attachments.toList()))
     }
 
@@ -433,7 +440,7 @@ class CaptureActivity : ComponentActivity() {
         wordCountLabel.text = "$words ${if (words == 1) "WORD" else "WORDS"}"
     }
 
-    private fun render() {
+    private fun render(animateCompletion: Boolean = false) {
         val selected = root
         val validVault = selected != null && hasPermission(selected)
         folder.text = when {
@@ -457,9 +464,10 @@ class CaptureActivity : ComponentActivity() {
             attachmentsLabel.setTextColor(seafoamColor)
         }
         updateWordCount()
-        val done = worker.result != null || save.visibility == View.GONE
+        val done = captureSaved || worker.result != null
+        captureSaved = done
         save.isEnabled = !worker.busy && !done
-        save.alpha = if (save.isEnabled) 1f else 0.55f
+        if (!done) save.alpha = if (save.isEnabled) 1f else 0.55f
         choose.isEnabled = !worker.busy
         text.isEnabled = !worker.busy && !done
         note.isEnabled = !worker.busy && !done
@@ -474,10 +482,39 @@ class CaptureActivity : ComponentActivity() {
         worker.result?.let {
             status.setTextColor(seafoamColor)
             status.text = "Saved to ${it.path}"
-            save.visibility = View.GONE
         }
-        fresh.visibility = if (done) View.VISIBLE else View.GONE
+        showCaptureAction(done, animated = animateCompletion && done)
         status.visibility = if (status.text.isNullOrBlank()) View.GONE else View.VISIBLE
+    }
+
+    private fun showCaptureAction(done: Boolean, animated: Boolean) {
+        if (actionInitialized && actionShowsSaved == done) return
+        val canAnimate = animated && actionInitialized && save.isLaidOut && hasWindowFocus() && ValueAnimator.areAnimatorsEnabled()
+        actionInitialized = true
+        actionShowsSaved = done
+        save.animate().cancel()
+        fresh.animate().cancel()
+        val incoming = if (done) fresh else save
+        val outgoing = if (done) save else fresh
+        outgoing.isEnabled = false
+        outgoing.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        incoming.isEnabled = !worker.busy
+        incoming.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        incoming.visibility = View.VISIBLE
+        incoming.bringToFront()
+        if (!canAnimate) {
+            incoming.alpha = if (incoming.isEnabled) 1f else 0.55f
+            outgoing.visibility = View.INVISIBLE
+            outgoing.alpha = 1f
+            return
+        }
+        val duration = CaptureMotion.duration(this, 120L)
+        incoming.alpha = 0f
+        outgoing.visibility = View.VISIBLE
+        incoming.animate().alpha(1f).setDuration(duration).setInterpolator(CaptureMotion.easing).start()
+        outgoing.animate().alpha(0f).setDuration(duration).setInterpolator(CaptureMotion.easing).withEndAction {
+            if (actionShowsSaved == done) outgoing.visibility = View.INVISIBLE
+        }.start()
     }
 
     private fun surfaceDrawable(fill: Int, stroke: Int, radius: Int) = GradientDrawable().apply {
@@ -488,265 +525,171 @@ class CaptureActivity : ComponentActivity() {
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }
 
-/**
- * EditText with Bike-style critically-damped spring caret animation (response = 0.125s, dampingRatio = 1.0)
- * and velocity preservation across rapid keystrokes.
- */
-private class SmoothCaretEditText(
-    context: Context,
-    private val caretColor: Int
-) : EditText(context), Choreographer.FrameCallback {
-    private val density = resources.displayMetrics.density
-    private val caretWidthPx = 2f * density
-    private val caretRadiusPx = 1f * density
-    private val maxDeltaXPx = 180f * density
-    private val maxDeltaYPx = 120f * density
-    private val caretPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = caretColor
-    }
-    private val caretRect = RectF()
+internal object CaptureMotion {
+    val easing = PathInterpolator(0.42f, 0f, 0.58f, 1f)
 
-    // Critically-damped spring frequency: omega0 = 2 * pi / response (response = 0.125s)
-    private val omega0 = (2.0 * Math.PI / 0.125).toFloat()
+    fun reducesMotion(context: Context): Boolean =
+        Settings.Global.getFloat(context.contentResolver, Settings.Global.TRANSITION_ANIMATION_SCALE, 1f) == 0f ||
+            Settings.Global.getFloat(context.contentResolver, Settings.Global.WINDOW_ANIMATION_SCALE, 1f) == 0f
 
-    private var hasCaretOrigin = false
-    private var currentX = 0f
-    private var currentY = 0f
-    private var currentHeight = 0f
-    private var targetX = 0f
-    private var targetY = 0f
-    private var targetHeight = 0f
-    private var velocityX = 0f
-    private var velocityY = 0f
-    private var velocityH = 0f
+    fun allowsCaretAnimation(context: Context): Boolean = ValueAnimator.areAnimatorsEnabled() &&
+        Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f && !reducesMotion(context)
 
-    private var frameScheduled = false
-    private var lastFrameNanos = 0L
-    private var lastInteractionMs = 0L
+    fun duration(context: Context, normal: Long): Long =
+        if (!ValueAnimator.areAnimatorsEnabled()) 0L else if (reducesMotion(context)) 80L else normal
+}
+
+/** Scale the drawing, not the View: touch bounds and native button activation stay unchanged. */
+private class FeedbackButton(context: Context, fill: Int, stroke: Int, private val radius: Int) : Button(context) {
+    private val pressedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.BLACK }
+    private val pressedBounds = RectF()
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private var touchActive = false
+    private var touchInside = false
+    private var touchPointer = -1
+    private var pendingTouchClick = false
+    private var touchFeedback = false
+    var isTouchClick = false
+        private set
+    private var visualScale = 1f
+    private var pressOpacity = 0f
+    private var pressAnimator: ValueAnimator? = null
 
     init {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            textCursorDrawable = ColorDrawable(Color.TRANSPARENT)
+        background = GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = radius.toFloat()
+            setStroke((resources.displayMetrics.density).toInt().coerceAtLeast(1), stroke)
         }
+        stateListAnimator = null
     }
 
-    override fun onSelectionChanged(selStart: Int, selEnd: Int) {
-        super.onSelectionChanged(selStart, selEnd)
-        updateCaretTarget(animated = true)
-    }
-
-    override fun onTextChanged(text: CharSequence?, start: Int, lengthBefore: Int, lengthAfter: Int) {
-        super.onTextChanged(text, start, lengthBefore, lengthAfter)
-        updateCaretTarget(animated = true)
-    }
-
-    override fun onFocusChanged(focused: Boolean, direction: Int, previouslyFocusedRect: android.graphics.Rect?) {
-        super.onFocusChanged(focused, direction, previouslyFocusedRect)
-        if (focused) {
-            hasCaretOrigin = false
-            updateCaretTarget(animated = false)
-        } else {
-            hasCaretOrigin = false
-            stopFrameLoop()
-            invalidate()
-        }
-    }
-
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        updateCaretTarget(animated = false)
-    }
-
-    override fun onDetachedFromWindow() {
-        stopFrameLoop()
-        super.onDetachedFromWindow()
-    }
-
-    private fun shouldShowCaret(): Boolean {
-        return isFocused && isEnabled && selectionStart >= 0 && selectionStart == selectionEnd
-    }
-
-    private fun computeTargetGeometry(): Boolean {
-        val textLayout = layout ?: return false
-        val len = text?.length ?: 0
-        val offset = selectionStart.coerceIn(0, len)
-        val line = textLayout.getLineForOffset(offset)
-        val primaryX = textLayout.getPrimaryHorizontal(offset)
-        val baseline = textLayout.getLineBaseline(line).toFloat()
-        val fm = paint.fontMetrics
-        val padV = 1f * density
-        val top = baseline + fm.ascent - padV
-        val bottom = baseline + fm.descent + padV
-
-        targetX = totalPaddingLeft + primaryX - caretWidthPx * 0.5f
-        targetY = totalPaddingTop + top
-        targetHeight = (bottom - top).coerceAtLeast(14f * density)
-        return true
-    }
-
-    private fun updateCaretTarget(animated: Boolean) {
-        if (!shouldShowCaret()) {
-            hasCaretOrigin = false
-            stopFrameLoop()
-            invalidate()
-            return
-        }
-        if (!computeTargetGeometry()) {
-            post { if (isAttachedToWindow) updateCaretTarget(animated = false) }
-            return
-        }
-        lastInteractionMs = android.os.SystemClock.uptimeMillis()
-        val animationsEnabled = ValueAnimator.areAnimatorsEnabled()
-        if (!animated || !hasCaretOrigin || !animationsEnabled) {
-            currentX = targetX
-            currentY = targetY
-            currentHeight = targetHeight
-            velocityX = 0f
-            velocityY = 0f
-            velocityH = 0f
-            hasCaretOrigin = true
-        } else {
-            // Clamp extreme jumps so long-distance cursor moves glide over the final approach
-            if (currentX - targetX > maxDeltaXPx) currentX = targetX + maxDeltaXPx
-            else if (currentX - targetX < -maxDeltaXPx) currentX = targetX - maxDeltaXPx
-            if (currentY - targetY > maxDeltaYPx) currentY = targetY + maxDeltaYPx
-            else if (currentY - targetY < -maxDeltaYPx) currentY = targetY - maxDeltaYPx
-        }
-        ensureFrameLoop()
-        invalidate()
-    }
-
-    private val blinkWakeRunnable = Runnable { ensureFrameLoop() }
-
-    private fun ensureFrameLoop() {
-        removeCallbacks(blinkWakeRunnable)
-        if (!frameScheduled && isAttachedToWindow && shouldShowCaret()) {
-            frameScheduled = true
-            Choreographer.getInstance().postFrameCallback(this)
-        }
-    }
-
-    private fun stopFrameLoop() {
-        removeCallbacks(blinkWakeRunnable)
-        if (frameScheduled) {
-            frameScheduled = false
-            Choreographer.getInstance().removeFrameCallback(this)
-        }
-        lastFrameNanos = 0L
-    }
-
-    override fun doFrame(frameTimeNanos: Long) {
-        frameScheduled = false
-        if (!isAttachedToWindow || !shouldShowCaret()) return
-
-        // Keep target synced if layout shifted during edit/scroll
-        computeTargetGeometry()
-
-        val dt = if (lastFrameNanos == 0L) (1f / 60f)
-        else ((frameTimeNanos - lastFrameNanos) * 1e-9f).coerceIn(1e-4f, 0.05f)
-        lastFrameNanos = frameTimeNanos
-
-        if (!ValueAnimator.areAnimatorsEnabled()) {
-            currentX = targetX
-            currentY = targetY
-            currentHeight = targetHeight
-            velocityX = 0f
-            velocityY = 0f
-            velocityH = 0f
-        } else {
-            val exp = kotlin.math.exp((-omega0 * dt).toDouble()).toFloat()
-            val dx = currentX - targetX
-            val dy = currentY - targetY
-            val dh = currentHeight - targetHeight
-
-            if (kotlin.math.abs(dx) > 0.1f || kotlin.math.abs(velocityX) > 0.5f) {
-                val nextX = targetX + exp * (dx * (1f + omega0 * dt) + velocityX * dt)
-                velocityX = exp * (velocityX * (1f - omega0 * dt) - omega0 * omega0 * dx * dt)
-                currentX = nextX
-            } else {
-                currentX = targetX
-                velocityX = 0f
-            }
-
-            if (kotlin.math.abs(dy) > 0.1f || kotlin.math.abs(velocityY) > 0.5f) {
-                val nextY = targetY + exp * (dy * (1f + omega0 * dt) + velocityY * dt)
-                velocityY = exp * (velocityY * (1f - omega0 * dt) - omega0 * omega0 * dy * dt)
-                currentY = nextY
-            } else {
-                currentY = targetY
-                velocityY = 0f
-            }
-
-            if (kotlin.math.abs(dh) > 0.1f || kotlin.math.abs(velocityH) > 0.5f) {
-                val nextH = targetHeight + exp * (dh * (1f + omega0 * dt) + velocityH * dt)
-                velocityH = exp * (velocityH * (1f - omega0 * dt) - omega0 * omega0 * dh * dt)
-                currentHeight = nextH
-            } else {
-                currentHeight = targetHeight
-                velocityH = 0f
-            }
-        }
-        val springMoving = kotlin.math.abs(currentX - targetX) > 0.1f ||
-            kotlin.math.abs(currentY - targetY) > 0.1f ||
-            kotlin.math.abs(currentHeight - targetHeight) > 0.1f ||
-            kotlin.math.abs(velocityX) > 0.5f ||
-            kotlin.math.abs(velocityY) > 0.5f ||
-            kotlin.math.abs(velocityH) > 0.5f
-
-        invalidate()
-        val elapsed = (android.os.SystemClock.uptimeMillis() - lastInteractionMs).coerceAtLeast(0L)
-        if (springMoving) {
-            ensureFrameLoop()
-        } else {
-            lastFrameNanos = 0L
-            if (elapsed < 530L) {
-                postDelayed(blinkWakeRunnable, (530L - elapsed) + 340L)
-            } else {
-                val cycle = (elapsed - 530L) % 1000L
-                when {
-                    cycle < 340L -> postDelayed(blinkWakeRunnable, 340L - cycle)
-                    cycle < 500L -> ensureFrameLoop()
-                    cycle < 840L -> postDelayed(blinkWakeRunnable, 840L - cycle)
-                    else -> ensureFrameLoop()
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (isEnabled && event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    touchActive = true
+                    touchFeedback = true
+                    touchInside = true
+                    touchPointer = event.getPointerId(0)
+                    pendingTouchClick = false
+                    updatePress(true)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val index = event.findPointerIndex(touchPointer)
+                    val inside = index >= 0 && event.getX(index) >= -touchSlop && event.getX(index) < width + touchSlop &&
+                        event.getY(index) >= -touchSlop && event.getY(index) < height + touchSlop
+                    if (touchActive && touchInside != inside) {
+                        touchInside = inside
+                        updatePress(inside)
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    pendingTouchClick = touchActive && touchInside
+                    touchActive = false
+                    updatePress(false)
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    pendingTouchClick = false
+                    touchActive = false
+                    updatePress(false)
+                }
+                MotionEvent.ACTION_POINTER_UP -> if (event.getPointerId(event.actionIndex) == touchPointer) {
+                    pendingTouchClick = false
+                    touchActive = false
+                    updatePress(false)
                 }
             }
         }
+        val handled = super.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_UP) post { pendingTouchClick = false }
+        return handled
     }
 
-    private fun currentCaretAlpha(): Int {
-        val elapsed = (android.os.SystemClock.uptimeMillis() - lastInteractionMs).coerceAtLeast(0L)
-        // Stay solid while typing/moving and for 530ms afterward, then smooth-blink every 500ms
-        if (elapsed < 530L) return 255
-        val cycle = (elapsed - 530L) % 1000L
-        val alphaFraction = when {
-            cycle < 340L -> 1f
-            cycle < 500L -> {
-                val t = (cycle - 340L) / 160f
-                0.5f * (1f + kotlin.math.cos(Math.PI * t)).toFloat()
-            }
-            cycle < 840L -> 0.08f
-            else -> {
-                val t = (cycle - 840L) / 160f
-                0.08f + 0.92f * (0.5f * (1f - kotlin.math.cos(Math.PI * t)).toFloat())
-            }
+    override fun performClick(): Boolean {
+        isTouchClick = pendingTouchClick
+        pendingTouchClick = false
+        return try { super.performClick() } finally { isTouchClick = false }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        resetFeedback()
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
+        resetFeedback()
+        return super.performAccessibilityAction(action, arguments)
+    }
+
+    private fun updatePress(pressed: Boolean) {
+        pressAnimator?.cancel()
+        pressAnimator = null
+        val reduced = CaptureMotion.reducesMotion(context)
+        val duration = CaptureMotion.duration(context, 100L)
+        val targetOpacity = if (pressed) 1f else 0f
+        val targetScale = if (pressed && !reduced && duration > 0L) 0.98f else 1f
+        if (!reduced || duration == 0L) pressOpacity = targetOpacity
+        if (reduced || duration == 0L) visualScale = 1f
+        val start = if (reduced) pressOpacity else visualScale
+        val target = if (reduced) targetOpacity else targetScale
+        if (duration == 0L || start == target) {
+            visualScale = targetScale
+            pressOpacity = targetOpacity
+            invalidate()
+            return
         }
-        return (alphaFraction * 255f).toInt().coerceIn(20, 255)
+        pressAnimator = ValueAnimator.ofFloat(start, target).apply {
+            this.duration = duration
+            interpolator = CaptureMotion.easing
+            addUpdateListener {
+                if (reduced) pressOpacity = it.animatedValue as Float else visualScale = it.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+        invalidate()
+    }
+
+    override fun draw(canvas: Canvas) {
+        if (visualScale == 1f) {
+            super.draw(canvas)
+        } else {
+            val checkpoint = canvas.save()
+            canvas.scale(visualScale, visualScale, width * 0.5f, height * 0.5f)
+            super.draw(canvas)
+            canvas.restoreToCount(checkpoint)
+        }
     }
 
     override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        if (!shouldShowCaret()) return
-        if (!hasCaretOrigin) {
-            if (!computeTargetGeometry()) return
-            currentX = targetX
-            currentY = targetY
-            currentHeight = targetHeight
-            hasCaretOrigin = true
+        val opacity = if (isEnabled && isPressed && !touchFeedback) 1f else if (isEnabled) pressOpacity else 0f
+        if (opacity > 0f) {
+            pressedPaint.alpha = (46f * opacity).toInt()
+            pressedBounds.set(0f, 0f, width.toFloat(), height.toFloat())
+            canvas.drawRoundRect(pressedBounds, radius.toFloat(), radius.toFloat(), pressedPaint)
         }
-        caretPaint.color = caretColor
-        caretPaint.alpha = currentCaretAlpha()
-        caretRect.set(currentX, currentY, currentX + caretWidthPx, currentY + currentHeight)
-        canvas.drawRoundRect(caretRect, caretRadiusPx, caretRadiusPx, caretPaint)
+        super.onDraw(canvas)
+    }
+
+    private fun resetFeedback() {
+        pressAnimator?.cancel()
+        pressAnimator = null
+        touchActive = false
+        pendingTouchClick = false
+        touchFeedback = false
+        visualScale = 1f
+        pressOpacity = 0f
+        invalidate()
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        if (!hasWindowFocus) resetFeedback()
+    }
+
+    override fun onDetachedFromWindow() {
+        resetFeedback()
+        super.onDetachedFromWindow()
     }
 }

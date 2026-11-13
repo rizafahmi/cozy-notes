@@ -69,8 +69,8 @@ import CozyCore
         return um
     }()
     override var undoManager: UndoManager? { editorUndoManager }
-    var onFiles: (([URL]) -> Void)?
-    var onClipboardImage: ((Data) -> Void)?
+    var onFiles: (([URL], Bool) -> Void)?
+    var onClipboardImage: ((Data, Bool) -> Void)?
     var onFocusChange: (() -> Void)?
     var onFoldStatusChange: ((String) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
@@ -177,7 +177,7 @@ import CozyCore
     private var lastClipboardString: String = ""
     private var lastClipboardLength: Int = -1
     private var lastClipboardSig: Int = 0
-    /// Bike-style smooth typewriter caret layer driven by additive critically-damped springs.
+    /// Bike-style visual easing for typing; logical insertion, selection, and scrolling stay immediate.
     private let caretLayer: CALayer = {
         let layer = CALayer()
         layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
@@ -194,17 +194,23 @@ import CozyCore
         return layer
     }()
     private var hasCaretOrigin = false
-    private var caretAnimationSeq: UInt64 = 0
+    private var caretAnimationSequence: UInt64 = 0
+    private var isHandlingTypingInput = false
+    private var isCaretTypingTransaction = false
+    private var animatesNextCaretUpdate = false
+    private let caretAccessibilityCenter = NSWorkspace.shared.notificationCenter
+    private var caretAccessibilityObserver: NSObjectProtocol?
+    private static let caretSpringFrequency: CGFloat = 2 * .pi / 0.125
+    private static let caretSpringStiffness = caretSpringFrequency * caretSpringFrequency
+    private static let caretSpringDamping = 2 * caretSpringFrequency
     private var caretBlinkWorkItem: DispatchWorkItem?
     private var caretBlinkOn = true
-    private(set) var scrollSpringTargetY: CGFloat?
-    private var scrollSpringVelocityY: CGFloat = 0
-    private var scrollSpringWorkItem: DispatchWorkItem?
     private var lastEditWasLarge = false
     private var minimumOverscrollHeight: CGFloat = 0
     private var windowFocusObservers: [NSObjectProtocol] = []
     var suppressCaretUpdates = false
     override func setFrameSize(_ newSize: NSSize) {
+        if newSize != frame.size { removeCaretTravelAnimations() }
         if minimumOverscrollHeight > 0 {
             let maxOverscroll = newSize.height + (enclosingScrollView?.contentView.bounds.height ?? 0) * 0.4
             if minimumOverscrollHeight > maxOverscroll {
@@ -656,15 +662,26 @@ import CozyCore
     }
 
     override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
-        // Suppress AppKit's teleporting insertion bar and NSTextInsertionIndicator; caretLayer renders the spring-animated caret.
+        // Avoid AppKit's insertion-point layout queries; caretLayer renders the glyph-aligned caret.
     }
 
     @objc(_drawInsertionPointInRect:color:)
     func _drawInsertionPoint(in rect: NSRect, color: NSColor) {}
+    deinit {
+        for token in windowFocusObservers { NotificationCenter.default.removeObserver(token) }
+        if let token = caretAccessibilityObserver { caretAccessibilityCenter.removeObserver(token) }
+        caretBlinkWorkItem?.cancel()
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         for token in windowFocusObservers { NotificationCenter.default.removeObserver(token) }
         windowFocusObservers.removeAll()
+        if let token = caretAccessibilityObserver { caretAccessibilityCenter.removeObserver(token) }
+        caretAccessibilityObserver = nil
+        cancelCaretBlink()
+        removeCaretTravelAnimations()
+        hasCaretOrigin = false
         wantsLayer = true
         ensureCaretSublayer()
         let nc = NotificationCenter.default
@@ -674,20 +691,26 @@ import CozyCore
                 nc.addObserver(forName: NSView.boundsDidChangeNotification, object: clipView, queue: .main) { [weak self] _ in
                     MainActor.assumeIsolated {
                         guard let self else { return }
+                        self.updateCaret()
                         self.setNeedsDisplay(self.visibleRect, avoidAdditionalLayout: true)
                     }
                 }
             )
         }
         if let window {
+            caretAccessibilityObserver = caretAccessibilityCenter.addObserver(
+                forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateCaret() }
+            }
             windowFocusObservers.append(
                 nc.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.updateCaret(animated: false) }
+                    MainActor.assumeIsolated { self?.updateCaret() }
                 }
             )
             windowFocusObservers.append(
                 nc.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.updateCaret(animated: false) }
+                    MainActor.assumeIsolated { self?.updateCaret() }
                 }
             )
         }
@@ -702,7 +725,7 @@ import CozyCore
         let ok = super.becomeFirstResponder()
         if ok {
             onFocusChange?()
-            updateCaret(animated: false)
+            updateCaret()
         }
         return ok
     }
@@ -711,6 +734,7 @@ import CozyCore
         let ok = super.resignFirstResponder()
         if ok {
             hasCaretOrigin = false
+            removeCaretTravelAnimations()
             cancelCaretBlink()
             caretLayer.isHidden = true
             onFocusChange?()
@@ -729,6 +753,9 @@ import CozyCore
         let repNS = (replacementString ?? "") as NSString
         let repLen = repNS.length
         let delta = repLen - affectedCharRange.length
+        animatesNextCaretUpdate = isCaretTypingTransaction
+            && affectedCharRange.length <= 16 && repLen <= 64
+            && !editorUndoManager.isUndoing && !editorUndoManager.isRedoing
         let isLargeEdit = affectedCharRange.length > 4096 || repLen > 4096
         lastEditWasLarge = isLargeEdit
         var requiresFullFormat = isLargeEdit || !fencedBlocks.isEmpty || !tableBlocks.isEmpty
@@ -781,6 +808,17 @@ import CozyCore
         return ok
     }
 
+    override func keyDown(with event: NSEvent) {
+        let previous = isHandlingTypingInput
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let scalar = event.characters?.unicodeScalars.first?.value
+        isHandlingTypingInput = !modifiers.contains(.command) && !modifiers.contains(.control)
+            && scalar != nil && scalar != 9 && scalar != 27
+            && !(0xF700...0xF8FF).contains(scalar ?? 0)
+        defer { isHandlingTypingInput = previous }
+        super.keyDown(with: event)
+    }
+
     override func insertText(_ string: Any, replacementRange: NSRange) {
         let str: String
         if let s = string as? String {
@@ -791,7 +829,25 @@ import CozyCore
             str = String(describing: string)
         }
         let targetRange = replacementRange.location == NSNotFound ? selectedRange() : replacementRange
+        let previous = isCaretTypingTransaction
+        isCaretTypingTransaction = previous || (isHandlingTypingInput && selectedRange().length == 0
+            && targetRange == selectedRange())
+        defer { isCaretTypingTransaction = previous }
         applyUndoableReplacement(in: targetRange, with: str)
+    }
+
+    override func deleteBackward(_ sender: Any?) {
+        let previous = isCaretTypingTransaction
+        isCaretTypingTransaction = isHandlingTypingInput && selectedRange().length == 0
+        defer { isCaretTypingTransaction = previous }
+        super.deleteBackward(sender)
+    }
+
+    override func deleteForward(_ sender: Any?) {
+        let previous = isCaretTypingTransaction
+        isCaretTypingTransaction = isHandlingTypingInput && selectedRange().length == 0
+        defer { isCaretTypingTransaction = previous }
+        super.deleteForward(sender)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -1060,7 +1116,6 @@ import CozyCore
 
     override func scrollRangeToVisible(_ range: NSRange) {
         autoreleasepool {
-            cancelScrollSpring()
             super.scrollRangeToVisible(range)
         }
     }
@@ -1556,7 +1611,7 @@ import CozyCore
             lm.ensureLayout(for: tc)
         }
         minimumOverscrollHeight = 0
-        updateCaret(animated: false)
+        updateCaret()
         setNeedsDisplay(bounds, avoidAdditionalLayout: true)
     }
 
@@ -2076,15 +2131,18 @@ import CozyCore
     override func didChangeText() {
         let wasLarge = lastEditWasLarge
         let editLocation = pendingEdit?.affectedRange.location
+        let animateCaret = animatesNextCaretUpdate
+        animatesNextCaretUpdate = false
         lastEditWasLarge = false
         isEditingText = false
         super.didChangeText()
         if wasLarge, (textStorage?.length ?? 0) > 65_536 {
             cancelCaretBlink()
+            removeCaretTravelAnimations()
             caretLayer.isHidden = true
             hasCaretOrigin = false
         } else {
-            updateCaret(animated: true)
+            updateCaret(animateForTyping: animateCaret)
             if !wasLarge && !suppressCaretUpdates {
                 // Same-line edits must not recenter a caret already visible near a viewport edge.
                 let useTypewriterStep: Bool
@@ -2095,7 +2153,7 @@ import CozyCore
                 } else {
                     useTypewriterStep = true
                 }
-                ensureCaretVisible(animated: true, useTypewriterStep: useTypewriterStep)
+                ensureCaretVisible(useTypewriterStep: useTypewriterStep)
             }
         }
     }
@@ -2103,13 +2161,19 @@ import CozyCore
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelectingFlag)
         guard !suppressCaretUpdates && !isEditingText else { return }
-        updateCaret(animated: !stillSelectingFlag)
+        updateCaret()
     }
 
     override func doCommand(by selector: Selector) {
         if let handler = onWikiAutocompleteCommand, handler(selector) {
             return
         }
+        let previous = isCaretTypingTransaction
+        isCaretTypingTransaction = isHandlingTypingInput && selectedRange().length == 0
+            && (selector == #selector(NSResponder.insertNewline(_:))
+                || selector == #selector(NSResponder.deleteBackward(_:))
+                || selector == #selector(NSResponder.deleteForward(_:)))
+        defer { isCaretTypingTransaction = previous }
         super.doCommand(by: selector)
         guard !suppressCaretUpdates && !isEditingText,
               window?.firstResponder === self else { return }
@@ -2128,40 +2192,24 @@ import CozyCore
             }
         }
         if selectedRange().length == 0 {
-            ensureCaretVisible(animated: true, useTypewriterStep: true)
+            ensureCaretVisible(useTypewriterStep: true)
         }
     }
 
     func resetCaretPosition() {
         hasCaretOrigin = false
+        animatesNextCaretUpdate = false
         minimumOverscrollHeight = 0
         foldedSections.removeAll()
         externalChangeRanges.removeAll()
         outlineFoldMode = .showAll
         foldHitTargets.removeAll()
         caretLayer.removeAllAnimations()
-        cancelScrollSpring()
-    }
-
-    func cancelScrollSpring() {
-        scrollSpringWorkItem?.cancel()
-        scrollSpringWorkItem = nil
-        scrollSpringTargetY = nil
-        scrollSpringVelocityY = 0
-    }
-
-    func completeScrollSpringImmediately() {
-        guard let targetY = scrollSpringTargetY,
-              let scrollView = enclosingScrollView else { return }
-        let clipView = scrollView.contentView
-        cancelScrollSpring()
-        clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: targetY))
-        scrollView.reflectScrolledClipView(clipView)
     }
 
     /// Ensures the active insertion caret stays inside the visible viewport comfort zone.
     /// When the caret moves below the fold, scrolls up with a ~30% viewport typewriter breathing margin below the cursor.
-    func ensureCaretVisible(animated: Bool, useTypewriterStep: Bool = true) {
+    func ensureCaretVisible(useTypewriterStep: Bool = true) {
         guard !suppressCaretUpdates,
               let scrollView = enclosingScrollView else { return }
         let clipView = scrollView.contentView
@@ -2181,7 +2229,7 @@ import CozyCore
         }
         guard caret.height > 0 else { return }
 
-        let currentY = scrollSpringTargetY ?? clipView.bounds.origin.y
+        let currentY = clipView.bounds.origin.y
         let topMargin = max(20.0, min(44.0, round(visHeight * 0.08)))
         let bottomMargin = max(28.0, min(56.0, round(visHeight * 0.12)))
         let topBound = currentY + topMargin
@@ -2213,77 +2261,10 @@ import CozyCore
             desiredY = max(0, round(caret.minY - topRoom))
         }
 
-        smoothScrollClipView(to: desiredY, animated: animated)
-    }
-
-    private func smoothScrollClipView(to targetY: CGFloat, animated: Bool) {
-        guard let scrollView = enclosingScrollView else { return }
-        let clipView = scrollView.contentView
-        let visHeight = clipView.bounds.height
-        let currentY = clipView.bounds.origin.y
-        guard abs(targetY - currentY) > 0.5 else {
-            cancelScrollSpring()
-            return
-        }
-
-        let canAnimate = animated
-            && (window?.isVisible ?? false)
-            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            && abs(targetY - currentY) <= visHeight * 1.5
-
-        guard canAnimate else {
-            cancelScrollSpring()
-            clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: targetY))
-            scrollView.reflectScrolledClipView(clipView)
-            return
-        }
-
-        scrollSpringTargetY = targetY
-        stepScrollSpring()
-    }
-
-    private func stepScrollSpring() {
-        scrollSpringWorkItem?.cancel()
-        scrollSpringWorkItem = nil
-        guard let targetY = scrollSpringTargetY,
-              let scrollView = enclosingScrollView else {
-            cancelScrollSpring()
-            return
-        }
-        let clipView = scrollView.contentView
-        let currentY = clipView.bounds.origin.y
-        let displacement = currentY - targetY
-
-        // Analytical critically-damped spring (response = 0.14s, dampingRatio = 1.0) at dt = 1/120s
-        let dt: CGFloat = 1.0 / 120.0
-        let response: CGFloat = 0.14
-        let omega: CGFloat = (2.0 * .pi) / response
-        let expTerm = exp(-omega * dt)
-        let v0 = scrollSpringVelocityY
-        let c1 = displacement
-        let c2 = v0 + omega * c1
-        let nextDisp = (c1 + c2 * dt) * expTerm
-        let nextVel = (c2 - omega * (c1 + c2 * dt)) * expTerm
-        let nextY = targetY + nextDisp
-
-        if abs(nextDisp) < 0.5 && abs(nextVel) < 8.0 {
-            cancelScrollSpring()
-            clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: targetY))
-            scrollView.reflectScrolledClipView(clipView)
-            return
-        }
-
-        scrollSpringVelocityY = nextVel
-        clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: round(nextY * 2) / 2))
+        guard abs(desiredY - currentY) > 0.01 else { return }
+        clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: desiredY))
         scrollView.reflectScrolledClipView(clipView)
-
-        let work = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated {
-                self?.stepScrollSpring()
-            }
-        }
-        scrollSpringWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + dt, execute: work)
+        updateCaret()
     }
 
     private func ensureCaretSublayer() {
@@ -2313,10 +2294,9 @@ import CozyCore
         if len > 0 {
             let ensureLoc = min(charIdx, len - 1)
             let lineRange = ns.lineRange(for: NSRange(location: ensureLoc, length: 0))
-            if len <= 100_000 && lineRange.location > 0 {
-                let startLoc = lineRange.location - 1
-                let fullEnsure = ns.lineRange(for: NSRange(location: startLoc, length: NSMaxRange(lineRange) - startLoc))
-                lm.ensureLayout(forCharacterRange: fullEnsure)
+            if len <= 100_000 {
+                // Small notes can use exact preceding geometry; large notes retain bounded lazy layout.
+                lm.ensureLayout(forCharacterRange: NSRange(location: 0, length: NSMaxRange(lineRange)))
             } else {
                 lm.ensureLayout(forCharacterRange: lineRange)
             }
@@ -2363,13 +2343,14 @@ import CozyCore
         return NSRect(x: x, y: y, width: caretWidth, height: height)
     }
 
-    func updateCaret(animated: Bool) {
+    func updateCaret(animateForTyping: Bool = false) {
         guard !suppressCaretUpdates else { return }
         ensureCaretSublayer()
         let isActive = window?.firstResponder === self && (window?.isKeyWindow ?? false) && isEditable
         let sel = selectedRange()
         guard isActive, sel.length == 0 else {
             cancelCaretBlink()
+            removeCaretTravelAnimations()
             caretLayer.isHidden = true
             if sel.length > 0 { hasCaretOrigin = false }
             return
@@ -2379,13 +2360,14 @@ import CozyCore
         guard targetRect.height > 0 else { return }
         let targetPos = CGPoint(x: targetRect.midX, y: targetRect.midY)
         let targetBounds = CGRect(x: 0, y: 0, width: targetRect.width, height: targetRect.height)
-
-        let oldPos = caretLayer.position
+        let oldPosition = caretLayer.position
         let oldBounds = caretLayer.bounds
-        let shouldAnimate = animated
-            && hasCaretOrigin
-            && !caretLayer.isHidden
-            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let dx = oldPosition.x - targetPos.x
+        let dy = oldPosition.y - targetPos.y
+        let canAnimate = animateForTyping && hasCaretOrigin && !caretLayer.isHidden
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && !hasMarkedText()
+            && abs(dx) <= max(96, targetRect.height * 4) && abs(dy) <= targetRect.height * 1.5
+        if !canAnimate { removeCaretTravelAnimations() }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -2395,52 +2377,44 @@ import CozyCore
         caretLayer.bounds = targetBounds
         CATransaction.commit()
 
-        hasCaretOrigin = true
-        scheduleCaretBlink()
-
-        guard shouldAnimate else { return }
-        let rawDX = oldPos.x - targetPos.x
-        let rawDY = oldPos.y - targetPos.y
-        let dh = oldBounds.height - targetBounds.height
-        guard hypot(rawDX, rawDY) > 0.25 || abs(dh) > 0.5 else { return }
-
-        caretAnimationSeq &+= 1
-        // Critically-damped spring matching BikeLib.CaretLineLayer (response = 0.125s, dampingRatio = 1.0)
-        let response: CGFloat = 0.125
-        let dampingRatio: CGFloat = 1.0
-        let omega0 = (2.0 * .pi) / response
-        let stiffness = omega0 * omega0
-        let damping = 4.0 * .pi * dampingRatio / response
-
-        if hypot(rawDX, rawDY) > 0.25 {
-            let dx = max(-180, min(180, rawDX))
-            let dy = max(-120, min(120, rawDY))
-            let posAnim = CASpringAnimation(keyPath: "position")
-            posAnim.isAdditive = true
-            posAnim.mass = 1.0
-            posAnim.stiffness = stiffness
-            posAnim.damping = damping
-            posAnim.initialVelocity = 0.0
-            posAnim.fromValue = NSValue(point: NSPoint(x: dx, y: dy))
-            posAnim.toValue = NSValue(point: .zero)
-            posAnim.duration = posAnim.settlingDuration
-            posAnim.isRemovedOnCompletion = true
-            caretLayer.add(posAnim, forKey: "caret.pos.\(caretAnimationSeq)")
+        if canAnimate {
+            caretAnimationSequence &+= 1
+            // Existing additive springs retain their presentation offset and velocity on rapid typing.
+            if abs(dx) > 0.01 || abs(dy) > 0.01 {
+                let travel = makeCaretSpring(keyPath: "position")
+                travel.fromValue = NSValue(point: NSPoint(x: dx, y: dy))
+                travel.toValue = NSValue(point: .zero)
+                caretLayer.add(travel, forKey: "caret.position.\(caretAnimationSequence)")
+            }
+            let widthDelta = oldBounds.width - targetBounds.width
+            let heightDelta = oldBounds.height - targetBounds.height
+            if abs(widthDelta) > 0.01 || abs(heightDelta) > 0.01 {
+                let resize = makeCaretSpring(keyPath: "bounds")
+                resize.fromValue = NSValue(rect: NSRect(x: 0, y: 0, width: widthDelta, height: heightDelta))
+                resize.toValue = NSValue(rect: .zero)
+                caretLayer.add(resize, forKey: "caret.bounds.\(caretAnimationSequence)")
+            }
         }
 
-        if abs(dh) > 0.5 {
-            let clampedDH = max(-40, min(40, dh))
-            let boundsAnim = CASpringAnimation(keyPath: "bounds")
-            boundsAnim.isAdditive = true
-            boundsAnim.mass = 1.0
-            boundsAnim.stiffness = stiffness
-            boundsAnim.damping = damping
-            boundsAnim.initialVelocity = 0.0
-            boundsAnim.fromValue = NSValue(rect: NSRect(x: 0, y: 0, width: 0, height: clampedDH))
-            boundsAnim.toValue = NSValue(rect: .zero)
-            boundsAnim.duration = boundsAnim.settlingDuration
-            boundsAnim.isRemovedOnCompletion = true
-            caretLayer.add(boundsAnim, forKey: "caret.bounds.\(caretAnimationSeq)")
+        hasCaretOrigin = true
+        scheduleCaretBlink()
+    }
+
+    private func makeCaretSpring(keyPath: String) -> CASpringAnimation {
+        let spring = CASpringAnimation(keyPath: keyPath)
+        spring.isAdditive = true
+        spring.mass = 1
+        spring.stiffness = Self.caretSpringStiffness
+        spring.damping = Self.caretSpringDamping
+        spring.initialVelocity = 0
+        spring.duration = spring.settlingDuration
+        return spring
+    }
+
+    private func removeCaretTravelAnimations() {
+        guard let keys = caretLayer.animationKeys() else { return }
+        for key in keys where key.hasPrefix("caret.position.") || key.hasPrefix("caret.bounds.") {
+            caretLayer.removeAnimation(forKey: key)
         }
     }
 
@@ -2469,8 +2443,8 @@ import CozyCore
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = caretLayer.presentation()?.opacity ?? caretLayer.opacity
         fade.toValue = targetOpacity
-        fade.duration = 0.16
-        fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        fade.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.08 : 0.16
+        fade.timingFunction = Theme.feedbackTimingFunction
         caretLayer.opacity = targetOpacity
         caretLayer.add(fade, forKey: "caret.blink")
 
@@ -2487,11 +2461,11 @@ import CozyCore
             let pb = NSPasteboard.general
             if pb.types?.contains(.fileURL) == true,
                let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-                onFiles?(urls)
+                onFiles?(urls, CaptureEditor.isPointerAction)
             } else if pb.availableType(from: [.string]) == nil,
                       let image = NSImage(pasteboard: pb), let tiff = image.tiffRepresentation,
                       let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) {
-                onClipboardImage?(png)
+                onClipboardImage?(png, CaptureEditor.isPointerAction)
             } else {
                 let str: String?
                 if pb.changeCount == lastClipboardChangeCount && lastClipboardLength >= 0 {
@@ -2515,7 +2489,7 @@ import CozyCore
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         if let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            onFiles?(urls)
+            onFiles?(urls, true)
             return true
         }
         return super.performDragOperation(sender)
@@ -3244,8 +3218,8 @@ import CozyCore
         typesetter.textView = textView
         textView.layoutManager?.typesetter = typesetter
         textView.registerForDraggedTypes([.fileURL])
-        textView.onFiles = { [weak self] in self?.addAttachments($0) }
-        textView.onClipboardImage = { [weak self] in self?.addClipboardImage($0) }
+        textView.onFiles = { [weak self] urls, animated in self?.addAttachments(urls, animated: animated) }
+        textView.onClipboardImage = { [weak self] data, animated in self?.addClipboardImage(data, animated: animated) }
         textView.onFocusChange = { [weak self] in self?.handleFocusChange() }
         textView.onFoldStatusChange = { [weak self] msg in
             self?.status.stringValue = msg
@@ -3299,6 +3273,7 @@ import CozyCore
         chips.alignment = .centerY
         chips.spacing = 10
         chips.edgeInsets = NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
+        chips.translatesAutoresizingMaskIntoConstraints = false
         attachmentScroll.documentView = chips
         attachmentScroll.drawsBackground = false
         attachmentScroll.hasHorizontalScroller = true
@@ -3449,7 +3424,7 @@ import CozyCore
         onHorizontalInsetChange?(insetX)
         if geometryChanged {
             textView.refreshFoldLayoutAfterGeometryChange(visibleCharacterRange: visibleCharacters)
-            textView.updateCaret(animated: false)
+            textView.updateCaret()
             textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             if isWikiAutocompleteVisible {
                 positionWikiCompletionView()
@@ -3515,7 +3490,7 @@ import CozyCore
                 let ns = nsText
                 lastCursorLine = ns.length > 0 ? ns.lineRange(for: NSRange(location: min(clampedLocation, ns.length), length: 0)) : NSRange(location: 0, length: 0)
                 textView.suppressCaretUpdates = false
-                textView.updateCaret(animated: false)
+                textView.updateCaret()
                 textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
                 if isInNoteFindVisible {
                     updateInNoteFindMatches(scrollToMatch: false)
@@ -3534,6 +3509,21 @@ import CozyCore
             || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     func focus() { window?.makeFirstResponder(textView) }
+    func preserveReadingPosition(during updates: () -> Void) {
+        let clipView = scroll.contentView
+        let origin = clipView.bounds.origin
+        let anchorInWindow = textView.convert(origin, to: nil)
+        updates()
+        (window?.contentView ?? self).layoutSubtreeIfNeeded()
+        let anchorAfter = textView.convert(anchorInWindow, from: nil)
+        let target = NSPoint(
+            x: max(0, clipView.bounds.origin.x + origin.x - anchorAfter.x),
+            y: max(0, clipView.bounds.origin.y + origin.y - anchorAfter.y)
+        )
+        clipView.setBoundsOrigin(target)
+        scroll.reflectScrolledClipView(clipView)
+    }
+
     func clearPendingAttachments() {
         if !attachments.isEmpty { attachments = [] }
         if !temporaryFiles.isEmpty {
@@ -3614,7 +3604,7 @@ import CozyCore
         lastCursorLine = line
         refreshCursorDependentLines(oldLine: prevLine, newLine: line)
     }
-    func addAttachments(_ urls: [URL]) {
+    func addAttachments(_ urls: [URL], animated: Bool = false) {
         guard allowsAttachments else {
             status.stringValue = "Start a new note to add attachments."
             return
@@ -3627,14 +3617,16 @@ import CozyCore
             }
         }
         guard !valid.isEmpty else { return }
-        if let onAttachFiles {
-            onAttachFiles(valid)
-            return
+        performAttachmentChange(animated: animated) {
+            if let onAttachFiles {
+                onAttachFiles(valid)
+            } else {
+                for url in valid where !attachments.contains(url) {
+                    attachments.append(url)
+                }
+                onChange?()
+            }
         }
-        for url in valid where !attachments.contains(url) {
-            attachments.append(url)
-        }
-        onChange?()
     }
     @objc private func chooseAttachments() {
         guard allowsAttachments else {
@@ -3645,11 +3637,12 @@ import CozyCore
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         guard let window else { return }
+        let animated = Self.isPointerAction
         panel.beginSheetModal(for: window) { [weak self] result in
-            if result == .OK { self?.addAttachments(panel.urls) }
+            if result == .OK { self?.addAttachments(panel.urls, animated: animated) }
         }
     }
-    private func addClipboardImage(_ data: Data) {
+    private func addClipboardImage(_ data: Data, animated: Bool) {
         guard allowsAttachments else {
             status.stringValue = "Start a new note to paste a screenshot."
             return
@@ -3658,7 +3651,7 @@ import CozyCore
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("Screenshot-\(UUID().uuidString).png")
             try data.write(to: url, options: .atomic)
             temporaryFiles.append(url)
-            addAttachments([url])
+            addAttachments([url], animated: animated)
         } catch { showError(error, in: window) }
     }
 
@@ -3668,58 +3661,165 @@ import CozyCore
         let pendingIndex: Int?
     }
     private var renderedChipItems: [ChipItem] = []
+    private struct ChipCard {
+        let view: PaperSurface
+        let openButton: QuietButton
+        let removeButton: QuietButton
+    }
+    private var renderedChipCards: [ChipCard] = []
+    private var attachmentExitOverlays: [FeedbackOverlay] = []
+    private var removingChipView: NSView?
+    private var batchingAttachmentChanges = false
+    private var needsAttachmentUpdate = false
+    private var animatesAttachmentChanges = false
+
+    static var isPointerAction: Bool {
+        guard let type = NSApp.currentEvent?.type else { return false }
+        return type == .leftMouseDown || type == .leftMouseUp || type == .rightMouseDown || type == .rightMouseUp
+    }
+
+    private func performAttachmentChange(animated: Bool, _ updates: () -> Void) {
+        let wasBatching = batchingAttachmentChanges
+        let previousAnimation = animatesAttachmentChanges
+        batchingAttachmentChanges = true
+        animatesAttachmentChanges = animated && window?.isVisible == true
+        preserveReadingPosition {
+            updates()
+            batchingAttachmentChanges = wasBatching
+            if !wasBatching, needsAttachmentUpdate {
+                needsAttachmentUpdate = false
+                updateAttachments()
+            }
+        }
+        animatesAttachmentChanges = previousAnimation
+    }
+
+    private func clearAttachmentFeedback() {
+        for overlay in attachmentExitOverlays { overlay.removeFromSuperview() }
+        attachmentExitOverlays.removeAll()
+        for card in renderedChipCards { card.view.layer?.removeAnimation(forKey: "feedback.opacity") }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { clearAttachmentFeedback() }
+    }
 
     private func updateAttachments() {
-        for view in chips.arrangedSubviews { chips.removeArrangedSubview(view); view.removeFromSuperview() }
+        if batchingAttachmentChanges {
+            needsAttachmentUpdate = true
+            return
+        }
         var items: [ChipItem] = linkedAttachments.map { ChipItem(url: $0.url, linked: $0, pendingIndex: nil) }
         for (idx, url) in attachments.enumerated() {
             items.append(ChipItem(url: url, linked: nil, pendingIndex: idx))
         }
-        renderedChipItems = items
+        if items.count == renderedChipItems.count,
+           zip(items, renderedChipItems).allSatisfy({ $0.0.url == $0.1.url }), removingChipView == nil {
+            renderedChipItems = items
+            return
+        }
         let activeURLs = Set(items.map(\.url))
         previews = previews.filter { activeURLs.contains($0.key) }
+        if !animatesAttachmentChanges { clearAttachmentFeedback() }
 
-        for (index, item) in items.enumerated() {
-            let url = item.url
-            let preview = NSImageView()
-            preview.imageScaling = .scaleProportionallyUpOrDown
-            preview.image = thumbnail(for: url) ?? NSWorkspace.shared.icon(forFile: url.path)
-            preview.setAccessibilityElement(false)
-            preview.wantsLayer = true
-            preview.layer?.cornerRadius = 6
-            preview.layer?.masksToBounds = true
-            preview.widthAnchor.constraint(equalToConstant: 38).isActive = true
-            preview.heightAnchor.constraint(equalToConstant: 38).isActive = true
-
-            let name = Theme.label(url.lastPathComponent, size: 12, color: Theme.ink)
-            name.font = .systemFont(ofSize: 12, weight: .medium)
-            name.lineBreakMode = .byTruncatingMiddle
-            name.widthAnchor.constraint(lessThanOrEqualToConstant: 145).isActive = true
-
-            let kindText = url.pathExtension.isEmpty ? "FILE" : url.pathExtension.uppercased()
-            let kind = Theme.label("\(kindText) · Click to open", size: 10, color: Theme.muted)
-            let description = Theme.stack([name, kind], orientation: .vertical, spacing: 2)
-
-            let openBtn = QuietButton(symbol: "arrow.up.right", target: self, action: #selector(openChipAttachment(_:)))
-            openBtn.tag = index
-            openBtn.toolTip = "Open \(url.lastPathComponent)"
-            openBtn.setAccessibilityLabel("Open \(url.lastPathComponent)")
-            let remove = QuietButton(symbol: "xmark", target: self, action: #selector(removeAttachment(_:)))
-            remove.setAccessibilityLabel("Remove \(url.lastPathComponent)")
-            remove.toolTip = "Remove \(url.lastPathComponent) from this note"
-            remove.tag = index
-
-            let row = Theme.stack([preview, description, openBtn, remove], spacing: 6)
-            let card = PaperSurface(cornerRadius: 10, color: Theme.elevated, bordered: true)
-            Theme.fill(row, in: card, inset: 7)
-            card.heightAnchor.constraint(equalToConstant: 52).isActive = true
-            chips.addArrangedSubview(card)
+        var available: [URL: [ChipCard]] = [:]
+        for (item, card) in zip(renderedChipItems, renderedChipCards) where card.view !== removingChipView {
+            available[item.url, default: []].append(card)
         }
-        chips.setFrameSize(chips.fittingSize)
-        let empty = items.isEmpty
-        attachmentScroll.isHidden = empty
-        attachmentHeight?.constant = empty ? 0 : 62
-        attachmentBottom?.constant = empty ? 0 : -6
+        var used: [URL: Int] = [:]
+        var nextCards: [ChipCard] = []
+        var newCards: [ChipCard] = []
+        nextCards.reserveCapacity(items.count)
+        for (index, item) in items.enumerated() {
+            let occurrence = used[item.url, default: 0]
+            let card: ChipCard
+            if let candidates = available[item.url], occurrence < candidates.count {
+                card = candidates[occurrence]
+            } else {
+                card = makeChipCard(for: item.url)
+                newCards.append(card)
+            }
+            used[item.url] = occurrence + 1
+            card.openButton.tag = index
+            card.removeButton.tag = index
+            nextCards.append(card)
+        }
+        let retained = Set(nextCards.map { ObjectIdentifier($0.view) })
+        for card in renderedChipCards where !retained.contains(ObjectIdentifier(card.view)) {
+            let frame = convert(card.view.bounds, from: card.view)
+            chips.removeArrangedSubview(card.view)
+            card.view.removeFromSuperview()
+            if animatesAttachmentChanges {
+                let overlay = FeedbackOverlay(frame: frame)
+                overlay.setAccessibilityElement(false)
+                overlay.setAccessibilityChildren([])
+                card.view.translatesAutoresizingMaskIntoConstraints = true
+                card.view.frame = overlay.bounds
+                overlay.addSubview(card.view)
+                addSubview(overlay)
+                attachmentExitOverlays.append(overlay)
+                if let layer = card.view.layer {
+                    Theme.fade(layer, to: 0, duration: 0.12) { [weak self, weak overlay] in
+                        overlay?.removeFromSuperview()
+                        self?.attachmentExitOverlays.removeAll { $0 === overlay }
+                    }
+                }
+            }
+        }
+        for (index, card) in nextCards.enumerated() {
+            if chips.arrangedSubviews.indices.contains(index), chips.arrangedSubviews[index] === card.view { continue }
+            if card.view.superview === chips { chips.removeArrangedSubview(card.view) }
+            chips.insertArrangedSubview(card.view, at: index)
+        }
+        renderedChipItems = items
+        renderedChipCards = nextCards
+        preserveReadingPosition {
+            let size = chips.fittingSize
+            chips.setFrameSize(NSSize(width: max(4, size.width), height: max(4, size.height)))
+            let empty = items.isEmpty
+            attachmentScroll.isHidden = empty
+            attachmentHeight?.constant = empty ? 0 : 62
+            attachmentBottom?.constant = empty ? 0 : -6
+        }
+        if animatesAttachmentChanges {
+            for card in newCards {
+                if let layer = card.view.layer { Theme.fade(layer, to: 1, duration: 0.16, from: 0) }
+            }
+        }
+    }
+
+    private func makeChipCard(for url: URL) -> ChipCard {
+        let preview = NSImageView()
+        preview.imageScaling = .scaleProportionallyUpOrDown
+        preview.image = thumbnail(for: url) ?? NSWorkspace.shared.icon(forFile: url.path)
+        preview.setAccessibilityElement(false)
+        preview.wantsLayer = true
+        preview.layer?.cornerRadius = 6
+        preview.layer?.masksToBounds = true
+        preview.widthAnchor.constraint(equalToConstant: 38).isActive = true
+        preview.heightAnchor.constraint(equalToConstant: 38).isActive = true
+
+        let name = Theme.label(url.lastPathComponent, size: 12, color: Theme.ink)
+        name.font = .systemFont(ofSize: 12, weight: .medium)
+        name.lineBreakMode = .byTruncatingMiddle
+        name.widthAnchor.constraint(lessThanOrEqualToConstant: 145).isActive = true
+        let kindText = url.pathExtension.isEmpty ? "FILE" : url.pathExtension.uppercased()
+        let kind = Theme.label("\(kindText) · Click to open", size: 10, color: Theme.muted)
+        let description = Theme.stack([name, kind], orientation: .vertical, spacing: 2)
+
+        let open = QuietButton(symbol: "arrow.up.right", target: self, action: #selector(openChipAttachment(_:)))
+        open.toolTip = "Open \(url.lastPathComponent)"
+        open.setAccessibilityLabel("Open \(url.lastPathComponent)")
+        let remove = QuietButton(symbol: "xmark", target: self, action: #selector(removeAttachment(_:)))
+        remove.setAccessibilityLabel("Remove \(url.lastPathComponent)")
+        remove.toolTip = "Remove \(url.lastPathComponent) from this note"
+        let row = Theme.stack([preview, description, open, remove], spacing: 6)
+        let card = PaperSurface(cornerRadius: 10, color: Theme.elevated, bordered: true)
+        card.wantsLayer = true
+        Theme.fill(row, in: card, inset: 7)
+        card.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        return ChipCard(view: card, openButton: open, removeButton: remove)
     }
 
     @objc private func openChipAttachment(_ sender: NSButton) {
@@ -3730,12 +3830,16 @@ import CozyCore
     @objc private func removeAttachment(_ sender: NSButton) {
         guard renderedChipItems.indices.contains(sender.tag) else { return }
         let item = renderedChipItems[sender.tag]
-        if let pendingIndex = item.pendingIndex, attachments.indices.contains(pendingIndex) {
-            attachments.remove(at: pendingIndex)
-            onChange?()
-        } else if let linked = item.linked {
-            onRemoveLinkedAttachment?(linked)
+        removingChipView = renderedChipCards[sender.tag].view
+        performAttachmentChange(animated: Self.isPointerAction) {
+            if let pendingIndex = item.pendingIndex, attachments.indices.contains(pendingIndex) {
+                attachments.remove(at: pendingIndex)
+                onChange?()
+            } else if let linked = item.linked {
+                onRemoveLinkedAttachment?(linked)
+            }
         }
+        removingChipView = nil
     }
 
     private func thumbnail(for url: URL) -> NSImage? {
@@ -3754,7 +3858,7 @@ import CozyCore
 
     func refreshTypography() {
         formatMarkdown()
-        textView.updateCaret(animated: false)
+        textView.updateCaret()
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
@@ -3853,11 +3957,10 @@ import CozyCore
             let clipView = scroll.contentView
             let visHeight = clipView.bounds.height
             let targetY = max(0, round(box.minY + textView.textContainerOrigin.y - max(24, visHeight * 0.16)))
-            textView.cancelScrollSpring()
             clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
             scroll.reflectScrolledClipView(clipView)
         }
-        textView.updateCaret(animated: false)
+        textView.updateCaret()
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
         refreshOutline()
         focus()
