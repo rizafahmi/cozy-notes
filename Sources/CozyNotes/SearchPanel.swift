@@ -9,6 +9,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onOpenNote: ((URL) -> Void)?
     var onOpenNoteInNewWindow: ((URL) -> Void)?
     var onTogglePinNote: ((URL) -> Void)?
+    var onMergeNotes: (([URL]) -> Void)?
     var onNewNote: (() -> Void)?
     var onDeleteNote: ((URL) -> Void)?
     var onToggleSidebar: (() -> Void)?
@@ -23,9 +24,16 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var isProcessing: Bool { busy }
     var isExtracting: Bool { extracting }
     var selectedNoteURL: URL? {
+        if table.selectedRowIndexes.count > 1 {
+            return selectedNoteURLs.first
+        }
         let row = table.selectedRow
         guard hits.indices.contains(row), hits[row].source.kind == .note else { return nil }
         return hits[row].source.url
+    }
+    var selectedNoteURLs: [URL] {
+        syncOrderedSelectionFromTable()
+        return orderedSelectedNoteURLs
     }
     var isSidebarFocused: Bool { window?.firstResponder === table }
     var visibleHits: [SearchHit] { hits }
@@ -49,6 +57,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private var hits: [SearchHit] = []
     private var stamps: [URL: SearchFileStamp] = [:]
     private var activeNoteURL: URL?
+    private var orderedSelectedNoteURLs: [URL] = []
     private var suppressSelectionAction = false
     private var scheduledRefresh: DispatchWorkItem?
     private var operation: SearchCancellation?
@@ -145,6 +154,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.backgroundColor = .clear
         table.selectionHighlightStyle = .regular
         table.allowsEmptySelection = true
+        table.allowsMultipleSelection = true
         table.delegate = self
         table.dataSource = self
         table.target = self
@@ -153,6 +163,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.onReturn = { [weak self] in self?.openSelected() }
         table.onOptionReturn = { [weak self] in self?.openSelectedInNewWindow() }
         table.onTogglePin = { [weak self] in self?.togglePinSelectedNote() }
+        table.onMerge = { [weak self] in self?.mergeSelectedNotes() }
         table.onDelete = { [weak self] in self?.deleteSelectedNote() }
         table.onMenuForRow = { [weak self] row in self?.contextMenuForRow(row) }
         let scroll = NSScrollView()
@@ -215,6 +226,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             suppressSelectionAction = true
             table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
             suppressSelectionAction = false
+            syncOrderedSelectionFromTable()
         }
         window?.makeFirstResponder(table)
     }
@@ -243,12 +255,54 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         suppressSelectionAction = true
         defer { suppressSelectionAction = false }
         guard let url, let row = hits.firstIndex(where: { $0.source.url == url }) else {
+            orderedSelectedNoteURLs = []
             table.deselectAll(nil)
             updateOpenButtonVisibility()
+            updateFooterSummary()
             return
         }
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        orderedSelectedNoteURLs = hits[row].source.kind == .note ? [url] : []
         updateOpenButtonVisibility()
+        updateFooterSummary()
+    }
+
+    func selectNotes(_ urls: [URL]) {
+        suppressSelectionAction = true
+        defer { suppressSelectionAction = false }
+        var rowIndexes = IndexSet()
+        var ordered: [URL] = []
+        for url in urls {
+            let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+            if let row = hits.firstIndex(where: { $0.source.kind == .note && $0.source.url == canonical }) {
+                rowIndexes.insert(row)
+                if !ordered.contains(canonical) {
+                    ordered.append(canonical)
+                }
+            }
+        }
+        orderedSelectedNoteURLs = ordered
+        if rowIndexes.isEmpty {
+            table.deselectAll(nil)
+        } else {
+            table.selectRowIndexes(rowIndexes, byExtendingSelection: false)
+        }
+        updateOpenButtonVisibility()
+        updateFooterSummary()
+    }
+
+    private func syncOrderedSelectionFromTable() {
+        var currentNotes: [URL] = []
+        for row in table.selectedRowIndexes where hits.indices.contains(row) && hits[row].source.kind == .note {
+            let url = hits[row].source.url
+            if !currentNotes.contains(url) {
+                currentNotes.append(url)
+            }
+        }
+        orderedSelectedNoteURLs.removeAll { !currentNotes.contains($0) }
+        for url in currentNotes where !orderedSelectedNoteURLs.contains(url) {
+            orderedSelectedNoteURLs.append(url)
+        }
     }
 
     func applyPinnedPaths(_ pinnedPaths: Set<String>) {
@@ -286,6 +340,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         onOpenNote = nil
         onOpenNoteInNewWindow = nil
         onTogglePinNote = nil
+        onMergeNotes = nil
         onNewNote = nil
         onDeleteNote = nil
         onToggleSidebar = nil
@@ -310,6 +365,18 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let newItem = NSMenuItem(title: "New Note", action: #selector(newNoteTapped), keyEquivalent: "")
         newItem.target = self
         menu.addItem(newItem)
+
+        let selectedNotes = selectedNoteURLs
+        if selectedNotes.count >= 2 {
+            let mergeItem = NSMenuItem(
+                title: "Merge \(selectedNotes.count) Notes…",
+                action: #selector(mergeSelectedNotes),
+                keyEquivalent: ""
+            )
+            mergeItem.target = self
+            mergeItem.isEnabled = !busy
+            menu.addItem(mergeItem)
+        }
 
         let indexItem = NSMenuItem(title: "Make Searchable", action: #selector(makeSearchable), keyEquivalent: "")
         indexItem.target = self
@@ -441,6 +508,8 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     private func render() {
         guard !closed else { return }
+        syncOrderedSelectionFromTable()
+        let previousMultiNotes = table.selectedRowIndexes.count > 1 ? orderedSelectedNoteURLs : []
         let selectedHit = table.selectedRow >= 0 && table.selectedRow < hits.count ? hits[table.selectedRow] : nil
         let targetURL = selectedHit?.source.url ?? activeNoteURL
         let targetPage = selectedHit?.page
@@ -456,9 +525,25 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         }
         suppressSelectionAction = true
         table.reloadData()
-        if let targetURL,
-           let row = hits.firstIndex(where: { $0.source.url == targetURL && (targetPage == nil || $0.page == targetPage) }) {
+        if previousMultiNotes.count > 1 {
+            var restoredIndexes = IndexSet()
+            var restoredOrdered: [URL] = []
+            for url in previousMultiNotes {
+                if let row = hits.firstIndex(where: { $0.source.kind == .note && $0.source.url == url }) {
+                    restoredIndexes.insert(row)
+                    restoredOrdered.append(url)
+                }
+            }
+            orderedSelectedNoteURLs = restoredOrdered
+            if !restoredIndexes.isEmpty {
+                table.selectRowIndexes(restoredIndexes, byExtendingSelection: false)
+            }
+        } else if let targetURL,
+                  let row = hits.firstIndex(where: { $0.source.url == targetURL && (targetPage == nil || $0.page == targetPage) }) {
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            orderedSelectedNoteURLs = hits[row].source.kind == .note ? [hits[row].source.url] : []
+        } else {
+            orderedSelectedNoteURLs = []
         }
         suppressSelectionAction = false
         if let scroll = table.enclosingScrollView {
@@ -477,20 +562,30 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         } else {
             empty.stringValue = "No notes yet.\(pending > 0 ? "\n\(pending) files still need indexing." : "")"
         }
-        if !busy, let snapshot {
-            let count = hits.count
-            let noun = count == 1 ? "ENTRY" : "ENTRIES"
-            let pinnedCount = hits.reduce(0) { $0 + ($1.source.isPinned ? 1 : 0) }
-            var summary = "\(count) \(noun)"
-            if pinnedCount > 0 { summary += " · \(pinnedCount) PINNED" }
-            if snapshot.pendingCount > 0 { summary += " · \(snapshot.pendingCount) PENDING" }
-            if snapshot.issueCount > 0 { summary += " · \(snapshot.issueCount) ISSUE" }
-            setStatus(summary)
-        }
+        updateFooterSummary()
         updateOpenButtonVisibility()
     }
 
+    private func updateFooterSummary() {
+        guard !busy, let snapshot else { return }
+        let selectedCount = orderedSelectedNoteURLs.count
+        let count = hits.count
+        let noun = count == 1 ? "ENTRY" : "ENTRIES"
+        let pinnedCount = hits.reduce(0) { $0 + ($1.source.isPinned ? 1 : 0) }
+        var summary = "\(count) \(noun)"
+        if selectedCount >= 2 { summary += " · \(selectedCount) SELECTED" }
+        if pinnedCount > 0 { summary += " · \(pinnedCount) PINNED" }
+        if snapshot.pendingCount > 0 { summary += " · \(snapshot.pendingCount) PENDING" }
+        if snapshot.issueCount > 0 { summary += " · \(snapshot.issueCount) ISSUE" }
+        setStatus(summary)
+    }
+
     private func updateOpenButtonVisibility() {
+        if table.selectedRowIndexes.count > 1 {
+            openButton.isEnabled = !busy && !hits.isEmpty
+            openButton.isHidden = true
+            return
+        }
         let row = table.selectedRow
         let selected = row >= 0 && row < hits.count ? hits[row] : nil
         openButton.isEnabled = !busy && !hits.isEmpty
@@ -544,8 +639,11 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        syncOrderedSelectionFromTable()
         updateOpenButtonVisibility()
+        updateFooterSummary()
         guard !suppressSelectionAction, !closed, !busy else { return }
+        guard table.selectedRowIndexes.count == 1 else { return }
         let row = table.selectedRow
         guard hits.indices.contains(row) else { return }
         let hit = hits[row]
@@ -561,10 +659,14 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     @objc private func rowClicked() {
         guard !closed, !busy else { return }
+        syncOrderedSelectionFromTable()
+        let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+        guard table.selectedRowIndexes.count <= 1,
+              !flags.contains(.command),
+              !flags.contains(.shift) else { return }
         let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
         guard hits.indices.contains(row) else { return }
         let hit = hits[row]
-        let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
         if hit.source.kind == .note {
             activateHit(hit, allowExternalViewer: false, inNewWindow: flags.contains(.option))
         }
@@ -572,6 +674,10 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     @objc func openSelected() {
         guard !closed, !busy, !hits.isEmpty else { return }
+        if selectedNoteURLs.count >= 2 {
+            mergeSelectedNotes()
+            return
+        }
         let row = table.selectedRow >= 0 ? table.selectedRow : 0
         guard hits.indices.contains(row) else { return }
         activateHit(hits[row], allowExternalViewer: true)
@@ -589,13 +695,51 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         onTogglePinNote?(url)
     }
 
+    @objc func mergeSelectedNotes() {
+        guard !closed, !busy else { return }
+        let urls = selectedNoteURLs
+        guard urls.count >= 2 else { return }
+        onMergeNotes?(urls)
+    }
+
     @objc func deleteSelectedNote() {
-        guard !closed, !busy, let url = selectedNoteURL else { return }
+        guard !closed, !busy, table.selectedRowIndexes.count == 1, let url = selectedNoteURL else { return }
         onDeleteNote?(url)
     }
 
     func contextMenuForRow(_ row: Int) -> NSMenu? {
         guard !closed, !busy, hits.indices.contains(row) else { return nil }
+        if table.selectedRowIndexes.count > 1 && table.selectedRowIndexes.contains(row) {
+            let selectedNotes = selectedNoteURLs
+            let allSelectedURLs = table.selectedRowIndexes.compactMap { idx -> URL? in
+                guard hits.indices.contains(idx) else { return nil }
+                return hits[idx].source.url
+            }
+            if selectedNotes.count >= 2 {
+                let menu = NSMenu()
+                let mergeItem = NSMenuItem(
+                    title: "Merge \(selectedNotes.count) Notes…",
+                    action: #selector(mergeRowsFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                mergeItem.target = self
+                mergeItem.representedObject = selectedNotes
+                menu.addItem(mergeItem)
+
+                menu.addItem(.separator())
+
+                let revealItem = NSMenuItem(
+                    title: "Reveal in Finder",
+                    action: #selector(revealMultipleRowsFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                revealItem.target = self
+                revealItem.representedObject = allSelectedURLs
+                menu.addItem(revealItem)
+                return menu
+            }
+        }
+
         let hit = hits[row]
         let menu = NSMenu()
         let openItem = NSMenuItem(
@@ -649,9 +793,20 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         return menu
     }
 
+    @objc private func mergeRowsFromMenu(_ sender: NSMenuItem) {
+        guard !closed, !busy, let urls = sender.representedObject as? [URL], urls.count >= 2 else { return }
+        onMergeNotes?(urls)
+    }
+
+    @objc private func revealMultipleRowsFromMenu(_ sender: NSMenuItem) {
+        guard let urls = sender.representedObject as? [URL], !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
     @objc private func openRowFromMenu(_ sender: NSMenuItem) {
         guard !closed, !busy, let row = sender.representedObject as? Int, hits.indices.contains(row) else { return }
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        syncOrderedSelectionFromTable()
         activateHit(hits[row], allowExternalViewer: true)
     }
 
@@ -795,15 +950,22 @@ private final class SearchResultsTable: NSTableView {
     var onReturn: (() -> Void)?
     var onOptionReturn: (() -> Void)?
     var onTogglePin: (() -> Void)?
+    var onMerge: (() -> Void)?
     var onDelete: (() -> Void)?
     var onMenuForRow: ((Int) -> NSMenu?)?
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.type == .keyDown {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             let key = event.charactersIgnoringModifiers?.lowercased()
-            if flags == [.command, .shift], key == "p", window?.firstResponder === self {
-                onTogglePin?()
-                return true
+            if flags == [.command, .shift], window?.firstResponder === self {
+                if key == "p" {
+                    onTogglePin?()
+                    return true
+                }
+                if key == "m", selectedRowIndexes.count >= 2 {
+                    onMerge?()
+                    return true
+                }
             }
         }
         return super.performKeyEquivalent(with: event)
