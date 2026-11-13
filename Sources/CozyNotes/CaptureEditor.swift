@@ -2293,9 +2293,13 @@ import CozyCore
             let clipView = enclosingScrollView?.contentView
             let savedOriginY = clipView?.bounds.origin.y
 
+            let wasEmpty = storage.length == 0
             editorUndoManager.disableUndoRegistration()
             storage.beginEditing()
             storage.replaceCharacters(in: safeRange, with: replacement)
+            if wasEmpty && repLen > 0 && !typingAttributes.isEmpty {
+                storage.setAttributes(typingAttributes, range: NSRange(location: 0, length: repLen))
+            }
             storage.endEditing()
             editorUndoManager.enableUndoRegistration()
 
@@ -5313,8 +5317,10 @@ import CozyCore
             || textView.bulletItems.contains { NSIntersectionRange($0.lineRange, oldLineRange).length > 0 || $0.lineRange.location == oldLineRange.location }
 
         let newHasSyntax = lineHasMarkdownSyntax(ns, lineRange: newLineRange)
+        let missingBaseAttrs = newLineRange.length > 0
+            && storage.attribute(.foregroundColor, at: newLineRange.location, effectiveRange: nil) == nil
 
-        if edit.affectedRange.length == 0 && !hadItemsInOldLine && !newHasSyntax {
+        if edit.affectedRange.length == 0 && !hadItemsInOldLine && !newHasSyntax && !missingBaseAttrs {
             // Fast path for plain prose editing: shift subsequent decoration ranges without touching NSTextStorage attributes
             if delta != 0 {
                 let shiftStart = oldLineEnd
@@ -6146,7 +6152,7 @@ import CozyCore
         bodyParagraph.lineSpacing = 8.0
         bodyParagraph.paragraphSpacing = 11.5
 
-        if targetRange.length < totalLen {
+        if targetRange.length < totalLen || scan == nil {
             storage.setAttributes([
                 .font: baseFont,
                 .foregroundColor: Theme.ink,
