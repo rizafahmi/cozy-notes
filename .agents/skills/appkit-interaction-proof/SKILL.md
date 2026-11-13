@@ -57,10 +57,14 @@ For wheel input, enter through the real event route. Distinguish line-wheel and 
 
 Capture the initial selection, visible coverage, content, and target geometry. Record:
 
-- The input action and its immediate effect.
+- The input action and its immediate effect, captured in the same run-loop turn as the input.
 - Subsequent layout or animation updates.
 - The resulting visible geometry and selection.
 - Settled state or an explicit deadline failure.
+
+Comparing before/after state across separate turns can include legitimate animation or layout progress and produce false failures. Capture the immediate effect atomically; sample later frames separately for continuity.
+
+For a no-op visibility request (the desired viewport origin already equals the current origin), assert both that the origin did not change and that an in-flight caret animation still exists. A redundant `setBoundsOrigin`/`reflectScrolledClipView` can cancel the presentation even though the viewport looks unchanged.
 
 For folds, compare following-heading spacing with expected paragraph spacing, not merely with its expanded position. Check that folding leaves source Markdown unchanged and preserves selection unless the selected content becomes hidden.
 
@@ -88,6 +92,8 @@ A useful sequence is fold -> resize -> wheel -> settle -> unfold -> wheel -> set
 
 Run the narrowest relevant check after a code change. Add a regression only when the existing tests do not cover the failing consumer path; a verification-only investigation needs no new permanent test.
 
+Separate input-handler cost from mutation cost. Synthetic key dispatch, first-responder handoff, `NSTextStorage` mutation, and the editor/layout update are different timestamps; one end-to-end number hides which budget moved. State the measured segment, not just “typing latency.”
+
 Require the runner's final completion summary and all claimed parameterized cases. Case-start messages, a command returning, or other tests passing are not proof that the target test completed. Preserve failures when capturing output through shell pipelines.
 
 Assertions should catch visible failures: excess folded height, changed selection, a displaced viewport, lost wheel progress, or a delayed return to an old target. Do not test source text, internal wiring, arbitrary finite values, or merely that event handling did not throw.
@@ -101,3 +107,5 @@ Report the exact verified path, check/scenario, completion result, and remaining
 A mouse-fold regression invocation stopped showing progress after two parameterized case starts while other fold checks and the workout passed. Removing test-level global event posting/draining allowed all four mouse cases to complete. A separate native Tab -> wheel probe then exposed bounce-back that those geometry and performance checks did not cover.
 
 The lesson is to verify the next interaction and the runner's actual completion, not to generalize success from nearby tests.
+
+A later caret probe added two checks. A no-op viewport request was cancelling backspace easing in a real AppKit window; comparing the desired origin before writing fixed it without a new scroll engine. Atomic before/after capture within one input turn also avoided false resets that appeared only when state was compared across turns. Native key dispatch produced separate handler and storage-mutation timings, so neither was reported as the other.

@@ -52,7 +52,7 @@ If the request fails this gate, say so plainly and don't write the animation. Of
 
 ### Writing-caret exception — presentation, not the editing operation
 
-An approved Bike-style caret is a continuous visual indicator, not a keyboard action waiting to finish. Record logical insertion/selection and rendered caret positions separately. Use the existing response/damping convention, keep text/IME/undo/focus native and immediate, and never let the visual caret authorize scrolling. Selection, navigation, paste/programmatic changes, resize/focus/scroll changes, and reduced or disabled motion snap or hide. Verify real typing, rapid retargeting, snap paths, and the affected frame/keystroke budgets; do not equate spring settling time with input latency. See [animate-native](../animate-native/SKILL.md) for the platform boundary.
+An approved Bike-style caret is a continuous visual indicator, not a keyboard action waiting to finish. Record logical insertion/selection and rendered caret positions separately. Use the existing response/damping convention, keep text/IME/undo/focus native and immediate, and never let the visual caret authorize scrolling. Selection, navigation, paste/programmatic changes, resize/focus/scroll changes, and reduced or disabled motion snap or hide. Verify real typing, rapid retargeting, snap paths, and the affected frame/keystroke budgets; do not equate spring settling time with input latency. See [animate-native](../animate-native/SKILL.md) for the platform boundary and [CARET.md](../animate-native/CARET.md) for the snap matrix, mechanics, and proof.
 
 ### 2. What is the purpose?
 

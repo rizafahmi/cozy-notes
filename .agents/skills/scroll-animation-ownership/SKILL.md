@@ -21,6 +21,10 @@ Trace current definitions and references for:
 
 For AppKit, distinguish `NSScrollView` input handling from `NSClipView` offset mutations such as `scroll(to:)` and `setBoundsOrigin`. A caret layer animation is not necessarily a viewport animation.
 
+Treat every offset write as an ownership event. Writing the origin that is already current is not a no-op: AppKit bounds observers, Android `OnScrollChangedListener`, and the app's own caret/scroll cancellation can treat it as input. Compute the desired origin, compare it with the current origin, and return before writing.
+
+Scope scroll notifications to the owned surface. A tree-level listener also fires for ancestor and sibling scrolls. Reconcile the owned view's location, size, padding, and text metrics; snap only when its own geometry changed.
+
 Keep ownership in the existing scroll controller or event path. Do not add a second independent scroll engine or a broad gesture abstraction to solve one conflict.
 
 ## 2. Observe the sequence, not just the endpoint
@@ -66,6 +70,7 @@ Fold/unfold and resize can invalidate a scroll target without changing the user'
 
 - Anchor required geometry updates once, from pre-change visible content; see [appkit-textkit-layout](../appkit-textkit-layout/SKILL.md).
 - Do not reapply the same anchor on every bounds-change or drawing callback.
+- If the desired origin equals the current origin, return before `setBoundsOrigin`, `scroll(to:)`, `reflectScrolledClipView`, or the platform equivalent. Reaffirming an unchanged origin can cancel caret presentation as if input arrived.
 - Distinguish a layout refresh from a new request to reveal the caret.
 - Start a newly requested animation from the actual current offset, not the old target.
 - Preserve the platform's valid overscroll behavior instead of globally disabling elasticity.

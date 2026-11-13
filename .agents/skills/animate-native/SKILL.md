@@ -12,6 +12,7 @@ For specialized work, load only the relevant guide:
 - [AppKit interaction proof](../appkit-interaction-proof/SKILL.md): event routing, focus, run-loop isolation, and explicit scenario completion.
 - [AppKit TextKit layout](../appkit-textkit-layout/SKILL.md): pre-change anchors, UTF-16 ranges, and bounded relayout.
 - [Scroll animation ownership](../scroll-animation-ownership/SKILL.md): viewport writers and direct-input handoff.
+- [Android view interaction proof](../android-view-interaction-proof/SKILL.md): `InputConnection`, native cursor state, atomic UI-thread sampling, and effective emulator geometry.
 - [Animation performance](../animation-performance/SKILL.md): rendering-path and frame-cost evidence.
 - [Write Swift](../write-swift/SKILL.md): language, toolchain, isolation, and sequential-mutation semantics. Honor the repository's SDK, Swift version, and test-runner conventions over newer examples.
 
@@ -29,10 +30,12 @@ Choose exact timing from existing motion tokens or platform conventions. The sha
 
 ### Smooth writing caret — a separate presentation contract
 
+Load [CARET.md](CARET.md) for the full contract, snap matrix, platform mechanics, and proof; the bullets below are the adapter summary.
+
 - Preserve an explicitly chosen writing feel instead of removing it solely because typing is frequent. The indicator can ease briefly while text, logical selection, IME, undo, and accessibility update immediately.
 - Classify ordinary typing at the actual input boundary. Do not animate every small programmatic edit or infer typing from a stale global event. Keep selection, arrow/search navigation, paste/large changes, layout/scroll/focus changes, and reduced or explicitly disabled motion on a snap/hide path.
 - On AppKit, an owned caret layer can commit model position/bounds immediately and use short critically damped additive springs for presentation continuity; native selection remains authoritative. Reuse the established response/damping, not a generic drawer spring.
-- On Android, retain native `EditText` and `InputConnection` editing/selection semantics. If a passive cursor drawing/overlay is required, avoid per-frame allocation or text relayout, stop frames when settling ends, and cancel on focus/lifecycle/policy changes. Custom drawing still costs frames; it is not automatically a compositor property animation.
+- On Android, retain native `EditText` and `InputConnection` editing/selection semantics. If a passive cursor drawing/overlay is required, avoid per-frame allocation or text relayout, stop frames when settling ends, and cancel on focus/lifecycle/policy changes. Custom drawing still costs frames; it is not automatically a compositor property animation. Native cursor bounds resolve during the native draw: an admitted selection move can leave a queued frame integrating toward the old target. Drop that owned callback, let the next draw resolve the target, and resume same-coordinate edits. Correlate a tree-level scroll listener with the editor's own geometry; unrelated ancestor/sibling scrolling must not snap typing.
 - Use the logical target, never the eased visual position, for any existing caret visibility check. The caret animation must neither start nor prolong a viewport scroll. Test text/selection immediately, rendered continuity over time, snap paths, and the existing typing/frame budgets independently.
 
 
