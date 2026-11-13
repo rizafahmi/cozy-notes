@@ -35,7 +35,11 @@ Reuse the repository's test runner and fixture conventions. In Cozy Notes, prese
 
 Do not post dummy mouse events or drain `NSApplication`'s global event queue from a shared regression test to force progress. This can consume unrelated input, enter nested tracking, or interfere with later parameterized cases. Tests that require full native tracking belong in an isolated process or supported UI automation.
 
-Use asynchronous observation with a bounded deadline where settling matters. Do not block the main actor with sleeps or treat an arbitrary delay as evidence of completion.
+Use asynchronous observation with a bounded deadline where settling matters. Do not block the main actor with sleeps or treat an arbitrary delay as evidence of completion. When an AppKit view dispatches work onto a background `DispatchQueue` and hops back via `DispatchQueue.main.async` or `asyncAfter` (e.g. `SearchPanel.refresh()`), mark the test `async` and yield with `try? await Task.sleep(...)` inside the deadline loop rather than synchronous `RunLoop.current.run(until:)`, which can starve `DispatchQueue.main` on Swift Testing's cooperative `@MainActor` executor.
+
+When constructing synthetic vault files for negative security or boundary assertions (e.g. `Extracted Text/*.md` companions), match the domain engine's full content-signature contract (`<!-- cozy-extracted-text:v1 ... -->`) rather than relying on folder paths alone, and verify that a rejected operation leaves no side-effect file before subsequent assertions.
+
+After completing a user-facing UI change on macOS, check whether `.build-app/Cozy Notes.app` exists or is currently running (`swift build` and `swift test` only update `.build/`); rebuild via `scripts/build-macos.sh` so the live app bundle reflects the new UI.
 
 ## 3. Derive input from current geometry
 

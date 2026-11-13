@@ -238,6 +238,13 @@ Preferences must not remove content, focus feedback, semantic state, or access t
 
 Touch devices can synthesize hover on tap. Gate hover-only enhancement behind capability media queries, and keep essential affordances, focus feedback, and information available without hover. Motion choices still pass [animate](../animate/SKILL.md).
 
+### Desktop & AppKit list-row affordances and keystroke-hot chrome
+
+- **Never hide primary item actions behind right-click or shortcuts alone**: If a list item supports a frequent toggle (such as pinning a note in the sidebar or Quick Switcher) and the main header button is hidden when no note is open (`NEW FOLIO`), surface a subtle hover-reveal control directly on the row alongside keyboard (`⇧⌘P`) and context-menu access.
+- **Zero-layout-shift hover controls**: Keep secondary row controls mounted in the stack at fixed width, toggling `alphaValue` (`0` when unhovered and inactive, `0.9` on `NSTrackingArea` row hover, `1.0` when active/pinned) rather than toggling `isHidden` on hover, so neighbouring titles and timestamps never jump horizontally. Override `hitTest(_:)` to return `nil` when `alphaValue <= 0.01` so clicking an unhovered row still selects the row normally.
+- **Instant optimistic snapshot updates**: When a user toggles item state (like Pin) in a view backed by a debounced background indexer, provide an immutable `Sendable` snapshot transform (e.g. `SearchSnapshot.updatingPinnedPaths(_:)`) so the list re-sorts and redraws synchronously in `0 ms` on `@MainActor` without waiting for a disk rescan.
+- **Zero-allocation per-keystroke chrome**: Any UI method invoked from `textDidChange` / `editorDidChange` (such as `updateEditorChrome()`) runs on every character typed. Cache file/vault metadata on the controller (invalidated only on URL change, state toggle, external FSEvents refresh, or checkpoint restore) and guard `NSImage(systemSymbolName:)`, tooltip, and accessibility setters behind equality checks so typing does zero syscalls or allocations.
+
 ## The Sonner Principles (Building Loved Components)
 
 These principles come from building Sonner (13M+ weekly npm downloads) and apply to any component:
