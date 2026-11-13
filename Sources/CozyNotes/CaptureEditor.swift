@@ -5,14 +5,23 @@ import QuartzCore
 import CozyCore
 
 @MainActor private final class CozyUndoManager: UndoManager {
+    var onWillUndoOrRedo: (() -> Void)?
+    var onDidUndoOrRedo: (() -> Void)?
+
     override func undo() {
+        onWillUndoOrRedo?()
         autoreleasepool { super.undo() }
+        onDidUndoOrRedo?()
     }
     override func undoNestedGroup() {
+        onWillUndoOrRedo?()
         autoreleasepool { super.undoNestedGroup() }
+        onDidUndoOrRedo?()
     }
     override func redo() {
+        onWillUndoOrRedo?()
         autoreleasepool { super.redo() }
+        onDidUndoOrRedo?()
     }
 }
 
@@ -63,12 +72,14 @@ import CozyCore
 }
 
 @MainActor final class MarkdownTextView: NSTextView {
-    private let editorUndoManager: UndoManager = {
+    static let defaultUndoLevels = 128
+    private let editorUndoManager: CozyUndoManager = {
         let um = CozyUndoManager()
-        um.levelsOfUndo = 2
+        um.levelsOfUndo = MarkdownTextView.defaultUndoLevels
         return um
     }()
     override var undoManager: UndoManager? { editorUndoManager }
+    let vim = VimEngine()
     var onFiles: (([URL], Bool) -> Void)?
     var onClipboardImage: ((Data, Bool) -> Void)?
     var onFocusChange: (() -> Void)?
@@ -188,6 +199,9 @@ import CozyCore
             "position": NSNull(),
             "bounds": NSNull(),
             "backgroundColor": NSNull(),
+            "borderColor": NSNull(),
+            "borderWidth": NSNull(),
+            "cornerRadius": NSNull(),
             "opacity": NSNull(),
             "hidden": NSNull()
         ]
@@ -733,6 +747,7 @@ import CozyCore
     override func resignFirstResponder() -> Bool {
         let ok = super.resignFirstResponder()
         if ok {
+            vim.handleFocusLost()
             hasCaretOrigin = false
             removeCaretTravelAnimations()
             cancelCaretBlink()
@@ -809,6 +824,9 @@ import CozyCore
     }
 
     override func keyDown(with event: NSEvent) {
+        if vim.isEnabled, isEditable, vim.handleKeyEvent(event) {
+            return
+        }
         let previous = isHandlingTypingInput
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let scalar = event.characters?.unicodeScalars.first?.value
@@ -840,6 +858,17 @@ import CozyCore
         let previous = isCaretTypingTransaction
         isCaretTypingTransaction = isHandlingTypingInput && selectedRange().length == 0
         defer { isCaretTypingTransaction = previous }
+        if vim.isEnabled, vim.mode == .insert, !hasMarkedText(), let ns = textStorage?.mutableString {
+            let sel = selectedRange()
+            if sel.length > 0 {
+                applyUndoableReplacement(in: sel, with: "", selectedRangeAfter: NSRange(location: sel.location, length: 0))
+                return
+            } else if sel.location > 0 {
+                let delRange = ns.rangeOfComposedCharacterSequence(at: sel.location - 1)
+                applyUndoableReplacement(in: delRange, with: "", selectedRangeAfter: NSRange(location: delRange.location, length: 0))
+                return
+            }
+        }
         super.deleteBackward(sender)
     }
 
@@ -847,6 +876,17 @@ import CozyCore
         let previous = isCaretTypingTransaction
         isCaretTypingTransaction = isHandlingTypingInput && selectedRange().length == 0
         defer { isCaretTypingTransaction = previous }
+        if vim.isEnabled, vim.mode == .insert, !hasMarkedText(), let ns = textStorage?.mutableString {
+            let sel = selectedRange()
+            if sel.length > 0 {
+                applyUndoableReplacement(in: sel, with: "", selectedRangeAfter: NSRange(location: sel.location, length: 0))
+                return
+            } else if sel.location < ns.length {
+                let delRange = ns.rangeOfComposedCharacterSequence(at: sel.location)
+                applyUndoableReplacement(in: delRange, with: "", selectedRangeAfter: NSRange(location: sel.location, length: 0))
+                return
+            }
+        }
         super.deleteForward(sender)
     }
 
@@ -861,6 +901,7 @@ import CozyCore
             case "x":
                 guard isEditable else { return false }
                 cut(self)
+                vim.clampSelectionIfNeeded()
                 return true
             case "c":
                 copy(self)
@@ -868,13 +909,17 @@ import CozyCore
             case "v":
                 guard isEditable else { return false }
                 paste(self)
+                vim.clampSelectionIfNeeded()
                 return true
             case "a":
                 selectAll(self)
                 return true
             case "z":
-                guard isEditable, let um = undoManager, um.canUndo else { return false }
+                guard isEditable else { return false }
+                vim.flushInsertUndoIfNeeded()
+                guard let um = undoManager, um.canUndo else { return false }
                 um.undo()
+                vim.clampSelectionIfNeeded()
                 return true
             case "b":
                 guard isEditable else { return false }
@@ -931,8 +976,11 @@ import CozyCore
         } else if flags == [.command, .shift] {
             switch key {
             case "z":
-                guard isEditable, let um = undoManager, um.canRedo else { return false }
+                guard isEditable else { return false }
+                vim.flushInsertUndoIfNeeded()
+                guard let um = undoManager, um.canRedo else { return false }
                 um.redo()
+                vim.clampSelectionIfNeeded()
                 return true
             case "x", "s":
                 guard isEditable else { return false }
@@ -1077,6 +1125,11 @@ import CozyCore
                 onOpenWikiLinkInNewWindow?(link)
                 return true
             }
+        } else if vim.isEnabled, isEditable, !hasMarkedText(),
+                  flags.contains(.control), !flags.contains(.command), !flags.contains(.option) {
+            if vim.handleKeyEvent(event) {
+                return true
+            }
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -1129,6 +1182,7 @@ import CozyCore
         let pt = convert(event.locationInWindow, from: nil)
         if let hit = foldHitTargets.first(where: { $0.rect.insetBy(dx: -4, dy: -3).contains(pt) }) {
             toggleFold(forHeadingAt: hit.headingLocation)
+            vim.clampSelectionIfNeeded()
             return
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -1141,6 +1195,7 @@ import CozyCore
             return
         }
         super.mouseDown(with: event)
+        vim.handleMouseSelectionCompleted()
     }
 
     func wikiLink(atPoint pt: NSPoint) -> WikiLink? {
@@ -1497,6 +1552,47 @@ import CozyCore
         case .headingsOnly:
             unfoldAllHeadings(sender)
         }
+    }
+
+    func foldedRangeEnclosing(_ charIndex: Int) -> NSRange? {
+        guard !foldedSections.isEmpty else { return nil }
+        var lo = 0
+        var hi = foldedSections.count - 1
+        while lo <= hi {
+            let mid = (lo + hi) >> 1
+            let r = foldedSections[mid].foldedCharRange
+            if charIndex < r.location {
+                hi = mid - 1
+            } else if charIndex >= NSMaxRange(r) {
+                lo = mid + 1
+            } else {
+                return r
+            }
+        }
+        return nil
+    }
+
+    @objc func foldHeadingAtCursor(_ sender: Any?) {
+        guard let idx = headingIndex(atOrEnclosing: selectedRange().location, requireSameLine: false) else { return }
+        let headingLocation = headingGutterItems[idx].range.location
+        guard foldedSections.firstIndex(where: { $0.headingLocation == headingLocation }) == nil else { return }
+        toggleFold(forHeadingAt: headingLocation)
+    }
+
+    @objc func foldAllHeadings(_ sender: Any?) {
+        guard !headingGutterItems.isEmpty else { return }
+        var nextFolds: [FoldedSection] = []
+        for idx in headingGutterItems.indices {
+            if let section = computeFoldedSection(forHeadingIndex: idx, bodyOnly: true) {
+                nextFolds.append(section)
+            }
+        }
+        let oldFolds = foldedSections
+        foldedSections = nextFolds
+        outlineFoldMode = nextFolds.isEmpty ? .showAll : .headingsOnly
+        clampSelectionOutsideFolds()
+        invalidateFoldLayout(forChangedRanges: Self.symmetricDifferenceRanges(from: oldFolds, to: nextFolds))
+        onFoldStatusChange?(outlineFoldMode == .headingsOnly ? "Outline: Headings Only" : "Outline: Show All")
     }
 
     @objc func unfoldAllHeadings(_ sender: Any?) {
@@ -2083,6 +2179,65 @@ import CozyCore
         )
     }
 
+    private static let taskCheckboxToggleRegex = try! NSRegularExpression(
+        pattern: "(?m)^([ \\t]*(?:[-*+]|\\d+\\.)\\s+\\[)([ xX])(\\])"
+    )
+
+    @discardableResult
+    func toggleTaskCompletion(in range: NSRange) -> Bool {
+        guard isEditable, let ns = textStorage?.mutableString, ns.length > 0 else { return false }
+        let safeLoc = min(max(0, range.location), ns.length)
+        let safeRange = NSRange(location: safeLoc, length: min(range.length, ns.length - safeLoc))
+        let lineSpan = ns.lineRange(for: safeRange)
+        guard lineSpan.length > 0 else { return false }
+        let block = ns.substring(with: lineSpan)
+        let blockNS = block as NSString
+        let matches = Self.taskCheckboxToggleRegex.matches(
+            in: block,
+            range: NSRange(location: 0, length: blockNS.length)
+        )
+        guard !matches.isEmpty else { return false }
+        let allChecked = matches.allSatisfy { m in
+            let state = blockNS.substring(with: m.range(at: 2))
+            return state == "x" || state == "X"
+        }
+        let nextState = allChecked ? " " : "x"
+        let mutable = NSMutableString(string: block)
+        for m in matches.reversed() {
+            mutable.replaceCharacters(in: m.range(at: 2), with: nextState)
+        }
+        let updated = mutable as String
+        guard updated != block else { return false }
+        let preservedLoc = min(selectedRange().location, ns.length)
+        applyUndoableReplacement(
+            in: lineSpan,
+            with: updated,
+            selectedRangeAfter: NSRange(location: preservedLoc, length: 0)
+        )
+        return true
+    }
+
+    func configureUndoHooks() {
+        editorUndoManager.onWillUndoOrRedo = { [weak self] in
+            self?.vim.flushInsertUndoIfNeeded()
+        }
+        editorUndoManager.onDidUndoOrRedo = { [weak self] in
+            self?.vim.clampSelectionIfNeeded()
+        }
+    }
+
+    func resetUndoHistory() {
+        editorUndoManager.removeAllActions()
+        editorUndoManager.levelsOfUndo = Self.defaultUndoLevels
+    }
+
+    func registerCoalescedUndo(inverseRange: NSRange, previousString: String, restoreSelection: NSRange) {
+        breakUndoCoalescing()
+        editorUndoManager.registerUndo(withTarget: self) { target in
+            target.applyUndoableReplacement(in: inverseRange, with: previousString, selectedRangeAfter: restoreSelection)
+        }
+    }
+
     func applyUndoableReplacement(in range: NSRange, with replacement: String, selectedRangeAfter: NSRange? = nil) {
         autoreleasepool {
             guard let storage = textStorage else { return }
@@ -2110,10 +2265,23 @@ import CozyCore
             }
 
             let repLen = (replacement as NSString).length
-            let inverseRange = NSRange(location: safeRange.location, length: repLen)
-            let restoreSelection = selectedRangeAfter != nil ? previousSelection : nil
-            editorUndoManager.registerUndo(withTarget: self) { target in
-                target.applyUndoableReplacement(in: inverseRange, with: previousString, selectedRangeAfter: restoreSelection)
+            if safeRange.length > 256_000 || repLen > 256_000 {
+                editorUndoManager.levelsOfUndo = 2
+            }
+            let absorbedByVimInsert = !editorUndoManager.isUndoing
+                && !editorUndoManager.isRedoing
+                && vim.recordMutationInInsertSession(
+                    safeRange: safeRange,
+                    previousString: previousString,
+                    replacementLength: repLen,
+                    selectionBefore: previousSelection
+                )
+            if !absorbedByVimInsert {
+                let inverseRange = NSRange(location: safeRange.location, length: repLen)
+                let restoreSelection = selectedRangeAfter != nil ? previousSelection : nil
+                editorUndoManager.registerUndo(withTarget: self) { target in
+                    target.applyUndoableReplacement(in: inverseRange, with: previousString, selectedRangeAfter: restoreSelection)
+                }
             }
 
             let clipView = enclosingScrollView?.contentView
@@ -2274,6 +2442,225 @@ import CozyCore
         updateCaret()
     }
 
+    func scrollCursorLine(alignment: VimScrollAlignment) {
+        guard !suppressCaretUpdates, let scrollView = enclosingScrollView else { return }
+        let clipView = scrollView.contentView
+        let visHeight = clipView.bounds.height
+        guard visHeight > 40 else { return }
+        let caret = currentCaretRect()
+        guard caret.height > 0 else { return }
+        let desiredY: CGFloat
+        switch alignment {
+        case .center:
+            desiredY = max(0, round(caret.midY - visHeight * 0.5))
+        case .top:
+            desiredY = max(0, round(caret.minY - max(18, visHeight * 0.06)))
+        case .bottom:
+            desiredY = max(0, round(caret.maxY - visHeight + max(24, visHeight * 0.08)))
+        }
+        let requiredDocHeight = desiredY + visHeight
+        if requiredDocHeight > minimumOverscrollHeight {
+            minimumOverscrollHeight = requiredDocHeight
+        }
+        if frame.height < requiredDocHeight {
+            setFrameSize(NSSize(width: frame.width, height: requiredDocHeight))
+        }
+        clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: desiredY))
+        scrollView.reflectScrolledClipView(clipView)
+        updateCaret()
+    }
+
+    func scrollByHalfPages(_ halfPages: Int) -> Int? {
+        guard let lm = layoutManager, let tc = textContainer, let storage = textStorage else { return nil }
+        let ns = storage.mutableString
+        guard ns.length > 0 else { return 0 }
+        guard let scrollView = enclosingScrollView, scrollView.contentView.bounds.height > 60 else {
+            // Fallback when not in an active scroll viewport: step ~12 lines per half-page
+            var pos = min(selectedRange().location, ns.length)
+            let steps = abs(halfPages) * 12
+            if halfPages > 0 {
+                for _ in 0..<steps {
+                    let lr = ns.lineRange(for: NSRange(location: min(pos, ns.length - 1), length: 0))
+                    guard NSMaxRange(lr) < ns.length else { pos = lr.location; break }
+                    pos = NSMaxRange(lr)
+                }
+            } else {
+                for _ in 0..<steps {
+                    let lr = ns.lineRange(for: NSRange(location: min(pos, ns.length - 1), length: 0))
+                    guard lr.location > 0 else { pos = 0; break }
+                    pos = ns.lineRange(for: NSRange(location: lr.location - 1, length: 0)).location
+                }
+            }
+            return pos
+        }
+        let clipView = scrollView.contentView
+        let visHeight = clipView.bounds.height
+        let oldY = clipView.bounds.origin.y
+        let caretBefore = currentCaretRect()
+        let relY = min(max(24.0, caretBefore.midY - oldY), visHeight - 24.0)
+        let deltaY = max(60.0, round(visHeight * 0.5)) * CGFloat(halfPages)
+        if ns.length <= 100_000 {
+            lm.ensureLayout(for: tc)
+        }
+        let maxScrollY = max(0, bounds.height - visHeight)
+        let nextY = min(max(0, oldY + deltaY), maxScrollY)
+        clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: nextY))
+        scrollView.reflectScrolledClipView(clipView)
+        let visInContainer = clipView.documentVisibleRect.offsetBy(dx: -textContainerOrigin.x, dy: -textContainerOrigin.y)
+        lm.ensureLayout(forBoundingRect: visInContainer, in: tc)
+        let probePt = NSPoint(x: 4.0, y: max(0, nextY + relY - textContainerOrigin.y))
+        let glyphIdx = lm.glyphIndex(for: probePt, in: tc, fractionOfDistanceThroughGlyph: nil)
+        let charIdx = lm.characterIndexForGlyph(at: glyphIdx)
+        updateCaret()
+        return min(charIdx, ns.length)
+    }
+
+    func viewportLineTarget(_ target: VimViewportTarget) -> Int? {
+        guard let scrollView = enclosingScrollView,
+              let lm = layoutManager,
+              let tc = textContainer,
+              let storage = textStorage,
+              storage.length > 0 else { return nil }
+        let vis = scrollView.contentView.documentVisibleRect.offsetBy(dx: -textContainerOrigin.x, dy: -textContainerOrigin.y)
+        guard vis.height > 20 else { return nil }
+        lm.ensureLayout(forBoundingRect: vis, in: tc)
+        let visGlyphs = lm.glyphRange(forBoundingRectWithoutAdditionalLayout: vis, in: tc)
+        guard visGlyphs.length > 0 else { return nil }
+        var visibleStarts: [Int] = []
+        lm.enumerateLineFragments(forGlyphRange: visGlyphs) { rect, _, _, glyphRange, _ in
+            guard rect.height > 0.5, rect.maxY > vis.minY + 2, rect.minY < vis.maxY - 2 else { return }
+            let ch = lm.characterIndexForGlyph(at: glyphRange.location)
+            if visibleStarts.last != ch {
+                visibleStarts.append(ch)
+            }
+        }
+        guard !visibleStarts.isEmpty else { return nil }
+        switch target {
+        case .top:
+            return visibleStarts[0]
+        case .middle:
+            return visibleStarts[visibleStarts.count / 2]
+        case .bottom:
+            return visibleStarts[visibleStarts.count - 1]
+        }
+    }
+
+    func visualLineVerticalTarget(from location: Int, deltaLines: Int, preferredX: inout CGFloat?) -> Int? {
+        guard deltaLines != 0,
+              let lm = layoutManager,
+              let tc = textContainer,
+              let storage = textStorage,
+              storage.length > 0 else { return nil }
+        let ns = storage.mutableString
+        let totalLen = ns.length
+        let clampedLoc = min(max(0, location), totalLen - 1)
+        let winStart = max(0, clampedLoc - 2000)
+        let winEnd = min(totalLen, clampedLoc + 2000)
+        lm.ensureLayout(forCharacterRange: ns.lineRange(for: NSRange(location: winStart, length: winEnd - winStart)))
+        let totalGlyphs = lm.numberOfGlyphs
+        guard totalGlyphs > 0 else { return nil }
+        let startGlyph = min(lm.glyphIndexForCharacter(at: clampedLoc), totalGlyphs - 1)
+        var fragRange = NSRange(location: 0, length: 0)
+        let startFrag = lm.lineFragmentRect(forGlyphAt: startGlyph, effectiveRange: &fragRange)
+        let targetX: CGFloat
+        if let px = preferredX {
+            targetX = px
+        } else {
+            let locPt = lm.location(forGlyphAt: startGlyph)
+            let computed = startFrag.minX + locPt.x
+            preferredX = computed
+            targetX = computed
+        }
+
+        var currentFrag = startFrag
+        var remaining = abs(deltaLines)
+        while remaining > 0 {
+            if deltaLines > 0 {
+                var probe = NSMaxRange(fragRange)
+                var found = false
+                while probe < lm.numberOfGlyphs {
+                    var nextRange = NSRange(location: 0, length: 0)
+                    let rect = lm.lineFragmentRect(forGlyphAt: probe, effectiveRange: &nextRange)
+                    if rect.height > 0.5 {
+                        fragRange = nextRange
+                        currentFrag = rect
+                        found = true
+                        break
+                    }
+                    probe = max(probe + 1, NSMaxRange(nextRange))
+                }
+                if !found { break }
+            } else {
+                guard fragRange.location > 0 else { break }
+                var probe = fragRange.location - 1
+                var found = false
+                while probe >= 0 {
+                    var prevRange = NSRange(location: 0, length: 0)
+                    let rect = lm.lineFragmentRect(forGlyphAt: probe, effectiveRange: &prevRange)
+                    if rect.height > 0.5 {
+                        fragRange = prevRange
+                        currentFrag = rect
+                        found = true
+                        break
+                    }
+                    if prevRange.location == 0 { break }
+                    probe = prevRange.location - 1
+                }
+                if !found { break }
+            }
+            remaining -= 1
+        }
+
+        let charSpan = lm.characterRange(forGlyphRange: fragRange, actualGlyphRange: nil)
+        var contentEnd = min(NSMaxRange(charSpan), totalLen)
+        while contentEnd > charSpan.location {
+            let u = ns.character(at: contentEnd - 1)
+            if u == 10 || u == 13 { contentEnd -= 1 } else { break }
+        }
+        guard contentEnd > charSpan.location else { return charSpan.location }
+        let hitChar = lm.characterIndex(
+            for: NSPoint(x: targetX, y: currentFrag.midY),
+            in: tc,
+            fractionOfDistanceBetweenInsertionPoints: nil
+        )
+        let maxChar = ns.rangeOfComposedCharacterSequence(at: contentEnd - 1).location
+        return min(max(charSpan.location, hitChar), maxChar)
+    }
+
+    func visualLineBoundary(from location: Int, kind: VimVisualBoundaryKind) -> Int? {
+        guard let lm = layoutManager,
+              let storage = textStorage,
+              storage.length > 0 else { return nil }
+        let ns = storage.mutableString
+        let totalLen = ns.length
+        let clamped = min(max(0, location), totalLen - 1)
+        lm.ensureLayout(forCharacterRange: ns.lineRange(for: NSRange(location: clamped, length: 0)))
+        guard lm.numberOfGlyphs > 0 else { return nil }
+        let glyphIdx = min(lm.glyphIndexForCharacter(at: clamped), lm.numberOfGlyphs - 1)
+        var fragGlyphs = NSRange(location: 0, length: 0)
+        _ = lm.lineFragmentRect(forGlyphAt: glyphIdx, effectiveRange: &fragGlyphs)
+        let charSpan = lm.characterRange(forGlyphRange: fragGlyphs, actualGlyphRange: nil)
+        var contentEnd = min(NSMaxRange(charSpan), totalLen)
+        while contentEnd > charSpan.location {
+            let u = ns.character(at: contentEnd - 1)
+            if u == 10 || u == 13 { contentEnd -= 1 } else { break }
+        }
+        switch kind {
+        case .start:
+            return charSpan.location
+        case .firstNonBlank:
+            var p = charSpan.location
+            while p < contentEnd {
+                let u = ns.character(at: p)
+                if u == 0x20 || u == 0x09 { p += 1 } else { break }
+            }
+            return p < contentEnd ? p : charSpan.location
+        case .end:
+            guard contentEnd > charSpan.location else { return charSpan.location }
+            return ns.rangeOfComposedCharacterSequence(at: contentEnd - 1).location
+        }
+    }
+
     private func ensureCaretSublayer() {
         wantsLayer = true
         guard let hostLayer = layer else { return }
@@ -2286,7 +2673,25 @@ import CozyCore
 
     func refreshCaretAppearance() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            caretLayer.backgroundColor = insertionPointColor.cgColor
+            switch vim.cursorShape {
+            case .beam:
+                caretLayer.backgroundColor = insertionPointColor.cgColor
+                caretLayer.borderWidth = 0
+                caretLayer.borderColor = nil
+                caretLayer.cornerRadius = 1.0
+            case .block:
+                let accent = Theme.accent
+                let highContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+                caretLayer.backgroundColor = accent.withAlphaComponent(highContrast ? 0.42 : 0.30).cgColor
+                caretLayer.borderWidth = 1.0
+                caretLayer.borderColor = accent.withAlphaComponent(highContrast ? 0.95 : 0.82).cgColor
+                caretLayer.cornerRadius = 2.0
+            case .underline:
+                caretLayer.backgroundColor = Theme.accent.cgColor
+                caretLayer.borderWidth = 0
+                caretLayer.borderColor = nil
+                caretLayer.cornerRadius = 1.0
+            }
         }
     }
 
@@ -2296,8 +2701,9 @@ import CozyCore
         let origin = textContainerOrigin
         let ns = storage.mutableString
         let len = ns.length
-        let charIdx = min(selectedRange().location, len)
-        let caretWidth: CGFloat = 2.0
+        let rawLoc = vim.activeBlockCursorLocation ?? selectedRange().location
+        let charIdx = min(max(0, rawLoc), len)
+        let shape = vim.cursorShape
         if len > 0 {
             let ensureLoc = min(charIdx, len - 1)
             let lineRange = ns.lineRange(for: NSRange(location: ensureLoc, length: 0))
@@ -2313,6 +2719,7 @@ import CozyCore
         let fallbackPara = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)
         let sampleFont: NSFont
         let samplePara: NSParagraphStyle?
+        var activeLineContentEnd = 0
 
         if len == 0 || (charIdx == len && ns.character(at: len - 1) == 10) {
             sampleFont = fallbackFont
@@ -2324,6 +2731,7 @@ import CozyCore
                 let ch = ns.character(at: lineContentEnd - 1)
                 if ch == 10 || ch == 13 { lineContentEnd -= 1 } else { break }
             }
+            activeLineContentEnd = lineContentEnd
             let probe = min(max(lineRange.location, charIdx < lineContentEnd ? charIdx : max(lineRange.location, lineContentEnd - 1)), len - 1)
             var resolvedFont = (textStorage?.attribute(.font, at: probe, effectiveRange: nil) as? NSFont) ?? fallbackFont
             if resolvedFont.pointSize < 2, lineContentEnd > lineRange.location,
@@ -2345,9 +2753,31 @@ import CozyCore
             ? (rawHeight - lineSpacing)
             : rawHeight
         let height = max(14, round(trimmedHeight))
-        let x = round((origin.x + raw.minX) * 2) / 2
+        var x = round((origin.x + raw.minX) * 2) / 2
         let y = round((origin.y + raw.minY) * 2) / 2
-        return NSRect(x: x, y: y, width: caretWidth, height: height)
+
+        if shape == .beam {
+            return NSRect(x: x, y: y, width: 2.0, height: height)
+        }
+
+        var cellWidth = max(8.5, round(sampleFont.pointSize * 0.56))
+        if len > 0, charIdx < activeLineContentEnd, !isCharacterFolded(charIdx) {
+            let seqRange = ns.rangeOfComposedCharacterSequence(at: charIdx)
+            let charGlyphs = lm.glyphRange(forCharacterRange: seqRange, actualCharacterRange: nil)
+            if charGlyphs.length > 0 {
+                let charBox = lm.boundingRect(forGlyphRange: charGlyphs, in: tc)
+                if charBox.width > 1.0 {
+                    x = round((origin.x + charBox.minX) * 2) / 2
+                    cellWidth = max(6.0, ceil(charBox.width))
+                }
+            }
+        }
+
+        if shape == .underline {
+            let underlineHeight: CGFloat = 2.5
+            return NSRect(x: x, y: y + height - underlineHeight, width: cellWidth, height: underlineHeight)
+        }
+        return NSRect(x: x, y: y, width: cellWidth, height: height)
     }
 
     func updateCaret(animateForTyping: Bool = false) {
@@ -2355,7 +2785,9 @@ import CozyCore
         ensureCaretSublayer()
         let isActive = window?.firstResponder === self && (window?.isKeyWindow ?? false) && isEditable
         let sel = selectedRange()
-        guard isActive, sel.length == 0 else {
+        let shape = vim.cursorShape
+        let showCaret = isActive && (sel.length == 0 || vim.activeBlockCursorLocation != nil)
+        guard showCaret else {
             cancelCaretBlink()
             removeCaretTravelAnimations()
             caretLayer.isHidden = true
@@ -2371,7 +2803,7 @@ import CozyCore
         let oldBounds = caretLayer.bounds
         let dx = oldPosition.x - targetPos.x
         let dy = oldPosition.y - targetPos.y
-        let canAnimate = animateForTyping && hasCaretOrigin && !caretLayer.isHidden
+        let canAnimate = shape == .beam && animateForTyping && hasCaretOrigin && !caretLayer.isHidden
             && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && !hasMarkedText()
             && abs(dx) <= max(96, targetRect.height * 4) && abs(dy) <= targetRect.height * 1.5
         if !canAnimate { removeCaretTravelAnimations() }
@@ -2404,7 +2836,12 @@ import CozyCore
         }
 
         hasCaretOrigin = true
-        scheduleCaretBlink()
+        if shape == .beam {
+            scheduleCaretBlink()
+        } else {
+            cancelCaretBlink()
+            caretLayer.opacity = 1.0
+        }
     }
 
     private func makeCaretSpring(keyPath: String) -> CASpringAnimation {
@@ -2444,7 +2881,7 @@ import CozyCore
     }
 
     private func tickCaretBlink() {
-        guard !caretLayer.isHidden, window?.firstResponder === self, window?.isKeyWindow == true else { return }
+        guard vim.cursorShape == .beam, !caretLayer.isHidden, window?.firstResponder === self, window?.isKeyWindow == true else { return }
         caretBlinkOn.toggle()
         let targetOpacity: Float = caretBlinkOn ? 1.0 : 0.08
         let fade = CABasicAnimation(keyPath: "opacity")
@@ -2686,6 +3123,7 @@ import CozyCore
     let searchBar = CozySearchBar()
     let countLabel = Theme.label("", size: 10, color: Theme.subtle)
     var onQueryChange: ((String) -> Void)?
+    var onCommit: (() -> Void)?
     var onNext: (() -> Void)?
     var onPrevious: (() -> Void)?
     var onClose: (() -> Void)?
@@ -2757,6 +3195,8 @@ import CozyCore
              #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
             if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
                 onPrevious?()
+            } else if let onCommit {
+                onCommit()
             } else {
                 onNext?()
             }
@@ -3112,7 +3552,21 @@ import CozyCore
     override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     let textView = MarkdownTextView()
     let status = Theme.label("", size: 11, color: Theme.muted)
+    let vimPendingLabel = Theme.label("", size: 10.5, color: Theme.accent)
+    let vimModePill = VimModePill(frame: .zero)
     let wordCount = Theme.label("", size: 10.5, color: Theme.subtle)
+    var allowsVimMode = false {
+        didSet {
+            if allowsVimMode != oldValue {
+                syncVimModePreference()
+            }
+        }
+    }
+    var isVimActive: Bool { allowsVimMode && Theme.vimModeEnabled }
+    private(set) var vimSearchDirection: VimSearchDirection = .forward
+    private var vimSearchWholeWord = false
+    private var isVimSearchingPrompt = false
+    private var vimSearchOriginLocation: Int = 0
     var onChange: (() -> Void)?
     var onAttachFiles: (([URL]) -> Void)?
     var onRemoveLinkedAttachment: ((LinkedAttachment) -> Void)?
@@ -3169,6 +3623,7 @@ import CozyCore
     var inNoteFindQuery: String {
         get { inNoteFindBar.query }
         set {
+            vimSearchWholeWord = false
             inNoteFindBar.query = newValue
             updateInNoteFindMatches(scrollToMatch: true)
         }
@@ -3229,6 +3684,8 @@ import CozyCore
         textView.drawsBackground = false
         textView.insertionPointColor = Theme.accent
         textView.delegate = self
+        textView.configureUndoHooks()
+        textView.vim.host = self
         let typesetter = FoldTypesetter()
         typesetter.textView = textView
         textView.layoutManager?.typesetter = typesetter
@@ -3250,7 +3707,18 @@ import CozyCore
         textView.onFindPreviousInNote = { [weak self] in self?.findPreviousInNote() }
         textView.onToggleOutline = { [weak self] in self?.toggleOutline() }
         inNoteFindBar.isHidden = true
-        inNoteFindBar.onQueryChange = { [weak self] _ in self?.updateInNoteFindMatches(scrollToMatch: true) }
+        inNoteFindBar.onQueryChange = { [weak self] _ in
+            self?.vimSearchWholeWord = false
+            self?.updateInNoteFindMatches(scrollToMatch: true)
+        }
+        inNoteFindBar.onCommit = { [weak self] in
+            guard let self else { return }
+            if self.isVimActive && self.isVimSearchingPrompt {
+                self.commitVimSearchFromFindBar()
+            } else {
+                self.findNextInNote()
+            }
+        }
         inNoteFindBar.onNext = { [weak self] in self?.findNextInNote() }
         inNoteFindBar.onPrevious = { [weak self] in self?.findPreviousInNote() }
         inNoteFindBar.onClose = { [weak self] in self?.hideInNoteFind() }
@@ -3260,6 +3728,7 @@ import CozyCore
         outlineView.onToggleFoldItem = { [weak self] idx in self?.toggleFoldForOutlineItem(at: idx) }
         outlineView.onCycleFoldMode = { [weak self] in
             self?.textView.cycleOutlineFolding(nil)
+            self?.textView.vim.clampSelectionIfNeeded()
             self?.refreshOutline()
         }
         outlineView.onClose = { [weak self] in self?.setOutlineVisible(false) }
@@ -3281,6 +3750,12 @@ import CozyCore
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         status.lineBreakMode = .byTruncatingMiddle
+        vimPendingLabel.font = Theme.monoFont(10.5, weight: .semibold)
+        vimPendingLabel.textColor = Theme.accent
+        vimPendingLabel.setContentHuggingPriority(.required, for: .horizontal)
+        vimPendingLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        vimPendingLabel.isHidden = true
+        vimModePill.isHidden = true
         wordCount.font = Theme.monoFont(10.5, weight: .medium)
         wordCount.setContentHuggingPriority(.required, for: .horizontal)
 
@@ -3304,7 +3779,7 @@ import CozyCore
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 10
-        for item in [add, status, spacer, wordCount] { footer.addArrangedSubview(item) }
+        for item in [add, status, spacer, vimPendingLabel, vimModePill, wordCount] { footer.addArrangedSubview(item) }
 
         for view in [scroll, outlineDivider, outlineView, attachmentScroll, footerRule, footer, inNoteFindBar] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -3500,11 +3975,16 @@ import CozyCore
                 }
                 applyEditorChromeAttributes()
                 isFormatting = false
-                textView.undoManager?.removeAllActions()
+                textView.resetUndoHistory()
                 textView.setSelectedRange(NSRange(location: clampedLocation, length: 0))
+                if isVimActive {
+                    textView.vim.resetForLoadedDocument(isEmpty: newLen == 0)
+                }
+                updateVimChrome()
                 let ns = nsText
-                lastCursorLine = ns.length > 0 ? ns.lineRange(for: NSRange(location: min(clampedLocation, ns.length), length: 0)) : NSRange(location: 0, length: 0)
+                lastCursorLine = ns.length > 0 ? ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, ns.length), length: 0)) : NSRange(location: 0, length: 0)
                 textView.suppressCaretUpdates = false
+                textView.refreshCaretAppearance()
                 textView.updateCaret()
                 textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
                 if isInNoteFindVisible {
@@ -3873,6 +4353,8 @@ import CozyCore
 
     func refreshTypography() {
         formatMarkdown()
+        vimModePill.needsDisplay = true
+        textView.refreshCaretAppearance()
         textView.updateCaret()
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
@@ -3965,6 +4447,7 @@ import CozyCore
         }
         let targetLoc = min(nsText.length, NSMaxRange(heading.range))
         textView.setSelectedRange(NSRange(location: targetLoc, length: 0))
+        textView.vim.clampSelectionIfNeeded()
         if let lm = textView.layoutManager, let tc = textView.textContainer {
             lm.ensureLayout(forCharacterRange: heading.range)
             let glyphRange = lm.glyphRange(forCharacterRange: heading.range, actualCharacterRange: nil)
@@ -3985,6 +4468,7 @@ import CozyCore
         guard textView.headingGutterItems.indices.contains(index) else { return }
         let heading = textView.headingGutterItems[index]
         textView.toggleFold(forHeadingAt: heading.range.location)
+        textView.vim.clampSelectionIfNeeded()
         refreshOutline()
     }
 
@@ -4082,7 +4566,48 @@ import CozyCore
         }
         return merged
     }
+    private func computeFindRanges(for query: String, wholeWord: Bool, in ns: NSString) -> [NSRange] {
+        guard !query.isEmpty, ns.length > 0 else { return [] }
+        let totalLen = ns.length
+        let maxMatches = 2000
+        if wholeWord {
+            let escaped = NSRegularExpression.escapedPattern(for: query)
+            let startsWord = query.unicodeScalars.first.map { CharacterSet.alphanumerics.contains($0) || $0 == "_" } ?? false
+            let endsWord = query.unicodeScalars.last.map { CharacterSet.alphanumerics.contains($0) || $0 == "_" } ?? false
+            let pattern = (startsWord ? "\\b" : "") + escaped + (endsWord ? "\\b" : "")
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+                var ranges: [NSRange] = []
+                regex.enumerateMatches(in: ns as String, options: [], range: NSRange(location: 0, length: totalLen)) { match, _, stop in
+                    if let r = match?.range, r.length > 0 {
+                        ranges.append(r)
+                        if ranges.count >= maxMatches {
+                            stop.pointee = true
+                        }
+                    }
+                }
+                return ranges
+            }
+        }
+        var ranges: [NSRange] = []
+        var searchStart = 0
+        while searchStart < totalLen && ranges.count < maxMatches {
+            let hit = ns.range(
+                of: query,
+                options: [.caseInsensitive],
+                range: NSRange(location: searchStart, length: totalLen - searchStart)
+            )
+            guard hit.location != NSNotFound && hit.length > 0 else { break }
+            ranges.append(hit)
+            searchStart = NSMaxRange(hit)
+        }
+        return ranges
+    }
+
     @objc func showInNoteFind() {
+        vimSearchWholeWord = false
+        isVimSearchingPrompt = false
+        vimSearchDirection = .forward
+        inNoteFindBar.searchBar.field.placeholderString = "Find in note…"
         let sel = textView.selectedRange()
         if sel.length > 0 && sel.length <= 80, NSMaxRange(sel) <= nsText.length {
             let sub = nsText.substring(with: sel)
@@ -4096,13 +4621,24 @@ import CozyCore
     }
 
     @objc func hideInNoteFind() {
-        guard !inNoteFindBar.isHidden else { return }
+        let wasVimPrompt = isVimSearchingPrompt
+        isVimSearchingPrompt = false
+        inNoteFindBar.searchBar.field.placeholderString = "Find in note…"
+        guard !inNoteFindBar.isHidden || !textView.inNoteFindRanges.isEmpty else { return }
         inNoteFindBar.isHidden = true
         textView.inNoteFindRanges = []
         textView.activeInNoteFindIndex = -1
         inNoteFindBar.countLabel.stringValue = ""
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
         window?.makeFirstResponder(textView)
+        if isVimActive {
+            if wasVimPrompt {
+                textView.vim.enterNormalModeFromExternalControl(at: vimSearchOriginLocation)
+            } else {
+                textView.vim.clampSelectionIfNeeded()
+            }
+            textView.updateCaret()
+        }
     }
 
     @objc func findNextInNote() {
@@ -4137,20 +4673,7 @@ import CozyCore
             textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             return
         }
-        var ranges: [NSRange] = []
-        var searchStart = 0
-        let totalLen = ns.length
-        let maxMatches = 2000
-        while searchStart < totalLen && ranges.count < maxMatches {
-            let hit = ns.range(
-                of: q,
-                options: [.caseInsensitive],
-                range: NSRange(location: searchStart, length: totalLen - searchStart)
-            )
-            guard hit.location != NSNotFound && hit.length > 0 else { break }
-            ranges.append(hit)
-            searchStart = NSMaxRange(hit)
-        }
+        let ranges = computeFindRanges(for: q, wholeWord: vimSearchWholeWord, in: ns)
         textView.inNoteFindRanges = ranges
         guard !ranges.isEmpty else {
             textView.activeInNoteFindIndex = -1
@@ -4158,15 +4681,36 @@ import CozyCore
             textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             return
         }
-        let cursorLoc = textView.selectedRange().location
-        if let idx = ranges.firstIndex(where: { $0.location >= cursorLoc }) {
-            textView.activeInNoteFindIndex = idx
+        let refLoc = isVimSearchingPrompt ? vimSearchOriginLocation : textView.selectedRange().location
+        let dir = isVimSearchingPrompt ? vimSearchDirection : .forward
+        if dir == .forward {
+            if let idx = ranges.firstIndex(where: { isVimSearchingPrompt ? ($0.location > refLoc) : ($0.location >= refLoc) }) {
+                textView.activeInNoteFindIndex = idx
+            } else {
+                textView.activeInNoteFindIndex = 0
+            }
         } else {
-            textView.activeInNoteFindIndex = 0
+            if let idx = ranges.lastIndex(where: { $0.location < refLoc }) {
+                textView.activeInNoteFindIndex = idx
+            } else {
+                textView.activeInNoteFindIndex = ranges.count - 1
+            }
         }
         inNoteFindBar.countLabel.stringValue = "\(textView.activeInNoteFindIndex + 1) OF \(ranges.count)"
         if scrollToMatch {
-            revealActiveInNoteFindMatch()
+            if isVimSearchingPrompt {
+                let idx = textView.activeInNoteFindIndex
+                if ranges.indices.contains(idx) {
+                    let matchRange = ranges[idx]
+                    if textView.isCharacterFolded(matchRange.location) {
+                        textView.unfoldSectionsIntersecting(matchRange)
+                    }
+                    textView.scrollRangeToVisible(matchRange)
+                }
+                textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
+            } else {
+                revealActiveInNoteFindMatch()
+            }
         } else {
             textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
         }
@@ -4183,6 +4727,73 @@ import CozyCore
         textView.setSelectedRange(matchRange)
         textView.scrollRangeToVisible(matchRange)
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
+    }
+
+    func commitVimSearchFromFindBar() {
+        isVimSearchingPrompt = false
+        inNoteFindBar.searchBar.field.placeholderString = "Find in note…"
+        let idx = textView.activeInNoteFindIndex
+        if textView.inNoteFindRanges.indices.contains(idx) {
+            let matchRange = textView.inNoteFindRanges[idx]
+            if textView.isCharacterFolded(matchRange.location) {
+                textView.unfoldSectionsIntersecting(matchRange)
+            }
+            textView.scrollRangeToVisible(matchRange)
+            focus()
+            textView.vim.enterNormalModeFromExternalControl(at: matchRange.location)
+            status.stringValue = ""
+        } else {
+            let q = inNoteFindBar.query
+            focus()
+            textView.vim.enterNormalModeFromExternalControl(at: vimSearchOriginLocation)
+            if !q.isEmpty {
+                status.stringValue = "Pattern not found: \(q)"
+            }
+        }
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
+    }
+
+    func syncVimModePreference() {
+        let active = isVimActive
+        if !active, isVimSearchingPrompt {
+            isVimSearchingPrompt = false
+            inNoteFindBar.searchBar.field.placeholderString = "Find in note…"
+        }
+        textView.vim.setEnabled(active, startInInsertIfEmpty: nsText.length == 0)
+        updateVimChrome()
+        textView.refreshCaretAppearance()
+        textView.updateCaret()
+    }
+
+    func enterVimInsertMode() {
+        guard isVimActive else { return }
+        textView.vim.enterInsertModeProgrammatically()
+        updateVimChrome()
+        textView.refreshCaretAppearance()
+        textView.updateCaret()
+    }
+
+    func updateVimChrome() {
+        if isVimActive {
+            let mode = textView.vim.mode
+            vimModePill.badgeText = mode.badgeTitle
+            vimModePill.style = mode.pillStyle
+            if vimModePill.isHidden { vimModePill.isHidden = false }
+            let pending = textView.vim.pendingKeysDisplay
+            if pending.isEmpty {
+                if !vimPendingLabel.isHidden { vimPendingLabel.isHidden = true }
+                if !vimPendingLabel.stringValue.isEmpty { vimPendingLabel.stringValue = "" }
+            } else {
+                if vimPendingLabel.stringValue != pending {
+                    vimPendingLabel.stringValue = pending
+                }
+                if vimPendingLabel.isHidden { vimPendingLabel.isHidden = false }
+            }
+        } else {
+            if !vimModePill.isHidden { vimModePill.isHidden = true }
+            if !vimPendingLabel.isHidden { vimPendingLabel.isHidden = true }
+            if !vimPendingLabel.stringValue.isEmpty { vimPendingLabel.stringValue = "" }
+        }
     }
 
     func hideWikiAutocomplete() {
@@ -5949,5 +6560,196 @@ import CozyCore
                 storage.addAttributes(bracketAttrs, range: NSRange(location: NSMaxRange(item.fullRange) - 2, length: 2))
             }
         }
+    }
+}
+
+extension CaptureEditor: VimHost {
+    var vimNSString: NSString { nsText }
+
+    var vimSelectedRange: NSRange {
+        get { textView.selectedRange() }
+        set { textView.setSelectedRange(newValue) }
+    }
+
+    var vimUndoManager: UndoManager? { textView.undoManager }
+
+    var vimHasMarkedText: Bool { textView.hasMarkedText() }
+
+    var vimIsWikiAutocompleteVisible: Bool { isWikiAutocompleteVisible }
+
+    func vimDismissWikiAutocomplete() {
+        dismissedWikiOpenLocation = activeWikiOpenLocation
+        hideWikiAutocomplete()
+    }
+
+    func vimReplace(in range: NSRange, with replacement: String, selectedRangeAfter: NSRange?) {
+        textView.applyUndoableReplacement(in: range, with: replacement, selectedRangeAfter: selectedRangeAfter)
+    }
+
+    func vimRegisterCoalescedUndo(inverseRange: NSRange, previousString: String, restoreSelection: NSRange) {
+        textView.registerCoalescedUndo(inverseRange: inverseRange, previousString: previousString, restoreSelection: restoreSelection)
+    }
+
+    func vimIsCharacterFolded(_ location: Int) -> Bool {
+        textView.isCharacterFolded(location)
+    }
+
+    func vimFoldedRangeEnclosing(_ location: Int) -> NSRange? {
+        textView.foldedRangeEnclosing(location)
+    }
+
+    func vimHeadingLocations() -> [Int] {
+        textView.headingGutterItems.map(\.range.location)
+    }
+
+    func vimToggleFoldAtCursor() {
+        textView.toggleHeadingFoldAtCursor(nil)
+        textView.vim.clampSelectionIfNeeded()
+        if isOutlineVisible { refreshOutline() }
+    }
+
+    func vimOpenFoldAtCursor() {
+        textView.unfoldHeadingAtCursor(nil)
+        textView.vim.clampSelectionIfNeeded()
+        if isOutlineVisible { refreshOutline() }
+    }
+
+    func vimCloseFoldAtCursor() {
+        textView.foldHeadingAtCursor(nil)
+        textView.vim.clampSelectionIfNeeded()
+        if isOutlineVisible { refreshOutline() }
+    }
+
+    func vimUnfoldAllHeadings() {
+        textView.unfoldAllHeadings(nil)
+        textView.vim.clampSelectionIfNeeded()
+        if isOutlineVisible { refreshOutline() }
+    }
+
+    func vimFoldAllHeadings() {
+        textView.foldAllHeadings(nil)
+        textView.vim.clampSelectionIfNeeded()
+        if isOutlineVisible { refreshOutline() }
+    }
+
+    func vimCycleOutlineFolding() {
+        textView.cycleOutlineFolding(nil)
+        textView.vim.clampSelectionIfNeeded()
+        if isOutlineVisible { refreshOutline() }
+    }
+
+    func vimOpenWikiLinkAtCursor(inNewWindow: Bool) -> Bool {
+        guard let link = textView.wikiLinkAtCursor() else { return false }
+        if inNewWindow {
+            onOpenWikiLinkInNewWindow?(link)
+        } else {
+            onOpenWikiLink?(link)
+        }
+        return true
+    }
+
+    func vimToggleTaskAt(range: NSRange) -> Bool {
+        textView.toggleTaskCompletion(in: range)
+    }
+
+    func vimEnsureCaretVisible(typewriter: Bool) {
+        textView.ensureCaretVisible(useTypewriterStep: typewriter)
+    }
+
+    func vimScrollCursorLine(alignment: VimScrollAlignment) {
+        textView.scrollCursorLine(alignment: alignment)
+    }
+
+    func vimScrollByHalfPages(_ halfPages: Int) -> Int? {
+        textView.scrollByHalfPages(halfPages)
+    }
+
+    func vimViewportLineTarget(_ target: VimViewportTarget) -> Int? {
+        textView.viewportLineTarget(target)
+    }
+
+    func vimVisualLineVerticalTarget(from location: Int, deltaLines: Int, preferredX: inout CGFloat?) -> Int? {
+        textView.visualLineVerticalTarget(from: location, deltaLines: deltaLines, preferredX: &preferredX)
+    }
+
+    func vimVisualLineBoundary(from location: Int, kind: VimVisualBoundaryKind) -> Int? {
+        textView.visualLineBoundary(from: location, kind: kind)
+    }
+
+    func vimBeginSearch(direction: VimSearchDirection) {
+        vimSearchOriginLocation = textView.vim.activeBlockCursorLocation ?? textView.selectedRange().location
+        vimSearchDirection = direction
+        vimSearchWholeWord = false
+        isVimSearchingPrompt = true
+        inNoteFindBar.searchBar.field.placeholderString = direction == .forward ? "Search forward (/)…" : "Search backward (?)…"
+        inNoteFindBar.query = ""
+        inNoteFindBar.isHidden = false
+        updateInNoteFindMatches(scrollToMatch: false)
+        inNoteFindBar.focusField()
+    }
+
+    func vimFindMatchLocation(from location: Int, reverse: Bool, count: Int, inclusiveCurrent: Bool) -> NSRange? {
+        let q = inNoteFindBar.query
+        guard !q.isEmpty else {
+            status.stringValue = "No previous search pattern"
+            return nil
+        }
+        let ranges = computeFindRanges(for: q, wholeWord: vimSearchWholeWord, in: nsText)
+        textView.inNoteFindRanges = ranges
+        guard !ranges.isEmpty else {
+            textView.activeInNoteFindIndex = -1
+            inNoteFindBar.countLabel.stringValue = "0 MATCHES"
+            status.stringValue = "Pattern not found: \(q)"
+            textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
+            return nil
+        }
+        let forward = (vimSearchDirection == .forward) ? !reverse : reverse
+        let steps = max(1, count)
+        var idx: Int
+        if forward {
+            idx = ranges.firstIndex(where: { inclusiveCurrent ? ($0.location >= location) : ($0.location > location) }) ?? 0
+            idx = (idx + steps - 1) % ranges.count
+        } else {
+            idx = ranges.lastIndex(where: { inclusiveCurrent ? ($0.location <= location) : ($0.location < location) }) ?? (ranges.count - 1)
+            let offset = (steps - 1) % ranges.count
+            idx = (idx - offset + ranges.count) % ranges.count
+        }
+        textView.activeInNoteFindIndex = idx
+        let matchRange = ranges[idx]
+        if textView.isCharacterFolded(matchRange.location) {
+            textView.unfoldSectionsIntersecting(matchRange)
+        }
+        inNoteFindBar.countLabel.stringValue = "\(idx + 1) OF \(ranges.count)"
+        status.stringValue = ""
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
+        return matchRange
+    }
+
+    func vimSearchWord(_ word: String, forward: Bool, count: Int) -> NSRange? {
+        vimSearchDirection = forward ? .forward : .backward
+        isVimSearchingPrompt = false
+        inNoteFindBar.searchBar.field.placeholderString = "Find in note…"
+        inNoteFindBar.query = word
+        vimSearchWholeWord = true
+        let cursor = textView.vim.activeBlockCursorLocation ?? textView.selectedRange().location
+        return vimFindMatchLocation(from: cursor, reverse: false, count: count, inclusiveCurrent: false)
+    }
+
+    func vimDismissSearchHighlightsIfNeeded() -> Bool {
+        if !inNoteFindBar.isHidden || !textView.inNoteFindRanges.isEmpty {
+            hideInNoteFind()
+            return true
+        }
+        return false
+    }
+
+    func vimSetStatus(_ message: String) {
+        status.stringValue = message
+    }
+
+    func vimDidUpdateState() {
+        updateVimChrome()
+        textView.refreshCaretAppearance()
+        textView.updateCaret()
     }
 }
