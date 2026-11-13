@@ -224,6 +224,9 @@ import CozyCore
             workspace?.saveCurrent()
         }
     }
+    @objc func mergeNotes() {
+        workspace?.mergeSelectedNotes()
+    }
     @objc private func deleteNote() {
         if let noteWin = workspace?.activeNoteWindowController {
             noteWin.deleteCurrentNote()
@@ -320,6 +323,7 @@ import CozyCore
         add("Quick Capture", action: #selector(quick), key: " ", modifiers: [.command, .shift], to: file)
         add("Open in New Window", action: #selector(openInNewWindow), key: "o", modifiers: [.command, .option], to: file)
         add("Pin Note", action: #selector(togglePinNote), key: "p", modifiers: [.command, .shift], to: file)
+        add("Merge Notes…", action: #selector(mergeNotes), key: "m", modifiers: [.command, .shift], to: file)
         add("Save Note", action: #selector(save), key: "s", to: file)
         add("Keep / Save", action: #selector(save), key: "\r", to: file)
         add("Delete Note…", action: #selector(deleteNote), key: "\u{08}", to: file)
@@ -436,6 +440,17 @@ import CozyCore
             }
             menuItem.title = workspace.targetNoteIsPinned ? "Unpin Note" : "Pin Note"
             return workspace.canPinNote
+        }
+        if menuItem.action == #selector(mergeNotes) {
+            guard let workspace,
+                  workspace.activeNoteWindowController == nil,
+                  NSApp.keyWindow === workspace.window || NSApp.keyWindow == nil else {
+                menuItem.title = "Merge Notes…"
+                return false
+            }
+            let count = workspace.selectedNotesForMerge.count
+            menuItem.title = count >= 2 ? "Merge \(count) Notes…" : "Merge Notes…"
+            return workspace.canMergeNotes
         }
         if menuItem.action == #selector(toggleVimMode) {
             menuItem.state = Theme.vimModeEnabled ? .on : .off

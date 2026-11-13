@@ -178,6 +178,7 @@ import CozyCore
     private var autosave: Timer?
     private var watcher: VaultWatcher?
     private(set) var noteWindows: [NoteWindowController] = []
+    private(set) var activeMergeSheet: MergeNotesSheetController?
     var activeNoteWindowController: NoteWindowController? {
         noteWindows.first { $0.window === NSApp.keyWindow }
     }
@@ -393,6 +394,7 @@ import CozyCore
         searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         searchPanel.onOpenNoteInNewWindow = { [weak self] url in _ = self?.openNoteInNewWindow(url) }
         searchPanel.onTogglePinNote = { [weak self] url in self?.togglePinNote(url) }
+        searchPanel.onMergeNotes = { [weak self] urls in _ = self?.presentMergeNotesSheet(for: urls) }
         searchPanel.onNewNote = { [weak self] in self?.newCapture() }
         searchPanel.onDeleteNote = { [weak self] url in self?.confirmAndDeleteNote(url) }
         searchPanel.onToggleSidebar = { [weak self] in self?.toggleSidebar() }
@@ -1285,6 +1287,149 @@ import CozyCore
             return false
         }
     }
+    var selectedNotesForMerge: [URL] {
+        searchPanel.selectedNoteURLs
+    }
+
+    var canMergeNotes: Bool {
+        !searchPanel.isExtracting && selectedNotesForMerge.count >= 2
+    }
+
+    @objc func mergeSelectedNotes() {
+        _ = presentMergeNotesSheet(for: selectedNotesForMerge)
+    }
+
+    @discardableResult
+    func presentMergeNotesSheet(
+        for urls: [URL],
+        in hostWindow: NSWindow? = nil,
+        moveToTrash: Bool = true
+    ) -> MergeNotesSheetController? {
+        let alertHost = hostWindow ?? window
+        guard persistAllWindows() else { return nil }
+        guard !searchPanel.isExtracting else {
+            showError(NSError(domain: "CozyNotes", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Wait for extraction to finish or cancel it before merging notes."
+            ]), in: alertHost)
+            return nil
+        }
+        var canonicalURLs: [URL] = []
+        for url in urls where url.isFileURL {
+            let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+            if !canonicalURLs.contains(canonical) {
+                canonicalURLs.append(canonical)
+            }
+        }
+        guard canonicalURLs.count >= 2 else { return nil }
+
+        var expectedContents: [URL: String] = [:]
+        do {
+            for url in canonicalURLs {
+                expectedContents[url] = try vault.read(url)
+            }
+            _ = try vault.previewMerge(canonicalURLs)
+        } catch {
+            showError(error, in: alertHost)
+            return nil
+        }
+
+        activeMergeSheet?.dismissSheet()
+        let sheet = MergeNotesSheetController(
+            vault: vault,
+            noteURLs: canonicalURLs,
+            appearance: alertHost?.appearance
+        )
+        sheet.onConfirmMerge = { [weak self, weak sheet] orderedURLs in
+            guard let self else { return }
+            if self.activeMergeSheet === sheet {
+                self.activeMergeSheet = nil
+            }
+            _ = self.performMergeNotes(orderedURLs, expectedContents: expectedContents, moveToTrash: moveToTrash)
+        }
+        sheet.onCancel = { [weak self, weak sheet] in
+            guard let self else { return }
+            if self.activeMergeSheet === sheet {
+                self.activeMergeSheet = nil
+            }
+        }
+        activeMergeSheet = sheet
+        sheet.present(in: alertHost)
+        return sheet
+    }
+
+    @discardableResult
+    func performMergeNotes(
+        _ noteURLs: [URL],
+        expectedContents: [URL: String] = [:],
+        moveToTrash: Bool = true
+    ) -> MergeResult? {
+        guard persistAllWindows() else { return nil }
+        guard !searchPanel.isExtracting else {
+            showError(NSError(domain: "CozyNotes", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Wait for extraction to finish or cancel it before merging notes."
+            ]), in: window)
+            return nil
+        }
+        autosave?.invalidate()
+        do {
+            let result = try vault.merge(
+                noteURLs,
+                expectedContents: expectedContents,
+                moveToTrash: moveToTrash
+            )
+            let removedSet = Set(result.removedNoteURLs.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
+            let removedCompanions = noteWindows.filter { win in
+                guard let winURL = win.noteURL?.standardizedFileURL.resolvingSymlinksInPath() else { return false }
+                return removedSet.contains(winURL)
+            }
+            for win in removedCompanions {
+                win.closeAfterDeletion()
+                noteWindows.removeAll { $0 === win }
+            }
+
+            let targetCanonical = result.targetRecord.url.standardizedFileURL.resolvingSymlinksInPath()
+            let rewrittenSet = Set(result.rewrittenNoteURLs.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
+            for win in noteWindows {
+                win.invalidatePinnedState()
+                win.editor.invalidateNoteRecordsCache()
+                guard let winURL = win.noteURL else { continue }
+                let canonical = winURL.standardizedFileURL.resolvingSymlinksInPath()
+                if canonical == targetCanonical {
+                    win.applyExternalSave(url: winURL, content: result.mergedContent)
+                } else if rewrittenSet.contains(canonical), let updatedText = try? vault.read(winURL) {
+                    win.applyExternalSave(url: winURL, content: updatedText)
+                }
+            }
+
+            noteURL = result.targetRecord.url
+            noteBaseline = result.mergedContent
+            noteDirty = false
+            noteConflicted = false
+            hasExternalDiskChange = false
+            pendingExternalDiskText = nil
+            noteAvailable = true
+            cachedNoteStamp = nil
+            cachedNotePinned = result.targetRecord.isPinned
+            editor.clearPendingAttachments()
+            editor.clearExternalChangeHighlights()
+            editor.text = result.mergedContent
+            editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: result.targetRecord.url)
+            editor.invalidateNoteRecordsCache()
+            let mergedCount = result.removedNoteURLs.count + 1
+            editor.status.stringValue = "Merged \(mergedCount) notes"
+            searchPanel.applyPinnedPaths(vault.pinnedRelativePaths())
+            searchPanel.selectNote(result.targetRecord.url)
+            updateEditorChrome()
+            searchPanel.refresh()
+            editor.focus()
+            return result
+        } catch {
+            refresh()
+            showError(error, in: window)
+            return nil
+        }
+    }
+
     @objc private func revealFolder() { NSWorkspace.shared.open(vault.root) }
     @objc private func chooseFolder() { onChooseFolder?() }
     @objc private func openFolderInNewWindow() { onOpenFolderInNewWindow?() }
@@ -1352,6 +1497,8 @@ import CozyCore
 
     func shutdown() {
         autosave?.invalidate()
+        activeMergeSheet?.dismissSheet()
+        activeMergeSheet = nil
         for win in noteWindows {
             win.shutdown()
             win.window?.orderOut(nil)
