@@ -1575,7 +1575,14 @@ import CozyCore
         lm.ensureLayout(forCharacterRange: NSRange(location: start, length: end - start))
     }
 
-    private func invalidateFoldLayout(forChangedRanges ranges: [NSRange]) {
+    /// Full-document attribute resets can leave cached visible line fragments for folded bodies.
+    /// Re-invalidate every fold so the typesetter restores hidden layout without moving the viewport.
+    func refreshFoldLayoutAfterFullFormat() {
+        guard !foldedSections.isEmpty else { return }
+        invalidateFoldLayout(forChangedRanges: foldedSections.map(\.foldedCharRange), scrollCaretIntoView: false)
+    }
+
+    private func invalidateFoldLayout(forChangedRanges ranges: [NSRange], scrollCaretIntoView: Bool = true) {
         guard let lm = layoutManager, let tc = textContainer, let storage = textStorage else { return }
         let totalLen = storage.length
         guard totalLen > 0, !ranges.isEmpty else { return }
@@ -1595,7 +1602,7 @@ import CozyCore
             lm.ensureLayout(for: tc)
         } else if let scrollView = enclosingScrollView {
             let clipView = scrollView.contentView
-            if !foldedSections.isEmpty {
+            if scrollCaretIntoView, !foldedSections.isEmpty {
                 let selLoc = min(selectedRange().location, totalLen)
                 let selGlyphs = lm.glyphRange(forCharacterRange: NSRange(location: selLoc, length: 0), actualCharacterRange: nil)
                 let selRect = lm.boundingRect(forGlyphRange: selGlyphs, in: tc)
@@ -4871,6 +4878,7 @@ import CozyCore
         storage.endEditing()
         textView.undoManager?.enableUndoRegistration()
         applyEditorChromeAttributes()
+        textView.refreshFoldLayoutAfterFullFormat()
     }
 
     private func applyFullMarkdownAttributes(to storage: NSTextStorage, cursor: NSRange, scanHint: DocumentScanResult?) {
