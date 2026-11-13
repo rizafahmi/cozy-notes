@@ -486,6 +486,159 @@ final class VaultTests: XCTestCase {
         XCTAssertTrue(fixture.vault.pinnedRelativePaths().isEmpty)
         XCTAssertThrowsError(try fixture.vault.setPinned(true, for: olderPinned.url))
     }
+
+    func testMergeNotesCombinesBodiesRelinksAttachmentsRewritesWikiLinksPreservesPinsAndRecovers() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let fm = FileManager.default
+
+        // Prepare two real attachment files
+        let sourceFilesDir = fixture.workspace.appendingPathComponent("SourceFiles", isDirectory: true)
+        try fm.createDirectory(at: sourceFilesDir, withIntermediateDirectories: true)
+        let firstAsset = sourceFilesDir.appendingPathComponent("architecture.png")
+        let nestedAsset = sourceFilesDir.appendingPathComponent("deep diagram 1.png")
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x01]).write(to: firstAsset)
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x02]).write(to: nestedAsset)
+
+        // Note 1 (Target in Inbox/) with an attachment and internal link to absorbed Note 2
+        let targetNote = try fixture.vault.capture(
+            text: "# Master Plan\nOverview referencing [[Second Draft#Milestones]] and inline `[[Second Draft]]`.",
+            attachments: [firstAsset]
+        )
+
+        // Note 2 (Absorbed in Inbox/, pinned) with fenced code block containing literal [[Nested Research]]
+        let secondNote = try fixture.vault.capture(
+            text: """
+            # Second Draft
+            ## Milestones
+            Ship phase one.
+
+            ```markdown
+            Keep literal [[Second Draft]] and [[Nested Research]] untouched in code.
+            ```
+            """
+        )
+        XCTAssertTrue(try fixture.vault.setPinned(true, for: secondNote.url))
+
+        // Note 3 (Absorbed in nested subfolder Research/Deep/) with its own attachment
+        let nestedCaptured = try fixture.vault.capture(
+            text: "# Nested Research\nFindings with chart.",
+            attachments: [nestedAsset]
+        )
+        let nestedDir = fixture.root.appendingPathComponent("Research/Deep", isDirectory: true)
+        try fm.createDirectory(at: nestedDir, withIntermediateDirectories: true)
+        let nestedNoteURL = nestedDir.appendingPathComponent("nested-research.md").standardizedFileURL
+        // Rewrite nested note's relative attachment path for depth 2 (../../Attachments/...) before moving
+        let nestedCapturedText = try fixture.vault.read(nestedCaptured.url)
+        let depthAdjustedNestedText = nestedCapturedText.replacingOccurrences(of: "../Attachments/", with: "../../Attachments/")
+        try depthAdjustedNestedText.write(to: nestedNoteURL, atomically: true, encoding: .utf8)
+        try fm.removeItem(at: nestedCaptured.url)
+        XCTAssertEqual(fixture.vault.linkedAttachments(in: depthAdjustedNestedText, relativeTo: nestedNoteURL).count, 1)
+
+        // Note 4 (Empty/whitespace absorbed note — should not inject a double separator)
+        let emptyNote = try fixture.vault.capture(text: "   \n\n  ")
+
+        // External backlink note referencing absorbed notes via plain, fragment, and aliased WikiLinks
+        let backlinkNote = try fixture.vault.capture(
+            text: """
+            # Weekly Index
+            - Plain: [[Second Draft]]
+            - Fragment: [[Second Draft#Milestones]]
+            - Aliased path: [[Research/Deep/nested-research|research chart]]
+            - Inline code: `[[Second Draft]]`
+            """
+        )
+
+        // Validation: fewer than two distinct notes fails with invalidMerge
+        XCTAssertThrowsError(try fixture.vault.previewMerge([targetNote.url, targetNote.url])) { error in
+            guard case VaultError.invalidMerge = error else {
+                XCTFail("Expected invalidMerge, got \(error)")
+                return
+            }
+        }
+
+        // Validation: outside-vault and Extracted Text companion notes are rejected
+        let outside = fixture.workspace.appendingPathComponent("escape.md")
+        try "# Escape".write(to: outside, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try fixture.vault.merge([targetNote.url, outside], moveToTrash: false))
+
+        // Preview merge before committing
+        let mergeOrder = [targetNote.url, secondNote.url, nestedNoteURL, emptyNote.url]
+        let preview = try fixture.vault.previewMerge(mergeOrder)
+        XCTAssertEqual(preview.targetNote.url, targetNote.url)
+        XCTAssertEqual(preview.targetNote.title, "Master Plan")
+        XCTAssertTrue(preview.willBePinned)
+        XCTAssertEqual(preview.affectedBacklinkNoteCount, 1)
+        XCTAssertTrue(preview.mergedContent.contains("\n\n---\n\n# Second Draft\n"))
+        XCTAssertTrue(preview.mergedContent.contains("\n\n---\n\n# Nested Research\n"))
+        XCTAssertFalse(preview.mergedContent.contains("---\n\n---"))
+
+        // CAS conflict protection rejects stale expectedContents without mutating any note
+        XCTAssertThrowsError(
+            try fixture.vault.merge(
+                mergeOrder,
+                expectedContents: [secondNote.url: "stale contents"],
+                moveToTrash: false
+            )
+        ) { error in
+            guard case VaultError.conflict = error else {
+                XCTFail("Expected conflict, got \(error)")
+                return
+            }
+        }
+        XCTAssertTrue(fm.fileExists(atPath: secondNote.url.path))
+
+        // Execute merge
+        let preTargetText = try fixture.vault.read(targetNote.url)
+        let preBacklinkText = try fixture.vault.read(backlinkNote.url)
+        let result = try fixture.vault.merge(
+            mergeOrder,
+            expectedContents: [targetNote.url: preTargetText],
+            moveToTrash: false
+        )
+
+        XCTAssertEqual(result.targetRecord.url, targetNote.url)
+        XCTAssertTrue(result.targetRecord.isPinned)
+        XCTAssertTrue(fixture.vault.isPinned(targetNote.url))
+        XCTAssertFalse(fixture.vault.isPinned(secondNote.url))
+        XCTAssertEqual(Set(result.removedNoteURLs), Set([secondNote.url, nestedNoteURL, emptyNote.url]))
+        XCTAssertEqual(result.rewrittenNoteURLs, [backlinkNote.url])
+
+        // Absorbed note Markdown files are gone, while both attachments remain intact and linked from targetNote
+        XCTAssertFalse(fm.fileExists(atPath: secondNote.url.path))
+        XCTAssertFalse(fm.fileExists(atPath: nestedNoteURL.path))
+        XCTAssertFalse(fm.fileExists(atPath: emptyNote.url.path))
+
+        let mergedOnDisk = try fixture.vault.read(targetNote.url)
+        XCTAssertEqual(mergedOnDisk, preview.mergedContent)
+        let resolvedAttachments = fixture.vault.linkedAttachments(in: mergedOnDisk, relativeTo: targetNote.url)
+        XCTAssertEqual(resolvedAttachments.count, 2)
+        for attachment in resolvedAttachments {
+            XCTAssertTrue(fm.fileExists(atPath: attachment.url.path))
+        }
+
+        // Internal WikiLink in Note 1 updated, while inline code and fenced code spans stayed untouched
+        XCTAssertTrue(mergedOnDisk.contains("[[Master Plan#Milestones]]"))
+        XCTAssertTrue(mergedOnDisk.contains("`[[Second Draft]]`"))
+        XCTAssertTrue(mergedOnDisk.contains("Keep literal [[Second Draft]] and [[Nested Research]] untouched in code."))
+
+        // External backlinks updated (preserving #fragment and |alias), skipping inline code
+        let updatedBacklinks = try fixture.vault.read(backlinkNote.url)
+        XCTAssertTrue(updatedBacklinks.contains("- Plain: [[Master Plan]]"))
+        XCTAssertTrue(updatedBacklinks.contains("- Fragment: [[Master Plan#Milestones]]"))
+        XCTAssertTrue(updatedBacklinks.contains("- Aliased path: [[Master Plan|research chart]]"))
+        XCTAssertTrue(updatedBacklinks.contains("- Inline code: `[[Second Draft]]`"))
+
+        // Restoring the pre-merge checkpoint recovers all absorbed notes, original target text, backlinks, and pins
+        try fixture.vault.restore(snapshotID: result.snapshot.id)
+        XCTAssertTrue(fm.fileExists(atPath: secondNote.url.path))
+        XCTAssertTrue(fm.fileExists(atPath: nestedNoteURL.path))
+        XCTAssertTrue(fm.fileExists(atPath: emptyNote.url.path))
+        XCTAssertEqual(try fixture.vault.read(targetNote.url), preTargetText)
+        XCTAssertEqual(try fixture.vault.read(backlinkNote.url), preBacklinkText)
+        XCTAssertFalse(fixture.vault.isPinned(targetNote.url))
+        XCTAssertTrue(fixture.vault.isPinned(secondNote.url))
+    }
 }
 
 #if canImport(Testing)
@@ -561,6 +714,11 @@ struct VaultCoreSuite {
     @Test("Pinning persists dotfile, sorts modified first, and recovers across deletion")
     func pinningPersistsSortsAndRecovers() throws {
         try VaultTests().testPinningPersistsDotfileSortsModifiedFirstAndRecoversAcrossDeletion()
+    }
+
+    @Test("Merging notes combines bodies with rules, relinks attachments, rewrites WikiLinks, preserves pins, and recovers")
+    func mergeNotesEndToEnd() throws {
+        try VaultTests().testMergeNotesCombinesBodiesRelinksAttachmentsRewritesWikiLinksPreservesPinsAndRecovers()
     }
 }
 #endif

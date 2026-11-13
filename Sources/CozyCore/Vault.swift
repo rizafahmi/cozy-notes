@@ -58,10 +58,54 @@ public struct LinkedAttachment: Equatable {
     }
 }
 
-public struct VaultSnapshot {
+public struct VaultSnapshot: Equatable, Sendable {
     public let id: String
     public let label: String
     public let createdAt: Date
+}
+
+public struct MergePreview: Equatable, Sendable {
+    public let orderedNotes: [NoteRecord]
+    public let targetNote: NoteRecord
+    public let mergedContent: String
+    public let willBePinned: Bool
+    public let affectedBacklinkNoteCount: Int
+
+    public init(
+        orderedNotes: [NoteRecord],
+        targetNote: NoteRecord,
+        mergedContent: String,
+        willBePinned: Bool,
+        affectedBacklinkNoteCount: Int
+    ) {
+        self.orderedNotes = orderedNotes
+        self.targetNote = targetNote
+        self.mergedContent = mergedContent
+        self.willBePinned = willBePinned
+        self.affectedBacklinkNoteCount = affectedBacklinkNoteCount
+    }
+}
+
+public struct MergeResult: Equatable, Sendable {
+    public let targetRecord: NoteRecord
+    public let mergedContent: String
+    public let removedNoteURLs: [URL]
+    public let rewrittenNoteURLs: [URL]
+    public let snapshot: VaultSnapshot
+
+    public init(
+        targetRecord: NoteRecord,
+        mergedContent: String,
+        removedNoteURLs: [URL],
+        rewrittenNoteURLs: [URL],
+        snapshot: VaultSnapshot
+    ) {
+        self.targetRecord = targetRecord
+        self.mergedContent = mergedContent
+        self.removedNoteURLs = removedNoteURLs
+        self.rewrittenNoteURLs = rewrittenNoteURLs
+        self.snapshot = snapshot
+    }
 }
 
 public enum VaultError: LocalizedError {
@@ -69,6 +113,7 @@ public enum VaultError: LocalizedError {
     case conflict(String)
     case invalidSnapshot(String)
     case invalidAttachment(String)
+    case invalidMerge(String)
 
     public var errorDescription: String? {
         switch self {
@@ -76,6 +121,7 @@ public enum VaultError: LocalizedError {
         case .conflict(let path): return "File changed externally; reload before saving: \(path)"
         case .invalidSnapshot(let id): return "Invalid or incomplete checkpoint: \(id)"
         case .invalidAttachment(let path): return "Attachment is not a regular, non-symlink file: \(path)"
+        case .invalidMerge(let reason): return reason
         }
     }
 }
@@ -315,6 +361,616 @@ public final class Vault: @unchecked Sendable {
             }
         }
         try fm.removeItem(at: url)
+    }
+
+    public func previewMerge(_ noteURLs: [URL]) throws -> MergePreview {
+        try synchronized {
+            let plan = try prepareMergeLocked(noteURLs, expectedContents: [:])
+            let targetTitle = Self.extractedTitle(from: plan.mergedContent, fallbackURL: plan.targetURL)
+            let targetExcerpt = Self.extractedExcerpt(from: plan.mergedContent)
+            let updatedTarget = NoteRecord(
+                url: plan.targetURL,
+                title: targetTitle,
+                modifiedAt: plan.orderedRecords[0].modifiedAt,
+                excerpt: targetExcerpt,
+                isPinned: plan.willBePinned
+            )
+            return MergePreview(
+                orderedNotes: plan.orderedRecords,
+                targetNote: updatedTarget,
+                mergedContent: plan.mergedContent,
+                willBePinned: plan.willBePinned,
+                affectedBacklinkNoteCount: plan.externalRewrites.count
+            )
+        }
+    }
+
+    /// Merges two or more notes in order into the first note, preserving attachments and pin state,
+    /// updating vault `[[WikiLinks]]` that pointed to absorbed notes, saving a recovery checkpoint first,
+    /// and moving the absorbed note files to Trash.
+    @discardableResult
+    public func merge(
+        _ noteURLs: [URL],
+        expectedContents: [URL: String] = [:],
+        moveToTrash: Bool = true
+    ) throws -> MergeResult {
+        try synchronized {
+            let plan = try prepareMergeLocked(noteURLs, expectedContents: expectedContents)
+            let checkpoint = try makeSnapshot(
+                label: "Before merging \(plan.orderedURLs.count) notes into \(plan.orderedRecords[0].title)"
+            )
+            try atomicWrite(
+                Data(plan.mergedContent.utf8),
+                to: plan.targetURL,
+                expectedContent: plan.originalTexts[plan.targetURL]
+            )
+            for rewrite in plan.externalRewrites {
+                try atomicWrite(
+                    Data(rewrite.updated.utf8),
+                    to: rewrite.url,
+                    expectedContent: rewrite.original
+                )
+            }
+            if plan.updatedPinnedPaths != plan.previousPinnedPaths {
+                try writePinnedRelativePathsLocked(plan.updatedPinnedPaths)
+            }
+            for absorbedURL in plan.absorbedURLs {
+                try removeOrTrash(absorbedURL, moveToTrash: moveToTrash)
+            }
+            let finalTargetRecord = try record(plan.targetURL, pinnedPaths: plan.updatedPinnedPaths)
+            return MergeResult(
+                targetRecord: finalTargetRecord,
+                mergedContent: plan.mergedContent,
+                removedNoteURLs: plan.absorbedURLs,
+                rewrittenNoteURLs: plan.externalRewrites.map(\.url),
+                snapshot: checkpoint
+            )
+        }
+    }
+
+    private struct PreparedMerge {
+        let orderedURLs: [URL]
+        let orderedRecords: [NoteRecord]
+        let targetURL: URL
+        let absorbedURLs: [URL]
+        let originalTexts: [URL: String]
+        let mergedContent: String
+        let willBePinned: Bool
+        let previousPinnedPaths: Set<String>
+        let updatedPinnedPaths: Set<String>
+        let externalRewrites: [(url: URL, original: String, updated: String)]
+    }
+
+    private func prepareMergeLocked(
+        _ noteURLs: [URL],
+        expectedContents: [URL: String]
+    ) throws -> PreparedMerge {
+        var orderedURLs: [URL] = []
+        orderedURLs.reserveCapacity(noteURLs.count)
+        for rawURL in noteURLs {
+            guard rawURL.isFileURL else { throw VaultError.unsafePath(rawURL.absoluteString) }
+            let canonical = rawURL.standardizedFileURL.resolvingSymlinksInPath()
+            if !orderedURLs.contains(canonical) {
+                orderedURLs.append(canonical)
+            }
+        }
+        guard orderedURLs.count >= 2 else {
+            throw VaultError.invalidMerge("Select at least two notes to merge.")
+        }
+
+        var normalizedExpected: [URL: String] = [:]
+        normalizedExpected.reserveCapacity(expectedContents.count)
+        for (url, content) in expectedContents where url.isFileURL {
+            normalizedExpected[url.standardizedFileURL.resolvingSymlinksInPath()] = content
+        }
+
+        for url in orderedURLs {
+            try validateNote(url)
+            guard !Self.isExtractedCompanion(url, root: root) else {
+                throw VaultError.unsafePath(url.path)
+            }
+            try validateSource(url)
+        }
+
+        let allNotes = try notes()
+        let pinnedPaths = pinnedRelativePathsLocked()
+        let recordsByURL = Dictionary(uniqueKeysWithValues: allNotes.map { ($0.url, $0) })
+
+        var originalTexts: [URL: String] = [:]
+        originalTexts.reserveCapacity(orderedURLs.count)
+        var orderedRecords: [NoteRecord] = []
+        orderedRecords.reserveCapacity(orderedURLs.count)
+
+        for url in orderedURLs {
+            let text = try read(url)
+            if let expected = normalizedExpected[url], text != expected {
+                throw VaultError.conflict(url.path)
+            }
+            originalTexts[url] = text
+            let rec = try recordsByURL[url] ?? record(url, pinnedPaths: pinnedPaths)
+            orderedRecords.append(rec)
+        }
+
+        let targetURL = orderedURLs[0]
+        let absorbedURLs = Array(orderedURLs.dropFirst())
+        let absorbedSet = Set(absorbedURLs)
+
+        var nonEmptySections: [(originalIndex: Int, text: String)] = []
+        nonEmptySections.reserveCapacity(orderedURLs.count)
+        for (idx, url) in orderedURLs.enumerated() {
+            let rawSection = originalTexts[url] ?? ""
+            let relinked = relinkedSectionLocked(
+                rawSection,
+                from: url,
+                to: targetURL,
+                absorbedSet: absorbedSet
+            )
+            if !relinked.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                nonEmptySections.append((idx, relinked))
+            }
+        }
+
+        var combined: String
+        if nonEmptySections.isEmpty {
+            combined = originalTexts[targetURL] ?? ""
+        } else {
+            let trimmedPieces = nonEmptySections.enumerated().map { pieceOffset, entry -> String in
+                var slice = Substring(entry.text)
+                if pieceOffset > 0 || entry.originalIndex > 0 {
+                    while let first = slice.first, first == "\n" || first == "\r" {
+                        slice.removeFirst()
+                    }
+                }
+                while let last = slice.last, last == "\n" || last == "\r" {
+                    slice.removeLast()
+                }
+                return String(slice)
+            }
+            combined = trimmedPieces.joined(separator: "\n\n---\n\n") + "\n"
+        }
+
+        var updatedPins = pinnedPaths
+        var willBePinned = false
+        for url in orderedURLs {
+            let rel = try relativeNotePathLocked(url)
+            if pinnedPaths.contains(rel) {
+                willBePinned = true
+            }
+            if url != targetURL {
+                updatedPins.remove(rel)
+            }
+        }
+        if willBePinned {
+            updatedPins.insert(try validatedPinnableRelativePathLocked(targetURL))
+        }
+
+        var mergedTitle = Self.extractedTitle(from: combined, fallbackURL: targetURL)
+        var simulatedPostMerge = Self.simulatedPostMergeNotes(
+            from: allNotes,
+            targetURL: targetURL,
+            targetTitle: mergedTitle,
+            targetPinned: willBePinned,
+            absorbedSet: absorbedSet
+        )
+        var wikiTarget = Self.canonicalWikiTarget(
+            for: targetURL,
+            preferredTitle: mergedTitle,
+            in: simulatedPostMerge,
+            root: root
+        )
+
+        if combined.contains("[[") {
+            let updatedCombined = Self.rewriteAbsorbedWikiLinks(
+                in: combined,
+                preMergeNotes: allNotes,
+                absorbedSet: absorbedSet,
+                replacementTarget: wikiTarget,
+                root: root
+            )
+            if updatedCombined != combined {
+                combined = updatedCombined
+                let refreshedTitle = Self.extractedTitle(from: combined, fallbackURL: targetURL)
+                if refreshedTitle != mergedTitle {
+                    mergedTitle = refreshedTitle
+                    simulatedPostMerge = Self.simulatedPostMergeNotes(
+                        from: allNotes,
+                        targetURL: targetURL,
+                        targetTitle: mergedTitle,
+                        targetPinned: willBePinned,
+                        absorbedSet: absorbedSet
+                    )
+                    wikiTarget = Self.canonicalWikiTarget(
+                        for: targetURL,
+                        preferredTitle: mergedTitle,
+                        in: simulatedPostMerge,
+                        root: root
+                    )
+                }
+            }
+        }
+
+        var externalRewrites: [(url: URL, original: String, updated: String)] = []
+        for note in allNotes where note.url != targetURL && !absorbedSet.contains(note.url) {
+            let extText = try read(note.url)
+            guard extText.contains("[[") else { continue }
+            let updatedExt = Self.rewriteAbsorbedWikiLinks(
+                in: extText,
+                preMergeNotes: allNotes,
+                absorbedSet: absorbedSet,
+                replacementTarget: wikiTarget,
+                root: root
+            )
+            if updatedExt != extText {
+                externalRewrites.append((note.url, extText, updatedExt))
+            }
+        }
+
+        return PreparedMerge(
+            orderedURLs: orderedURLs,
+            orderedRecords: orderedRecords,
+            targetURL: targetURL,
+            absorbedURLs: absorbedURLs,
+            originalTexts: originalTexts,
+            mergedContent: combined,
+            willBePinned: willBePinned,
+            previousPinnedPaths: pinnedPaths,
+            updatedPinnedPaths: updatedPins,
+            externalRewrites: externalRewrites
+        )
+    }
+
+    private func relinkedSectionLocked(
+        _ text: String,
+        from sourceURL: URL,
+        to targetURL: URL,
+        absorbedSet: Set<URL>
+    ) -> String {
+        let ns = text as NSString
+        guard ns.length > 4, ns.range(of: "](", options: .literal).location != NSNotFound else {
+            return text
+        }
+        let sourceDir = sourceURL.deletingLastPathComponent()
+        let targetDir = targetURL.deletingLastPathComponent()
+        let codeSpans = Self.markdownCodeRanges(in: ns)
+        var edits: [(range: NSRange, replacement: String)] = []
+
+        var searchStart = 0
+        let totalLen = ns.length
+        while searchStart < totalLen {
+            let hit = ns.range(of: "](", options: .literal, range: NSRange(location: searchStart, length: totalLen - searchStart))
+            guard hit.location != NSNotFound else { break }
+            let lineRange = ns.lineRange(for: hit)
+            let lineStr = ns.substring(with: lineRange)
+            let lineNS = lineStr as NSString
+            for match in Self.linkedAttachmentRegex.matches(in: lineStr, range: NSRange(location: 0, length: lineNS.length)) where match.numberOfRanges > 1 {
+                let fullRange = NSRange(location: lineRange.location + match.range.location, length: match.range.length)
+                if codeSpans.contains(where: { NSIntersectionRange($0, fullRange).length > 0 }) {
+                    continue
+                }
+                let isImage = lineNS.character(at: match.range.location) == 0x21
+                let rawInnerRange = match.range(at: 1)
+                let rawInner = lineNS.substring(with: rawInnerRange)
+                let trimmed = rawInner.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.isEmpty,
+                      !trimmed.contains("://"),
+                      !trimmed.hasPrefix("/"),
+                      !trimmed.hasPrefix("#"),
+                      !trimmed.lowercased().hasPrefix("mailto:") else { continue }
+
+                let pathPart: String
+                let fragmentSuffix: String
+                if let hashIdx = trimmed.firstIndex(of: "#") {
+                    pathPart = String(trimmed[..<hashIdx])
+                    fragmentSuffix = String(trimmed[hashIdx...])
+                } else {
+                    pathPart = trimmed
+                    fragmentSuffix = ""
+                }
+                guard !pathPart.isEmpty,
+                      let decoded = pathPart.removingPercentEncoding,
+                      !decoded.isEmpty else { continue }
+
+                let candidate = sourceDir.appendingPathComponent(decoded).standardizedFileURL.resolvingSymlinksInPath()
+                guard (try? validateSource(candidate)) != nil else { continue }
+
+                let destination: URL
+                if !isImage && absorbedSet.contains(candidate) {
+                    destination = targetURL
+                } else {
+                    destination = candidate
+                }
+
+                let nextTarget: String
+                if destination == targetURL && !fragmentSuffix.isEmpty && !isImage {
+                    nextTarget = fragmentSuffix
+                } else if sourceDir.path != targetDir.path || destination != candidate {
+                    nextTarget = Self.relativeMarkdownPath(from: targetDir, to: destination) + fragmentSuffix
+                } else {
+                    continue
+                }
+
+                if nextTarget != rawInner {
+                    let fullInnerRange = NSRange(location: lineRange.location + rawInnerRange.location, length: rawInnerRange.length)
+                    edits.append((fullInnerRange, nextTarget))
+                }
+            }
+            searchStart = NSMaxRange(lineRange)
+        }
+
+        guard !edits.isEmpty else { return text }
+        let mutable = NSMutableString(string: text)
+        for edit in edits.reversed() {
+            mutable.replaceCharacters(in: edit.range, with: edit.replacement)
+        }
+        return mutable as String
+    }
+
+    private static func relativeMarkdownPath(from baseDir: URL, to targetFile: URL) -> String {
+        let baseParts = baseDir.standardizedFileURL.path.split(separator: "/", omittingEmptySubsequences: true)
+        let targetParts = targetFile.standardizedFileURL.path.split(separator: "/", omittingEmptySubsequences: true)
+        var common = 0
+        let limit = min(baseParts.count, targetParts.count)
+        while common < limit && baseParts[common] == targetParts[common] {
+            common += 1
+        }
+        var relParts = Array(repeating: "..", count: baseParts.count - common)
+        for part in targetParts[common...] {
+            relParts.append(encodedFilename(String(part)))
+        }
+        return relParts.isEmpty ? encodedFilename(targetFile.lastPathComponent) : relParts.joined(separator: "/")
+    }
+
+    private static func extractedTitle(from text: String, fallbackURL: URL) -> String {
+        let lines = text.components(separatedBy: .newlines)
+        if let index = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+            return title(from: lines[index])
+        }
+        return fallbackURL.deletingPathExtension().lastPathComponent
+    }
+
+    private static func extractedExcerpt(from text: String) -> String {
+        let lines = text.components(separatedBy: .newlines)
+        let index = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let excerpt = lines.enumerated().filter { $0.offset != index }.map(\.element)
+            .joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(excerpt.prefix(240))
+    }
+
+    private static func simulatedPostMergeNotes(
+        from existingNotes: [NoteRecord],
+        targetURL: URL,
+        targetTitle: String,
+        targetPinned: Bool,
+        absorbedSet: Set<URL>
+    ) -> [NoteRecord] {
+        let now = Date()
+        var next: [NoteRecord] = []
+        next.reserveCapacity(existingNotes.count)
+        var insertedTarget = false
+        for item in existingNotes where !absorbedSet.contains(item.url) {
+            if item.url == targetURL {
+                next.append(NoteRecord(url: targetURL, title: targetTitle, modifiedAt: now, excerpt: item.excerpt, isPinned: targetPinned))
+                insertedTarget = true
+            } else {
+                next.append(item)
+            }
+        }
+        if !insertedTarget {
+            next.append(NoteRecord(url: targetURL, title: targetTitle, modifiedAt: now, excerpt: "", isPinned: targetPinned))
+        }
+        next.sort {
+            if $0.isPinned != $1.isPinned { return $0.isPinned && !$1.isPinned }
+            return $0.modifiedAt == $1.modifiedAt ? $0.url.path < $1.url.path : $0.modifiedAt > $1.modifiedAt
+        }
+        return next
+    }
+
+    private static func canonicalWikiTarget(
+        for targetURL: URL,
+        preferredTitle: String,
+        in postMergeNotes: [NoteRecord],
+        root: URL
+    ) -> String {
+        let cleanedTitle = preferredTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanedTitle.isEmpty,
+           !cleanedTitle.contains("["),
+           !cleanedTitle.contains("]"),
+           !cleanedTitle.contains("|"),
+           !cleanedTitle.contains("#"),
+           findMatchingNote(for: cleanedTitle, in: postMergeNotes, root: root)?.url == targetURL {
+            return cleanedTitle
+        }
+        let stem = targetURL.deletingPathExtension().lastPathComponent
+        if !stem.isEmpty,
+           findMatchingNote(for: stem, in: postMergeNotes, root: root)?.url == targetURL {
+            return stem
+        }
+        let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        if targetURL.path.hasPrefix(rootPrefix) {
+            let rel = String(targetURL.path.dropFirst(rootPrefix.count))
+            return (rel as NSString).deletingPathExtension
+        }
+        return stem
+    }
+
+    private static func resolveWikiTarget(_ rawTarget: String, in candidates: [NoteRecord], root: URL) -> NoteRecord? {
+        let cleaned = normalizedWikiTarget(rawTarget)
+        guard !cleaned.isEmpty else { return nil }
+        if let match = findMatchingNote(for: cleaned, in: candidates, root: root) {
+            return match
+        }
+        if let hashIndex = cleaned.firstIndex(of: "#") {
+            let beforeHash = String(cleaned[..<hashIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !beforeHash.isEmpty, let match = findMatchingNote(for: beforeHash, in: candidates, root: root) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    private static func rewriteAbsorbedWikiLinks(
+        in text: String,
+        preMergeNotes: [NoteRecord],
+        absorbedSet: Set<URL>,
+        replacementTarget: String,
+        root: URL
+    ) -> String {
+        let ns = text as NSString
+        let links = wikiLinks(inNSString: ns)
+        guard !links.isEmpty else { return text }
+        let codeSpans = markdownCodeRanges(in: ns)
+        var edits: [(range: NSRange, replacement: String)] = []
+
+        for link in links {
+            if codeSpans.contains(where: { NSIntersectionRange($0, link.fullRange).length > 0 }) {
+                continue
+            }
+            guard let resolved = resolveWikiTarget(link.target, in: preMergeNotes, root: root),
+                  absorbedSet.contains(resolved.url) else {
+                continue
+            }
+            let fragmentSuffix: String
+            if let hashIdx = link.target.firstIndex(of: "#"),
+               findMatchingNote(for: normalizedWikiTarget(link.target), in: preMergeNotes, root: root) == nil {
+                let beforeHash = String(link.target[..<hashIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+                fragmentSuffix = beforeHash.isEmpty ? "" : String(link.target[hashIdx...])
+            } else {
+                fragmentSuffix = ""
+            }
+            let nextLink: String
+            if let alias = link.alias, !alias.isEmpty {
+                nextLink = "[[\(replacementTarget)\(fragmentSuffix)|\(alias)]]"
+            } else {
+                nextLink = "[[\(replacementTarget)\(fragmentSuffix)]]"
+            }
+            if nextLink != ns.substring(with: link.fullRange) {
+                edits.append((link.fullRange, nextLink))
+            }
+        }
+
+        guard !edits.isEmpty else { return text }
+        let mutable = NSMutableString(string: text)
+        for edit in edits.reversed() {
+            mutable.replaceCharacters(in: edit.range, with: edit.replacement)
+        }
+        return mutable as String
+    }
+
+    private static func markdownCodeRanges(in ns: NSString) -> [NSRange] {
+        let total = ns.length
+        guard total >= 2 else { return [] }
+        var ranges: [NSRange] = []
+        var activeFence: (char: unichar, count: Int, startLocation: Int)?
+        var lineStart = 0
+
+        while lineStart < total {
+            let lineRange = ns.lineRange(for: NSRange(location: lineStart, length: 0))
+            let lineEnd = NSMaxRange(lineRange)
+            var contentEnd = lineEnd
+            while contentEnd > lineRange.location {
+                let c = ns.character(at: contentEnd - 1)
+                if c == 0x0A || c == 0x0D { contentEnd -= 1 } else { break }
+            }
+
+            var cursor = lineRange.location
+            var spaces = 0
+            while cursor < contentEnd && spaces < 3 && ns.character(at: cursor) == 0x20 {
+                cursor += 1
+                spaces += 1
+            }
+
+            var handledFenceLine = false
+            if cursor < contentEnd {
+                let first = ns.character(at: cursor)
+                if first == 0x60 || first == 0x7E {
+                    var run = 0
+                    while cursor + run < contentEnd && ns.character(at: cursor + run) == first {
+                        run += 1
+                    }
+                    if run >= 3 {
+                        if let open = activeFence {
+                            if first == open.char && run >= open.count {
+                                var trailingClean = true
+                                var t = cursor + run
+                                while t < contentEnd {
+                                    let ch = ns.character(at: t)
+                                    if ch != 0x20 && ch != 0x09 {
+                                        trailingClean = false
+                                        break
+                                    }
+                                    t += 1
+                                }
+                                if trailingClean {
+                                    ranges.append(NSRange(location: open.startLocation, length: lineEnd - open.startLocation))
+                                    activeFence = nil
+                                    handledFenceLine = true
+                                }
+                            }
+                        } else {
+                            var validInfo = true
+                            if first == 0x60 {
+                                var t = cursor + run
+                                while t < contentEnd {
+                                    if ns.character(at: t) == 0x60 {
+                                        validInfo = false
+                                        break
+                                    }
+                                    t += 1
+                                }
+                            }
+                            if validInfo {
+                                activeFence = (first, run, lineRange.location)
+                                handledFenceLine = true
+                            }
+                        }
+                    }
+                }
+            }
+
+            if activeFence == nil && !handledFenceLine {
+                var idx = lineRange.location
+                while idx < contentEnd {
+                    if ns.character(at: idx) == 0x60 {
+                        var openTicks = 0
+                        while idx + openTicks < contentEnd && ns.character(at: idx + openTicks) == 0x60 {
+                            openTicks += 1
+                        }
+                        var scan = idx + openTicks
+                        var closedAt: Int?
+                        while scan < contentEnd {
+                            if ns.character(at: scan) == 0x60 {
+                                var closeTicks = 0
+                                while scan + closeTicks < contentEnd && ns.character(at: scan + closeTicks) == 0x60 {
+                                    closeTicks += 1
+                                }
+                                if closeTicks == openTicks {
+                                    closedAt = scan + closeTicks
+                                    break
+                                }
+                                scan += closeTicks
+                            } else {
+                                scan += 1
+                            }
+                        }
+                        if let endSpan = closedAt {
+                            ranges.append(NSRange(location: idx, length: endSpan - idx))
+                            idx = endSpan
+                        } else {
+                            idx += openTicks
+                        }
+                    } else {
+                        idx += 1
+                    }
+                }
+            }
+
+            lineStart = lineEnd
+        }
+
+        if let open = activeFence {
+            ranges.append(NSRange(location: open.startLocation, length: total - open.startLocation))
+        }
+        return ranges
     }
 
     public func attach(_ attachments: [URL], to noteURL: URL, text: String, expectedContent: String) throws -> String {
