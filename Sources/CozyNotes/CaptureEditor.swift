@@ -1178,7 +1178,7 @@ import CozyCore
         if let handler = onWikiAutocompleteCommand, handler(#selector(NSResponder.cancelOperation(_:))) {
             return
         }
-        super.cancelOperation(sender)
+        nextResponder?.tryToPerform(#selector(NSResponder.cancelOperation(_:)), with: sender)
     }
 
     override func insertTab(_ sender: Any?) {
