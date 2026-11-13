@@ -84,6 +84,14 @@ import AppKit
             UserDefaults.standard.set(Double(fontScale), forKey: "cozyFontScale")
         }
     }
+
+    static var vimModeEnabled: Bool = {
+        UserDefaults.standard.bool(forKey: "cozyVimMode")
+    }() {
+        didSet {
+            UserDefaults.standard.set(vimModeEnabled, forKey: "cozyVimMode")
+        }
+    }
     private static func adaptive(
         _ name: String,
         studyLight: (CGFloat, CGFloat, CGFloat),
@@ -788,6 +796,97 @@ import AppKit
         }
     }
 }
+
+/// Subtle semantic mode badge in the editor footer when Vim mode is enabled.
+@MainActor final class VimModePill: NSView {
+    enum Style: Equatable {
+        case normal
+        case insert
+        case visual
+    }
+
+    var badgeText: String = "NORMAL" {
+        didSet {
+            if badgeText != oldValue {
+                invalidateIntrinsicContentSize()
+                setAccessibilityValue(badgeText)
+                needsDisplay = true
+            }
+        }
+    }
+
+    var style: Style = .normal {
+        didSet {
+            if style != oldValue { needsDisplay = true }
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel("Vim mode")
+        setAccessibilityValue(badgeText)
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+
+    override var intrinsicContentSize: NSSize {
+        let font = Theme.monoFont(9.5, weight: .semibold)
+        let width = (badgeText as NSString).size(withAttributes: [.font: font]).width
+        return NSSize(width: ceil(width) + 14, height: 19)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+        let fill: NSColor
+        let border: NSColor
+        let ink: NSColor
+        switch style {
+        case .normal:
+            fill = Theme.elevated
+            border = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? Theme.muted : Theme.border
+            ink = Theme.muted
+        case .insert:
+            fill = Theme.accentSoft
+            border = Theme.accent.withAlphaComponent(0.45)
+            ink = Theme.accent
+        case .visual:
+            fill = Theme.selectionHighlight
+            border = Theme.accent.withAlphaComponent(0.55)
+            ink = Theme.headingInk
+        }
+        fill.setFill()
+        path.fill()
+        border.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+
+        let font = Theme.monoFont(9.5, weight: .semibold)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: ink,
+            .kern: 0.35
+        ]
+        let size = (badgeText as NSString).size(withAttributes: attrs)
+        let pt = NSPoint(
+            x: round((bounds.width - size.width) * 0.5),
+            y: round((bounds.height - size.height) * 0.5)
+        )
+        (badgeText as NSString).draw(at: pt, withAttributes: attrs)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 @MainActor func showError(_ error: Error, in window: NSWindow?) {
     let alert = NSAlert(error: error)
     if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
