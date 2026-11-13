@@ -732,6 +732,7 @@ import AppKit
 @MainActor final class QuietButton: NSButton {
     private var hovered = false { didSet { needsDisplay = true } }
     private var tracking: NSTrackingArea?
+    private(set) var symbolName: String?
     var tint: NSColor = Theme.muted { didSet { contentTintColor = tint; needsDisplay = true } }
 
     convenience init(title: String = "", symbol: String? = nil, target: AnyObject? = nil, action: Selector? = nil) {
@@ -740,10 +741,17 @@ import AppKit
         self.target = target
         self.action = action
         if let symbol {
-            self.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
-            self.imagePosition = title.isEmpty ? .imageOnly : .imageLeading
+            setSymbol(symbol)
         }
+    }
+
+    func setSymbol(_ symbol: String) {
+        guard symbolName != symbol else { return }
+        symbolName = symbol
+        self.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
+        self.imagePosition = title.isEmpty ? .imageOnly : .imageLeading
+        needsDisplay = true
     }
 
     override init(frame frameRect: NSRect) {

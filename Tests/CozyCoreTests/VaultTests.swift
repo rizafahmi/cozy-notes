@@ -413,6 +413,79 @@ final class VaultTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: snapshotStorage.appendingPathComponent("proj/node_modules/x/README.md").path))
         XCTAssertFalse(fm.fileExists(atPath: snapshotStorage.appendingPathComponent("elixir-app/deps/phoenix/README.md").path))
     }
+
+    func testPinningPersistsDotfileSortsModifiedFirstAndRecoversAcrossDeletion() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let fm = FileManager.default
+        let pinsFile = fixture.root.appendingPathComponent(Vault.pinsFilename)
+
+        let olderPinned = try fixture.vault.capture(text: "# Older Pinned\nFirst note")
+        let newerPinned = try fixture.vault.capture(text: "# Newer Pinned\nSecond note")
+        let newestUnpinned = try fixture.vault.capture(text: "# Newest Unpinned\nThird note")
+
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+        let t1 = Date(timeIntervalSince1970: 1_700_000_100)
+        let t2 = Date(timeIntervalSince1970: 1_700_000_200)
+        try fm.setAttributes([.modificationDate: t0], ofItemAtPath: olderPinned.url.path)
+        try fm.setAttributes([.modificationDate: t1], ofItemAtPath: newerPinned.url.path)
+        try fm.setAttributes([.modificationDate: t2], ofItemAtPath: newestUnpinned.url.path)
+
+        let olderBytesBefore = try Data(contentsOf: olderPinned.url)
+        let olderModBefore = try fm.attributesOfItem(atPath: olderPinned.url.path)[.modificationDate] as? Date
+
+        XCTAssertFalse(fm.fileExists(atPath: pinsFile.path))
+        XCTAssertEqual(try fixture.vault.notes().map(\.title), ["Newest Unpinned", "Newer Pinned", "Older Pinned"])
+
+        XCTAssertTrue(try fixture.vault.togglePinned(for: olderPinned.url))
+        XCTAssertTrue(try fixture.vault.setPinned(true, for: newerPinned.url))
+        XCTAssertTrue(fm.fileExists(atPath: pinsFile.path))
+        XCTAssertEqual(try Data(contentsOf: olderPinned.url), olderBytesBefore)
+        XCTAssertEqual(try fm.attributesOfItem(atPath: olderPinned.url.path)[.modificationDate] as? Date, olderModBefore)
+
+        let sorted = try fixture.vault.notes()
+        XCTAssertEqual(sorted.map(\.title), ["Newer Pinned", "Older Pinned", "Newest Unpinned"])
+        XCTAssertEqual(sorted.map(\.isPinned), [true, true, false])
+
+        // Re-open vault on the same directory to verify persistence across launches
+        let reopened = try Vault(root: fixture.root, historyRoot: fixture.history)
+        XCTAssertTrue(reopened.isPinned(olderPinned.url))
+        XCTAssertTrue(reopened.isPinned(newerPinned.url))
+        XCTAssertFalse(reopened.isPinned(newestUnpinned.url))
+
+        // Deleting a pinned note removes its stale pin entry, and restoring the pre-delete checkpoint restores both
+        let checkpoint = try fixture.vault.delete(newerPinned.url, moveToTrash: false)
+        XCTAssertFalse(fixture.vault.isPinned(newerPinned.url))
+        XCTAssertTrue(fixture.vault.isPinned(olderPinned.url))
+
+        try fixture.vault.restore(snapshotID: checkpoint.id)
+        XCTAssertTrue(fm.fileExists(atPath: newerPinned.url.path))
+        XCTAssertTrue(fixture.vault.isPinned(newerPinned.url))
+        XCTAssertTrue(fixture.vault.isPinned(olderPinned.url))
+
+        // Unpinning the remaining notes removes .cozy-pins.json cleanly
+        XCTAssertFalse(try fixture.vault.setPinned(false, for: olderPinned.url))
+        XCTAssertFalse(try fixture.vault.togglePinned(for: newerPinned.url))
+        XCTAssertFalse(fm.fileExists(atPath: pinsFile.path))
+
+        // Security invariants: outside paths, Extracted Text companions, and symlinked .cozy-pins.json are rejected
+        let outsideNote = fixture.workspace.appendingPathComponent("outside.md")
+        try "# Outside".write(to: outsideNote, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try fixture.vault.setPinned(true, for: outsideNote))
+
+        let extractedDir = fixture.root.appendingPathComponent("Extracted Text", isDirectory: true)
+        try fm.createDirectory(at: extractedDir, withIntermediateDirectories: true)
+        let companionMeta = Data("{\"source\":\"doc.pdf\",\"fingerprint\":\"fp1\",\"bodyHash\":\"bh1\"}".utf8).base64EncodedString()
+        let companionNote = extractedDir.appendingPathComponent("companion.md")
+        try "<!-- cozy-extracted-text:v1 \(companionMeta) -->\n# Companion".write(to: companionNote, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try fixture.vault.setPinned(true, for: companionNote))
+
+        let symlinkTarget = fixture.workspace.appendingPathComponent("hijack.json")
+        try "{\"version\":1,\"pinned\":[]}".write(to: symlinkTarget, atomically: true, encoding: .utf8)
+        try fm.createSymbolicLink(at: pinsFile, withDestinationURL: symlinkTarget)
+        XCTAssertTrue(fixture.vault.pinnedRelativePaths().isEmpty)
+        XCTAssertThrowsError(try fixture.vault.setPinned(true, for: olderPinned.url))
+    }
 }
 
 #if canImport(Testing)
@@ -483,6 +556,11 @@ struct VaultCoreSuite {
     @Test("Dependency directories are hidden while user note folders remain visible and snapshotted")
     func dependencyDirectoriesHiddenWhileUserNoteFoldersPreserved() throws {
         try VaultTests().testDependencyDirectoriesAreHiddenWhileUserNoteFoldersRemainVisibleAndSnapshotted()
+    }
+
+    @Test("Pinning persists dotfile, sorts modified first, and recovers across deletion")
+    func pinningPersistsSortsAndRecovers() throws {
+        try VaultTests().testPinningPersistsDotfileSortsModifiedFirstAndRecoversAcrossDeletion()
     }
 }
 #endif

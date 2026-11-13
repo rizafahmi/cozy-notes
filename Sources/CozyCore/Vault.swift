@@ -7,12 +7,14 @@ public struct NoteRecord: Equatable, Sendable {
     public let title: String
     public let modifiedAt: Date
     public let excerpt: String
+    public let isPinned: Bool
 
-    public init(url: URL, title: String, modifiedAt: Date, excerpt: String) {
+    public init(url: URL, title: String, modifiedAt: Date, excerpt: String, isPinned: Bool = false) {
         self.url = url
         self.title = title
         self.modifiedAt = modifiedAt
         self.excerpt = excerpt
+        self.isPinned = isPinned
     }
 }
 
@@ -81,16 +83,33 @@ public enum VaultError: LocalizedError {
 /// Plain Markdown storage. History deliberately lives outside the synced vault.
 // Configuration is immutable; every instance operation is protected by lock.
 public final class Vault: @unchecked Sendable {
+    public static let pinsFilename = ".cozy-pins.json"
     public let root: URL
     private let historyRoot: URL
     private let fm = FileManager.default
     private let lock = NSRecursiveLock()
+    private var cachedPins: (stamp: PinsStamp?, paths: Set<String>)?
 
     private struct Manifest: Codable {
         let id: String
         let label: String
         let createdAt: Date
         let files: [String]
+    }
+
+    private struct PinnedManifest: Codable {
+        let version: Int
+        let pinned: [String]
+    }
+
+    private struct PinsStamp: Equatable {
+        let device: Int32
+        let inode: UInt64
+        let size: Int64
+        let modifiedSeconds: Int
+        let modifiedNanos: Int
+        let changedSeconds: Int
+        let changedNanos: Int
     }
 
     public init(root: URL, historyRoot: URL? = nil) throws {
@@ -161,11 +180,61 @@ public final class Vault: @unchecked Sendable {
 
     public func notes() throws -> [NoteRecord] {
         try synchronized {
-            try files(under: root).filter {
+            let pinned = pinnedRelativePathsLocked()
+            return try files(under: root).filter {
                 ["md", "markdown"].contains($0.pathExtension.lowercased()) && !Self.isExtractedCompanion($0, root: root)
-            }.map(record).sorted {
-                    $0.modifiedAt == $1.modifiedAt ? $0.url.path < $1.url.path : $0.modifiedAt > $1.modifiedAt
-                }
+            }.map { try record($0, pinnedPaths: pinned) }.sorted {
+                if $0.isPinned != $1.isPinned { return $0.isPinned && !$1.isPinned }
+                return $0.modifiedAt == $1.modifiedAt ? $0.url.path < $1.url.path : $0.modifiedAt > $1.modifiedAt
+            }
+        }
+    }
+
+    public func pinnedRelativePaths() -> Set<String> {
+        synchronized { pinnedRelativePathsLocked() }
+    }
+
+    public func isPinned(_ noteURL: URL) -> Bool {
+        synchronized {
+            guard let rel = try? relativeNotePathLocked(noteURL) else { return false }
+            return pinnedRelativePathsLocked().contains(rel)
+        }
+    }
+
+    @discardableResult
+    public func setPinned(_ pinned: Bool, for noteURL: URL) throws -> Bool {
+        try synchronized {
+            let rel = try validatedPinnableRelativePathLocked(noteURL)
+            let pinsURL = root.appendingPathComponent(Self.pinsFilename)
+            try validate(pinsURL, beneath: root)
+            var paths = pinnedRelativePathsLocked()
+            if pinned {
+                paths.insert(rel)
+            } else {
+                paths.remove(rel)
+            }
+            try writePinnedRelativePathsLocked(paths)
+            return pinned
+        }
+    }
+
+    @discardableResult
+    public func togglePinned(for noteURL: URL) throws -> Bool {
+        try synchronized {
+            let rel = try validatedPinnableRelativePathLocked(noteURL)
+            let pinsURL = root.appendingPathComponent(Self.pinsFilename)
+            try validate(pinsURL, beneath: root)
+            var paths = pinnedRelativePathsLocked()
+            let nextPinned: Bool
+            if paths.contains(rel) {
+                paths.remove(rel)
+                nextPinned = false
+            } else {
+                paths.insert(rel)
+                nextPinned = true
+            }
+            try writePinnedRelativePathsLocked(paths)
+            return nextPinned
         }
     }
 
@@ -221,6 +290,12 @@ public final class Vault: @unchecked Sendable {
             }
 
             try removeOrTrash(noteURL, moveToTrash: moveToTrash)
+            if let rel = try? relativeNotePathLocked(noteURL) {
+                var pinned = pinnedRelativePathsLocked()
+                if pinned.remove(rel) != nil {
+                    try? writePinnedRelativePathsLocked(pinned)
+                }
+            }
             for folder in attachmentFolders.sorted(by: { $0.path < $1.path }) where fm.fileExists(atPath: folder.path) {
                 try validate(folder, beneath: root)
                 try removeOrTrash(folder, moveToTrash: moveToTrash)
@@ -636,6 +711,7 @@ public final class Vault: @unchecked Sendable {
                 try safeDirectory(destination.deletingLastPathComponent())
                 try atomicCopy(from: stored.appendingPathComponent(path), to: destination)
             }
+            cachedPins = nil
         }
     }
 
@@ -657,6 +733,12 @@ public final class Vault: @unchecked Sendable {
                 try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.copyItem(at: original, to: target)
                 paths.append(relative)
+            }
+            let pinsURL = root.appendingPathComponent(Self.pinsFilename)
+            if fm.fileExists(atPath: pinsURL.path),
+               (try? validateSource(pinsURL)) != nil {
+                try fm.copyItem(at: pinsURL, to: storage.appendingPathComponent(Self.pinsFilename))
+                paths.append(Self.pinsFilename)
             }
             let manifest = Manifest(id: id, label: label, createdAt: Date(), files: paths.sorted())
             try JSONEncoder().encode(manifest).write(to: temporary.appendingPathComponent("manifest.json"), options: .atomic)
@@ -687,7 +769,7 @@ public final class Vault: @unchecked Sendable {
         }
     }
 
-    private func record(_ url: URL) throws -> NoteRecord {
+    private func record(_ url: URL, pinnedPaths: Set<String>? = nil) throws -> NoteRecord {
         let text = try read(url)
         let lines = text.components(separatedBy: .newlines)
         let index = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -695,7 +777,108 @@ public final class Vault: @unchecked Sendable {
         let excerpt = lines.enumerated().filter { $0.offset != index }.map(\.element)
             .joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         let modified = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
-        return NoteRecord(url: url, title: title, modifiedAt: modified, excerpt: String(excerpt.prefix(240)))
+        let pinnedSet = pinnedPaths ?? pinnedRelativePathsLocked()
+        let isPinned = (try? relativeNotePathLocked(url)).map { pinnedSet.contains($0) } ?? false
+        return NoteRecord(url: url, title: title, modifiedAt: modified, excerpt: String(excerpt.prefix(240)), isPinned: isPinned)
+    }
+
+    private func relativeNotePathLocked(_ noteURL: URL) throws -> String {
+        try validateNote(noteURL)
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard noteURL.path.hasPrefix(prefix) else { throw VaultError.unsafePath(noteURL.path) }
+        let rel = String(noteURL.path.dropFirst(prefix.count))
+        try validateRelative(rel)
+        return rel
+    }
+
+    private func validatedPinnableRelativePathLocked(_ noteURL: URL) throws -> String {
+        let rel = try relativeNotePathLocked(noteURL)
+        guard !Self.isExtractedCompanion(noteURL, root: root) else {
+            throw VaultError.unsafePath(noteURL.path)
+        }
+        try validateSource(noteURL)
+        return rel
+    }
+
+    private func pinsStampLocked(_ pinsURL: URL) -> PinsStamp? {
+        var info = Darwin.stat()
+        guard Darwin.lstat(pinsURL.path, &info) == 0 else { return nil }
+        return PinsStamp(
+            device: info.st_dev,
+            inode: info.st_ino,
+            size: info.st_size,
+            modifiedSeconds: info.st_mtimespec.tv_sec,
+            modifiedNanos: info.st_mtimespec.tv_nsec,
+            changedSeconds: info.st_ctimespec.tv_sec,
+            changedNanos: info.st_ctimespec.tv_nsec
+        )
+    }
+
+    private func pinnedRelativePathsLocked() -> Set<String> {
+        let pinsURL = root.appendingPathComponent(Self.pinsFilename)
+        guard (try? validate(pinsURL, beneath: root)) != nil else {
+            cachedPins = nil
+            return []
+        }
+        let currentStamp = pinsStampLocked(pinsURL)
+        if let cached = cachedPins, cached.stamp == currentStamp {
+            return cached.paths
+        }
+        guard let currentStamp else {
+            cachedPins = (stamp: nil, paths: [])
+            return []
+        }
+        let descriptor = Darwin.open(pinsURL.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { return [] }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var opened = Darwin.stat()
+        guard Darwin.fstat(descriptor, &opened) == 0,
+              opened.st_dev == currentStamp.device,
+              opened.st_ino == currentStamp.inode,
+              opened.st_mode & S_IFMT == S_IFREG,
+              let data = try? handle.readToEnd() else {
+            return []
+        }
+        let rawPaths: [String]
+        if let manifest = try? JSONDecoder().decode(PinnedManifest.self, from: data) {
+            rawPaths = manifest.pinned
+        } else if let array = try? JSONDecoder().decode([String].self, from: data) {
+            rawPaths = array
+        } else {
+            cachedPins = (stamp: currentStamp, paths: [])
+            return []
+        }
+        var valid: Set<String> = []
+        valid.reserveCapacity(rawPaths.count)
+        for item in rawPaths {
+            guard (try? validateRelative(item)) != nil else { continue }
+            let ext = URL(fileURLWithPath: item).pathExtension.lowercased()
+            guard ext == "md" || ext == "markdown" else { continue }
+            valid.insert(item)
+        }
+        cachedPins = (stamp: currentStamp, paths: valid)
+        return valid
+    }
+
+    private func writePinnedRelativePathsLocked(_ paths: Set<String>) throws {
+        let pinsURL = root.appendingPathComponent(Self.pinsFilename)
+        try validate(pinsURL, beneath: root)
+        if paths.isEmpty {
+            if fm.fileExists(atPath: pinsURL.path) {
+                try validateSource(pinsURL)
+                try fm.removeItem(at: pinsURL)
+            }
+            cachedPins = (stamp: nil, paths: [])
+            return
+        }
+        let manifest = PinnedManifest(version: 1, pinned: paths.sorted())
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        var data = try encoder.encode(manifest)
+        data.append(0x0A)
+        try atomicWrite(data, to: pinsURL)
+        cachedPins = (stamp: pinsStampLocked(pinsURL), paths: paths)
     }
 
     private func files(under directory: URL) throws -> [URL] {

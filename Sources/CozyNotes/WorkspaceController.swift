@@ -119,7 +119,7 @@ import CozyCore
 @MainActor final class WorkspaceController: NSWindowController, NSWindowDelegate {
     let vault: Vault
     let editor = CaptureEditor(frame: .zero)
-    private let searchPanel: SearchPanel
+    let searchPanel: SearchPanel
     let quickSwitcher = QuickSwitcherOverlay(frame: .zero)
     private let sidebarContainer = NSView()
     private let folioSurface = FolioPageSurface()
@@ -128,6 +128,7 @@ import CozyCore
     private let contextLabel = Theme.label("", size: 10.5, color: Theme.muted)
     private let voiceButton = QuietButton(title: "AVENIR", symbol: "textformat", target: nil, action: nil)
     private let atmosphereButton = QuietButton(title: "OBSIDIAN", symbol: "sparkles", target: nil, action: nil)
+    let pinButton = QuietButton(symbol: "pin", target: nil, action: nil)
     let outlineButton = QuietButton(symbol: "list.bullet.indent", target: nil, action: nil)
     let openInNewWindowButton = QuietButton(symbol: "rectangle.on.rectangle", target: nil, action: nil)
     let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
@@ -149,7 +150,10 @@ import CozyCore
     private(set) var isSidebarCollapsed = false
     private(set) var noteURL: URL? {
         didSet {
-            if noteURL != oldValue { cachedNoteStamp = nil }
+            if noteURL != oldValue {
+                cachedNoteStamp = nil
+                cachedNotePinned = nil
+            }
         }
     }
     private var noteBaseline = "" {
@@ -165,6 +169,7 @@ import CozyCore
     private var noteBaselineUTF16Length = 0
     private var noteBaselineSig = 0
     private var cachedNoteStamp: String?
+    private var cachedNotePinned: Bool?
     private(set) var noteDirty = false
     private(set) var noteConflicted = false
     private(set) var hasExternalDiskChange = false
@@ -258,6 +263,10 @@ import CozyCore
         atmosphereButton.action = #selector(cycleAtmosphere)
         atmosphereButton.font = Theme.monoFont(10, weight: .semibold)
         atmosphereButton.toolTip = "Switch journal atmosphere (Obsidian / Midnight / Neo-Acid)"
+        pinButton.target = self
+        pinButton.action = #selector(togglePinCurrentNote)
+        pinButton.toolTip = "Pin note to top (⇧⌘P)"
+        pinButton.setAccessibilityLabel("Pin note")
         outlineButton.target = self
         outlineButton.action = #selector(toggleOutline)
         outlineButton.toolTip = "Toggle Document Outline (⌥⌘\\)"
@@ -287,7 +296,7 @@ import CozyCore
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, outlineButton, openInNewWindowButton, revealButton, deleteButton], spacing: 6)
+        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, pinButton, outlineButton, openInNewWindowButton, revealButton, deleteButton], spacing: 6)
 
         for view in [editorHeader, headerRule, reviewBanner, editor] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -367,10 +376,12 @@ import CozyCore
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in _ = self?.openWikiLinkInNewWindow(link) }
         editor.onOpenCurrentNoteInNewWindow = { [weak self] in self?.openCurrentNoteInNewWindow() }
+        editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
         editor.onQuickSwitcher = { [weak self] in self?.toggleQuickSwitcher() }
         editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
         quickSwitcher.onOpenNote = { [weak self] url in self?.openNote(url) }
         quickSwitcher.onOpenNoteInNewWindow = { [weak self] url in _ = self?.openNoteInNewWindow(url) }
+        quickSwitcher.onTogglePinNote = { [weak self] url in self?.togglePinNoteReturningPaths(url) }
         quickSwitcher.onOpenExternal = { [weak self] url in
             if !NSWorkspace.shared.open(url) {
                 self?.editor.status.stringValue = "No viewer could open \(url.lastPathComponent)."
@@ -381,6 +392,7 @@ import CozyCore
         quickSwitcher.onShowSidebarSearch = { [weak self] in self?.showInNoteFind() }
         searchPanel.onOpenNote = { [weak self] url in self?.openNote(url) }
         searchPanel.onOpenNoteInNewWindow = { [weak self] url in _ = self?.openNoteInNewWindow(url) }
+        searchPanel.onTogglePinNote = { [weak self] url in self?.togglePinNote(url) }
         searchPanel.onNewNote = { [weak self] in self?.newCapture() }
         searchPanel.onDeleteNote = { [weak self] url in self?.confirmAndDeleteNote(url) }
         searchPanel.onToggleSidebar = { [weak self] in self?.toggleSidebar() }
@@ -563,10 +575,16 @@ import CozyCore
     }
 
     func refresh() {
-        refreshNoteIfClean()
+        cachedNotePinned = nil
+        if noteURL != nil {
+            refreshNoteIfClean()
+        } else {
+            updateEditorChrome()
+        }
         searchPanel.refresh()
         editor.invalidateNoteRecordsCache()
         for win in noteWindows {
+            win.invalidatePinnedState()
             win.refreshNoteIfClean()
             win.editor.invalidateNoteRecordsCache()
         }
@@ -897,6 +915,77 @@ import CozyCore
         noteURL != nil || searchPanel.selectedNoteURL != nil || editor.hasContent
     }
 
+    var canPinNote: Bool {
+        if isQuickSwitcherVisible {
+            let row = quickSwitcher.selectedIndex >= 0 ? quickSwitcher.selectedIndex : 0
+            return quickSwitcher.hits.indices.contains(row) && quickSwitcher.hits[row].source.kind == .note
+        }
+        return noteURL != nil || searchPanel.selectedNoteURL != nil || editor.hasContent
+    }
+
+    var targetNoteIsPinned: Bool {
+        if isQuickSwitcherVisible {
+            let row = quickSwitcher.selectedIndex >= 0 ? quickSwitcher.selectedIndex : 0
+            guard quickSwitcher.hits.indices.contains(row), quickSwitcher.hits[row].source.kind == .note else {
+                return false
+            }
+            return quickSwitcher.hits[row].source.isPinned
+        }
+        let targetURL = (searchPanel.isSidebarFocused ? searchPanel.selectedNoteURL : nil)
+            ?? noteURL
+            ?? searchPanel.selectedNoteURL
+        guard let targetURL else { return false }
+        if targetURL == noteURL, let cached = cachedNotePinned {
+            return cached
+        }
+        return vault.isPinned(targetURL)
+    }
+
+    @objc func togglePinCurrentNote() {
+        if isQuickSwitcherVisible {
+            _ = quickSwitcher.togglePinSelectedNote()
+            return
+        }
+        if noteURL == nil && editor.hasContent {
+            guard persistCurrent() else { return }
+        }
+        let targetURL = (searchPanel.isSidebarFocused ? searchPanel.selectedNoteURL : nil)
+            ?? noteURL
+            ?? searchPanel.selectedNoteURL
+        guard let targetURL else { return }
+        _ = togglePinNote(targetURL)
+    }
+
+    @discardableResult
+    func togglePinNote(_ url: URL) -> Bool {
+        togglePinNoteReturningPaths(url) != nil
+    }
+
+    @discardableResult
+    func togglePinNoteReturningPaths(_ url: URL) -> Set<String>? {
+        do {
+            let nowPinned = try vault.togglePinned(for: url)
+            if noteURL == url {
+                cachedNotePinned = nowPinned
+                editor.status.stringValue = nowPinned ? "Pinned to top" : "Unpinned"
+            } else {
+                cachedNotePinned = nil
+            }
+            updateEditorChrome()
+            for win in noteWindows {
+                win.invalidatePinnedState(statusIfMatching: url, nowPinned: nowPinned)
+                win.editor.invalidateNoteRecordsCache()
+            }
+            editor.invalidateNoteRecordsCache()
+            let paths = vault.pinnedRelativePaths()
+            searchPanel.applyPinnedPaths(paths)
+            return paths
+        } catch {
+            showError(error, in: window)
+            return nil
+        }
+    }
+
     @objc func openCurrentNoteInNewWindow() {
         if noteURL == nil && editor.hasContent {
             guard persistCurrent() else { return }
@@ -930,6 +1019,9 @@ import CozyCore
         }
         controller.onOpenWikiLinkInNewWindow = { [weak self] link in
             _ = self?.openWikiLinkInNewWindow(link)
+        }
+        controller.onTogglePinNote = { [weak self] targetURL in
+            _ = self?.togglePinNote(targetURL)
         }
         controller.onQuickSwitcher = { [weak self] in
             self?.showAndFocus()
@@ -1058,6 +1150,7 @@ import CozyCore
         let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted
         if outlineButton.tint != desiredOutlineTint { outlineButton.tint = desiredOutlineTint }
         let hideNoteActions = noteURL == nil
+        if pinButton.isHidden != hideNoteActions { pinButton.isHidden = hideNoteActions }
         if openInNewWindowButton.isHidden != hideNoteActions { openInNewWindowButton.isHidden = hideNoteActions }
         if revealButton.isHidden != hideNoteActions { revealButton.isHidden = hideNoteActions }
         if deleteButton.isHidden != hideNoteActions { deleteButton.isHidden = hideNoteActions }
@@ -1066,6 +1159,22 @@ import CozyCore
         let atmoBadge = Theme.atmosphere.shortBadge
         if atmosphereButton.title != atmoBadge { atmosphereButton.title = atmoBadge }
         if let noteURL {
+            let isPinned: Bool
+            if let cached = cachedNotePinned {
+                isPinned = cached
+            } else {
+                let resolved = vault.isPinned(noteURL)
+                cachedNotePinned = resolved
+                isPinned = resolved
+            }
+            let desiredPinSymbol = isPinned ? "pin.fill" : "pin"
+            if pinButton.symbolName != desiredPinSymbol {
+                pinButton.setSymbol(desiredPinSymbol)
+                pinButton.toolTip = isPinned ? "Unpin note (⇧⌘P)" : "Pin note to top (⇧⌘P)"
+                pinButton.setAccessibilityLabel(isPinned ? "Unpin note" : "Pin note")
+            }
+            let desiredPinTint = isPinned ? Theme.accent : Theme.muted
+            if pinButton.tint != desiredPinTint { pinButton.tint = desiredPinTint }
             let relPath = String(noteURL.path.dropFirst(vault.root.path.count + 1))
             let stamp: String
             if let cached = cachedNoteStamp {
@@ -1216,6 +1325,7 @@ import CozyCore
                     }
                     guard snapshots.indices.contains(picker.indexOfSelectedItem) else { return }
                     try self.vault.restore(snapshotID: snapshots[picker.indexOfSelectedItem].id)
+                    self.cachedNotePinned = nil
                     if let activeURL = self.noteURL, let reloaded = try? self.vault.read(activeURL) {
                         self.noteBaseline = reloaded
                         self.noteDirty = false
@@ -1226,10 +1336,13 @@ import CozyCore
                         self.editor.text = reloaded
                         self.editor.linkedAttachments = self.vault.linkedAttachments(in: reloaded, relativeTo: activeURL)
                     }
+                    self.editor.invalidateNoteRecordsCache()
                     self.updateEditorChrome()
                     for win in self.noteWindows {
                         win.reloadAfterVaultRestore()
+                        win.editor.invalidateNoteRecordsCache()
                     }
+                    self.searchPanel.applyPinnedPaths(self.vault.pinnedRelativePaths())
                     self.searchPanel.refresh()
                     self.editor.focus()
                 } catch { showError(error, in: self.window) }
@@ -1275,6 +1388,7 @@ import CozyCore
     private let folioSurface = FolioPageSurface()
     private let sealDot = PaperSurface(cornerRadius: 3.5, color: Theme.sage, bordered: false)
     private let contextLabel = Theme.label("", size: 10.5, color: Theme.muted)
+    let pinButton = QuietButton(symbol: "pin", target: nil, action: nil)
     let outlineButton = QuietButton(symbol: "list.bullet.indent", target: nil, action: nil)
     let focusInWorkspaceButton = QuietButton(symbol: "sidebar.left", target: nil, action: nil)
     let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
@@ -1292,7 +1406,10 @@ import CozyCore
     private var bannerHeightConstraint: NSLayoutConstraint?
     private(set) var noteURL: URL? {
         didSet {
-            if noteURL != oldValue { cachedNoteStamp = nil }
+            if noteURL != oldValue {
+                cachedNoteStamp = nil
+                cachedNotePinned = nil
+            }
         }
     }
     private var noteBaseline = "" {
@@ -1308,6 +1425,7 @@ import CozyCore
     private var noteBaselineUTF16Length = 0
     private var noteBaselineSig = 0
     private var cachedNoteStamp: String?
+    private var cachedNotePinned: Bool?
     private(set) var noteDirty = false
     private(set) var noteConflicted = false
     private(set) var hasExternalDiskChange = false
@@ -1319,6 +1437,7 @@ import CozyCore
     var onDidSaveNote: ((URL, String) -> Void)?
     var onOpenInMainWorkspace: ((URL) -> Void)?
     var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
+    var onTogglePinNote: ((URL) -> Void)?
     var onQuickSwitcher: (() -> Void)?
     var onRequestDeleteNote: ((URL, NSWindow?) -> Void)?
     var onWillClose: ((NoteWindowController) -> Void)?
@@ -1367,6 +1486,11 @@ import CozyCore
         contextLabel.lineBreakMode = .byTruncatingMiddle
         contextLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        pinButton.target = self
+        pinButton.action = #selector(togglePinCurrentNote)
+        pinButton.toolTip = "Pin note to top (⇧⌘P)"
+        pinButton.setAccessibilityLabel("Pin note")
+
         outlineButton.target = self
         outlineButton.action = #selector(toggleOutline)
         outlineButton.toolTip = "Toggle Document Outline (⌥⌘\\)"
@@ -1399,7 +1523,7 @@ import CozyCore
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let editorHeader = Theme.stack([sealDot, contextLabel, spacer, conflictSaveButton, outlineButton, focusInWorkspaceButton, revealButton, deleteButton], spacing: 6)
+        let editorHeader = Theme.stack([sealDot, contextLabel, spacer, conflictSaveButton, pinButton, outlineButton, focusInWorkspaceButton, revealButton, deleteButton], spacing: 6)
 
         for view in [editorHeader, headerRule, reviewBanner, editor] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -1458,8 +1582,44 @@ import CozyCore
         editor.currentNoteURLProvider = { [weak self] in self?.noteURL }
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
+        editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
         editor.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
         editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
+    }
+
+    var isCurrentNotePinned: Bool {
+        guard let noteURL else { return false }
+        if let cached = cachedNotePinned { return cached }
+        let pinned = vault.isPinned(noteURL)
+        cachedNotePinned = pinned
+        return pinned
+    }
+
+    @objc func togglePinCurrentNote() {
+        guard let noteURL else { return }
+        if let onTogglePinNote {
+            onTogglePinNote(noteURL)
+        } else {
+            do {
+                let nowPinned = try vault.togglePinned(for: noteURL)
+                cachedNotePinned = nowPinned
+                editor.status.stringValue = nowPinned ? "Pinned to top" : "Unpinned"
+                editor.invalidateNoteRecordsCache()
+                updateEditorChrome()
+            } catch {
+                showError(error, in: window)
+            }
+        }
+    }
+
+    func invalidatePinnedState(statusIfMatching targetURL: URL? = nil, nowPinned: Bool? = nil) {
+        if let targetURL, noteURL == targetURL, let nowPinned {
+            cachedNotePinned = nowPinned
+            editor.status.stringValue = nowPinned ? "Pinned to top" : "Unpinned"
+        } else {
+            cachedNotePinned = nil
+        }
+        updateEditorChrome()
     }
 
     @objc func toggleOutline() {
@@ -1793,6 +1953,7 @@ import CozyCore
         pendingExternalDiskText = nil
         noteAvailable = true
         cachedNoteStamp = nil
+        cachedNotePinned = nil
         editor.text = reloaded
         editor.linkedAttachments = vault.linkedAttachments(in: reloaded, relativeTo: activeURL)
         updateEditorChrome()
@@ -1824,10 +1985,27 @@ import CozyCore
         let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted
         if outlineButton.tint != desiredOutlineTint { outlineButton.tint = desiredOutlineTint }
         let hideNoteActions = noteURL == nil
+        if pinButton.isHidden != hideNoteActions { pinButton.isHidden = hideNoteActions }
         if focusInWorkspaceButton.isHidden != hideNoteActions { focusInWorkspaceButton.isHidden = hideNoteActions }
         if revealButton.isHidden != hideNoteActions { revealButton.isHidden = hideNoteActions }
         if deleteButton.isHidden != hideNoteActions { deleteButton.isHidden = hideNoteActions }
         if let noteURL {
+            let isPinned: Bool
+            if let cached = cachedNotePinned {
+                isPinned = cached
+            } else {
+                let resolved = vault.isPinned(noteURL)
+                cachedNotePinned = resolved
+                isPinned = resolved
+            }
+            let desiredPinSymbol = isPinned ? "pin.fill" : "pin"
+            if pinButton.symbolName != desiredPinSymbol {
+                pinButton.setSymbol(desiredPinSymbol)
+                pinButton.toolTip = isPinned ? "Unpin note (⇧⌘P)" : "Pin note to top (⇧⌘P)"
+                pinButton.setAccessibilityLabel(isPinned ? "Unpin note" : "Pin note")
+            }
+            let desiredPinTint = isPinned ? Theme.accent : Theme.muted
+            if pinButton.tint != desiredPinTint { pinButton.tint = desiredPinTint }
             let relPath = String(noteURL.path.dropFirst(vault.root.path.count + 1))
             let stamp: String
             if let cached = cachedNoteStamp {

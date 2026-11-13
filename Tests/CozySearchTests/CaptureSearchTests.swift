@@ -189,6 +189,29 @@ final class CaptureSearchTests: XCTestCase {
         XCTAssertTrue(snapshot.search("SWIFT_SOURCE_ONLY").isEmpty)
         XCTAssertTrue(snapshot.search("Dependency").isEmpty)
     }
+
+    func testPinnedNotesSortFirstHidePinsManifestAndUpdateImmutably() throws {
+        let fixture = try Fixture(); defer { fixture.cleanup() }
+        let fm = FileManager.default
+        let older = try fixture.vault.capture(text: "# Older Note\nShared keyword alpha")
+        let newer = try fixture.vault.capture(text: "# Newer Note\nShared keyword beta")
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: older.url.path)
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_500)], ofItemAtPath: newer.url.path)
+
+        _ = try fixture.vault.setPinned(true, for: older.url)
+        let snapshot = try CaptureSearch(vault: fixture.vault).scan()
+
+        XCTAssertFalse(snapshot.sources.contains(where: { $0.relativePath == Vault.pinsFilename }))
+        XCTAssertEqual(snapshot.search("").map(\.source.title), ["Older Note", "Newer Note"])
+        XCTAssertEqual(snapshot.search("").map(\.source.isPinned), [true, false])
+        // Tie-break on identical lexical match score favors pinned note
+        XCTAssertEqual(snapshot.search("Shared keyword").map(\.source.title), ["Older Note", "Newer Note"])
+
+        let newerRelPath = String(newer.url.path.dropFirst(fixture.vault.root.path.count + 1))
+        let swapped = snapshot.updatingPinnedPaths([newerRelPath])
+        XCTAssertEqual(swapped.search("").map(\.source.title), ["Newer Note", "Older Note"])
+        XCTAssertEqual(swapped.search("").map(\.source.isPinned), [true, false])
+    }
 }
 
 #if canImport(Testing)
@@ -234,6 +257,11 @@ struct CaptureSearchSuite {
     @Test("Project repository search indexes only Markdown and managed folders")
     func projectRepositorySearchScoping() throws {
         try CaptureSearchTests().testProjectRepositorySearchIndexesOnlyMarkdownAndManagedFolders()
+    }
+
+    @Test("Pinned notes sort first, hide pins manifest, and update immutably")
+    func pinnedNotesSearchOrderingAndImmutableUpdate() throws {
+        try CaptureSearchTests().testPinnedNotesSortFirstHidePinsManifestAndUpdateImmutably()
     }
 }
 #endif

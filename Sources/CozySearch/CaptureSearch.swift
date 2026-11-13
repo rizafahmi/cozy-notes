@@ -16,6 +16,25 @@ public struct SearchSource: Sendable {
     public let kind: SearchSourceKind
     public let state: SearchReadiness
     public let detail: String
+    public let isPinned: Bool
+
+    public init(
+        url: URL,
+        relativePath: String,
+        title: String,
+        kind: SearchSourceKind,
+        state: SearchReadiness,
+        detail: String,
+        isPinned: Bool = false
+    ) {
+        self.url = url
+        self.relativePath = relativePath
+        self.title = title
+        self.kind = kind
+        self.state = state
+        self.detail = detail
+        self.isPinned = isPinned
+    }
 }
 
 public struct SearchHit: Sendable {
@@ -47,6 +66,25 @@ public struct SearchSnapshot: Sendable {
         self.sources = entries.map(\.source)
     }
 
+    public func updatingPinnedPaths(_ pinnedPaths: Set<String>) -> SearchSnapshot {
+        SearchSnapshot(entries: entries.map { item in
+            let shouldPin = item.source.kind == .note && pinnedPaths.contains(item.source.relativePath)
+            guard item.source.isPinned != shouldPin else { return item }
+            return SearchEntry(
+                source: SearchSource(
+                    url: item.source.url,
+                    relativePath: item.source.relativePath,
+                    title: item.source.title,
+                    kind: item.source.kind,
+                    state: item.source.state,
+                    detail: item.source.detail,
+                    isPinned: shouldPin
+                ),
+                pages: item.pages
+            )
+        })
+    }
+
     public func search(_ query: String) -> [SearchHit] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let terms = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
@@ -57,6 +95,15 @@ public struct SearchSnapshot: Sendable {
                 let page = entry.pages.first
                 let snippet = Self.snippet(page?.text ?? entry.source.detail, terms: [])
                 hits.append(SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page?.number))
+            }
+            if hits.contains(where: \.source.isPinned) {
+                var pinnedHits: [SearchHit] = []
+                var unpinnedHits: [SearchHit] = []
+                for hit in hits {
+                    if hit.source.isPinned { pinnedHits.append(hit) }
+                    else { unpinnedHits.append(hit) }
+                }
+                return pinnedHits + unpinnedHits
             }
             return hits
         }
@@ -80,6 +127,7 @@ public struct SearchSnapshot: Sendable {
         }
         scored.sort { a, b in
             if a.score != b.score { return a.score > b.score }
+            if a.hit.source.isPinned != b.hit.source.isPinned { return a.hit.source.isPinned && !b.hit.source.isPinned }
             return a.order < b.order
         }
         return scored.map(\.hit)
@@ -194,6 +242,7 @@ public final class CaptureSearch: @unchecked Sendable {
 
     private func scanLocked() throws -> SearchSnapshot {
         let files = try vault.sourceFiles()
+        let pinnedPaths = vault.pinnedRelativePaths()
         let paths = Set(files.map(\.path))
         cache = cache.filter { paths.contains($0.key) }
         companionCache = companionCache.filter { paths.contains($0.key) }
@@ -203,6 +252,7 @@ public final class CaptureSearch: @unchecked Sendable {
             if Vault.isExtractedCompanion(url, root: vault.root) { continue }
             let relative = relativePath(url)
             let kind = sourceKind(url)
+            let isPinned = kind == .note && pinnedPaths.contains(relative)
             if kind == .unsupported {
                 entries.append(entry(url, kind: kind, state: .unsupported, detail: "Content extraction is not supported for this format. Filename search is available."))
                 continue
@@ -211,9 +261,9 @@ public final class CaptureSearch: @unchecked Sendable {
                 let bytes = try fingerprint(url, keepText: kind == .note || kind == .text)
                 if kind == .note || kind == .text {
                     if let text = bytes.text {
-                        entries.append(entry(url, kind: kind, state: .ready, detail: "UTF-8 original", pages: [SearchPage(number: nil, text: text)]))
+                        entries.append(entry(url, kind: kind, state: .ready, detail: "UTF-8 original", pages: [SearchPage(number: nil, text: text)], isPinned: isPinned))
                     } else {
-                        entries.append(entry(url, kind: kind, state: .unreadable, detail: "Not valid UTF-8. Save a UTF-8 text copy to search its contents."))
+                        entries.append(entry(url, kind: kind, state: .unreadable, detail: "Not valid UTF-8. Save a UTF-8 text copy to search its contents.", isPinned: isPinned))
                     }
                 } else {
                     let companionURL = companionURL(for: relative)
@@ -234,7 +284,7 @@ public final class CaptureSearch: @unchecked Sendable {
                     }
                 }
             } catch {
-                entries.append(entry(url, kind: kind, state: .unreadable, detail: error.localizedDescription))
+                entries.append(entry(url, kind: kind, state: .unreadable, detail: error.localizedDescription, isPinned: isPinned))
             }
         }
         return SearchSnapshot(entries: entries)
@@ -281,7 +331,7 @@ public final class CaptureSearch: @unchecked Sendable {
         })
     }
 
-    private func entry(_ url: URL, kind: SearchSourceKind, state: SearchReadiness, detail: String, pages: [SearchPage] = []) -> SearchEntry {
+    private func entry(_ url: URL, kind: SearchSourceKind, state: SearchReadiness, detail: String, pages: [SearchPage] = [], isPinned: Bool = false) -> SearchEntry {
         var title = url.deletingPathExtension().lastPathComponent
         if kind == .note, let text = pages.first?.text {
             text.enumerateLines { line, stop in
@@ -290,7 +340,7 @@ public final class CaptureSearch: @unchecked Sendable {
                 stop = true
             }
         }
-        return SearchEntry(source: SearchSource(url: url, relativePath: relativePath(url), title: title, kind: kind, state: state, detail: detail), pages: pages)
+        return SearchEntry(source: SearchSource(url: url, relativePath: relativePath(url), title: title, kind: kind, state: state, detail: detail, isPinned: isPinned), pages: pages)
     }
 
     private func relativePath(_ url: URL) -> String { String(url.path.dropFirst(vault.root.path.count + 1)) }

@@ -8,6 +8,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     var onOpenNote: ((URL) -> Void)?
     var onOpenNoteInNewWindow: ((URL) -> Void)?
+    var onTogglePinNote: ((URL) -> Void)?
     var onNewNote: (() -> Void)?
     var onDeleteNote: ((URL) -> Void)?
     var onToggleSidebar: (() -> Void)?
@@ -26,6 +27,8 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         guard hits.indices.contains(row), hits[row].source.kind == .note else { return nil }
         return hits[row].source.url
     }
+    var isSidebarFocused: Bool { window?.firstResponder === table }
+    var visibleHits: [SearchHit] { hits }
 
     private let vault: Vault
     private let engine: CaptureSearch
@@ -149,6 +152,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.doubleAction = #selector(openSelected)
         table.onReturn = { [weak self] in self?.openSelected() }
         table.onOptionReturn = { [weak self] in self?.openSelectedInNewWindow() }
+        table.onTogglePin = { [weak self] in self?.togglePinSelectedNote() }
         table.onDelete = { [weak self] in self?.deleteSelectedNote() }
         table.onMenuForRow = { [weak self] row in self?.contextMenuForRow(row) }
         let scroll = NSScrollView()
@@ -247,6 +251,16 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         updateOpenButtonVisibility()
     }
 
+    func applyPinnedPaths(_ pinnedPaths: Set<String>) {
+        guard !closed else { return }
+        if let current = snapshot {
+            snapshot = current.updatingPinnedPaths(pinnedPaths)
+            render()
+        } else {
+            refresh()
+        }
+    }
+
     func refresh() {
         guard !closed else { return }
         refreshRequested = true
@@ -270,6 +284,8 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         scheduledRefresh = nil
         generation += 1
         onOpenNote = nil
+        onOpenNoteInNewWindow = nil
+        onTogglePinNote = nil
         onNewNote = nil
         onDeleteNote = nil
         onToggleSidebar = nil
@@ -431,6 +447,9 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let previousOffset = table.enclosingScrollView?.contentView.bounds.origin ?? .zero
         hits = snapshot?.search("") ?? []
         hits.sort {
+            if $0.source.isPinned != $1.source.isPinned {
+                return $0.source.isPinned && !$1.source.isPinned
+            }
             let left = stamps[$0.source.url]?.modified ?? .distantPast
             let right = stamps[$1.source.url]?.modified ?? .distantPast
             return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
@@ -461,7 +480,9 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         if !busy, let snapshot {
             let count = hits.count
             let noun = count == 1 ? "ENTRY" : "ENTRIES"
+            let pinnedCount = hits.reduce(0) { $0 + ($1.source.isPinned ? 1 : 0) }
             var summary = "\(count) \(noun)"
+            if pinnedCount > 0 { summary += " · \(pinnedCount) PINNED" }
             if snapshot.pendingCount > 0 { summary += " · \(snapshot.pendingCount) PENDING" }
             if snapshot.issueCount > 0 { summary += " · \(snapshot.issueCount) ISSUE" }
             setStatus(summary)
@@ -499,7 +520,12 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     func numberOfRows(in tableView: NSTableView) -> Int { hits.count }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        SearchHitRow()
+        let rowView = SearchHitRow()
+        rowView.isLastPinnedBeforeUnpinned = hits.indices.contains(row)
+            && hits[row].source.isPinned
+            && row + 1 < hits.count
+            && !hits[row + 1].source.isPinned
+        return rowView
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -508,6 +534,11 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let cell = (tableView.makeView(withIdentifier: id, owner: self) as? SearchHitCell) ?? SearchHitCell(frame: .zero)
         cell.identifier = id
         let hit = hits[row]
+        let noteURL = hit.source.url
+        cell.onTogglePin = hit.source.kind == .note ? { [weak self] in
+            guard let self, !self.closed, !self.busy else { return }
+            self.onTogglePinNote?(noteURL)
+        } : nil
         cell.show(hit, modifiedAt: stamps[hit.source.url]?.modified)
         return cell
     }
@@ -553,6 +584,11 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         activateHit(hits[row], allowExternalViewer: false, inNewWindow: true)
     }
 
+    @objc func togglePinSelectedNote() {
+        guard !closed, !busy, let url = selectedNoteURL else { return }
+        onTogglePinNote?(url)
+    }
+
     @objc func deleteSelectedNote() {
         guard !closed, !busy, let url = selectedNoteURL else { return }
         onDeleteNote?(url)
@@ -579,6 +615,15 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             openNewWindowItem.target = self
             openNewWindowItem.representedObject = row
             menu.addItem(openNewWindowItem)
+
+            let pinItem = NSMenuItem(
+                title: hit.source.isPinned ? "Unpin Note" : "Pin Note",
+                action: #selector(togglePinRowFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            pinItem.target = self
+            pinItem.representedObject = hit.source.url
+            menu.addItem(pinItem)
         }
 
         let revealItem = NSMenuItem(
@@ -618,6 +663,11 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     @objc private func revealRowFromMenu(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func togglePinRowFromMenu(_ sender: NSMenuItem) {
+        guard !closed, !busy, let url = sender.representedObject as? URL else { return }
+        onTogglePinNote?(url)
     }
 
     @objc private func deleteRowFromMenu(_ sender: NSMenuItem) {
@@ -698,14 +748,25 @@ private struct SearchFileStamp: Equatable {
 
 @MainActor
 private final class SearchHitRow: NSTableRowView {
+    var isLastPinnedBeforeUnpinned = false {
+        didSet {
+            if isLastPinnedBeforeUnpinned != oldValue { needsDisplay = true }
+        }
+    }
+
     override var isEmphasized: Bool {
         get { false }
         set {}
     }
 
     override func drawBackground(in dirtyRect: NSRect) {
-        Theme.border.withAlphaComponent(0.55).setFill()
-        NSRect(x: 18, y: bounds.maxY - 1, width: max(0, bounds.width - 30), height: 1).fill()
+        if isLastPinnedBeforeUnpinned {
+            Theme.accent.withAlphaComponent(0.32).setFill()
+            NSRect(x: 14, y: bounds.maxY - 1, width: max(0, bounds.width - 24), height: 1).fill()
+        } else {
+            Theme.border.withAlphaComponent(0.55).setFill()
+            NSRect(x: 18, y: bounds.maxY - 1, width: max(0, bounds.width - 30), height: 1).fill()
+        }
     }
 
     override func drawSelection(in dirtyRect: NSRect) {
@@ -733,8 +794,20 @@ private final class SearchHitRow: NSTableRowView {
 private final class SearchResultsTable: NSTableView {
     var onReturn: (() -> Void)?
     var onOptionReturn: (() -> Void)?
+    var onTogglePin: (() -> Void)?
     var onDelete: (() -> Void)?
     var onMenuForRow: ((Int) -> NSMenu?)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.type == .keyDown {
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let key = event.charactersIgnoringModifiers?.lowercased()
+            if flags == [.command, .shift], key == "p", window?.firstResponder === self {
+                onTogglePin?()
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if event.keyCode == 36 || event.keyCode == 76 {
@@ -758,12 +831,31 @@ private final class SearchResultsTable: NSTableView {
 }
 
 @MainActor
+private final class RowPinButton: NSButton {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01 else { return nil }
+        return super.hitTest(point)
+    }
+}
+
+@MainActor
 private final class SearchHitCell: NSTableCellView {
+    var onTogglePin: (() -> Void)?
     private let title = Theme.label("", size: 14, color: Theme.ink)
     private let badge = Theme.label("", size: 10, color: Theme.muted)
     private let snippet = Theme.label("", size: 12, color: Theme.muted)
     private let icon = NSImageView()
+    private let pinButton = RowPinButton()
     private let titleRow = NSStackView()
+    private var hoverTracking: NSTrackingArea?
+    private var isRowHovered = false
+    private var isNoteItem = false
+    private var isItemPinned = false
+
+    private static let pinnedSymbolImage: NSImage? = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: nil)?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
+    private static let unpinnedSymbolImage: NSImage? = NSImage(systemSymbolName: "pin", accessibilityDescription: nil)?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .medium))
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -795,12 +887,24 @@ private final class SearchHitCell: NSTableCellView {
         icon.widthAnchor.constraint(equalToConstant: 13).isActive = true
         icon.heightAnchor.constraint(equalToConstant: 13).isActive = true
 
+        pinButton.isBordered = false
+        pinButton.bezelStyle = .inline
+        pinButton.imagePosition = .imageOnly
+        pinButton.imageScaling = .scaleProportionallyDown
+        pinButton.target = self
+        pinButton.action = #selector(pinTapped)
+        pinButton.isHidden = true
+        pinButton.setContentHuggingPriority(.required, for: .horizontal)
+        pinButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        pinButton.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        pinButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         titleRow.orientation = .horizontal
         titleRow.alignment = .centerY
-        titleRow.spacing = 5
-        for view in [icon, title, spacer, badge] { titleRow.addArrangedSubview(view) }
+        titleRow.spacing = 4
+        for view in [icon, title, spacer, pinButton, badge] { titleRow.addArrangedSubview(view) }
 
         snippet.lineBreakMode = .byTruncatingTail
         snippet.maximumNumberOfLines = 2
@@ -823,6 +927,68 @@ private final class SearchHitCell: NSTableCellView {
 
     required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking {
+            removeTrackingArea(hoverTracking)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        isRowHovered = false
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        isRowHovered = true
+        syncPinButtonAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        isRowHovered = false
+        syncPinButtonAppearance()
+    }
+
+    @objc private func pinTapped() {
+        onTogglePin?()
+    }
+
+    private func syncPinButtonAppearance() {
+        guard isNoteItem, onTogglePin != nil else {
+            pinButton.isHidden = !isItemPinned
+            if isItemPinned {
+                pinButton.image = Self.pinnedSymbolImage
+                pinButton.contentTintColor = Theme.accent
+                pinButton.alphaValue = 1
+            }
+            return
+        }
+        pinButton.isHidden = false
+        if isItemPinned {
+            pinButton.image = Self.pinnedSymbolImage
+            pinButton.contentTintColor = Theme.accent
+            pinButton.alphaValue = 1
+            pinButton.toolTip = "Unpin note (⇧⌘P)"
+            pinButton.setAccessibilityLabel("Unpin note")
+        } else {
+            pinButton.image = Self.unpinnedSymbolImage
+            pinButton.contentTintColor = Theme.muted
+            pinButton.alphaValue = isRowHovered ? 0.9 : 0
+            pinButton.toolTip = "Pin note to top (⇧⌘P)"
+            pinButton.setAccessibilityLabel("Pin note")
+        }
+    }
+
     func show(_ hit: SearchHit, modifiedAt: Date?) {
         let source = hit.source
         let kind: String
@@ -842,6 +1008,9 @@ private final class SearchHitCell: NSTableCellView {
             icon.isHidden = true
         }
         title.stringValue = source.title
+        isNoteItem = (source.kind == .note)
+        isItemPinned = source.isPinned
+        syncPinButtonAppearance()
 
         if let page = hit.page {
             badge.stringValue = "P.\(page)"
@@ -911,8 +1080,9 @@ private final class SearchHitCell: NSTableCellView {
             snippet.attributedStringValue = text
         }
 
+        let pinPrefix = source.isPinned ? "Pinned · " : ""
         let pageInfo = hit.page.map { " · Page \($0)" } ?? ""
-        let metaInfo = "\(kind)\(pageInfo) · \(source.state.rawValue.capitalized)\(source.detail.isEmpty ? "" : " — \(source.detail)")"
+        let metaInfo = "\(pinPrefix)\(kind)\(pageInfo) · \(source.state.rawValue.capitalized)\(source.detail.isEmpty ? "" : " — \(source.detail)")"
         toolTip = "\(title.stringValue)\n\(source.relativePath)\n\(metaInfo)\n\(hit.snippet)"
         setAccessibilityLabel(toolTip)
     }
@@ -937,6 +1107,7 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
     let searchField = NSSearchField()
     var onOpenNote: ((URL) -> Void)?
     var onOpenNoteInNewWindow: ((URL) -> Void)?
+    var onTogglePinNote: ((URL) -> Set<String>?)?
     var onOpenExternal: ((URL) -> Void)?
     var onDismiss: (() -> Void)?
     var onShowSidebarSearch: (() -> Void)?
@@ -1047,7 +1218,7 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
             emptyLabel.centerYAnchor.constraint(equalTo: resultsContainer.centerYAnchor)
         ])
 
-        let hintLabel = Theme.label("↑↓ navigate  ·  ↵ open  ·  ⌥↵ new window  ·  esc dismiss", size: 10, color: Theme.subtle)
+        let hintLabel = Theme.label("↑↓ navigate  ·  ↵ open  ·  ⌥↵ new window  ·  ⇧⌘P pin  ·  esc dismiss", size: 10, color: Theme.subtle)
         hintLabel.font = Theme.monoFont(10, weight: .medium)
         statusLabel.font = Theme.monoFont(10, weight: .semibold)
         statusLabel.setContentHuggingPriority(.required, for: .horizontal)
@@ -1185,6 +1356,8 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         } else if flags == [.command, .shift], key == "f" {
             dismiss()
             return true
+        } else if flags == [.command, .shift], key == "p" {
+            return togglePinSelectedNote()
         } else if flags == .option, (event.keyCode == 36 || event.keyCode == 76 || key == "\r" || key == "\n") {
             return confirmSelection(inNewWindow: true)
         }
@@ -1227,12 +1400,30 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         confirmSelection(at: row, inNewWindow: inNewWindow)
     }
 
-    private func updateResults() {
+    @discardableResult
+    func togglePinSelectedNote() -> Bool {
+        let row = table.selectedRow >= 0 ? table.selectedRow : 0
+        guard hits.indices.contains(row), hits[row].source.kind == .note else { return false }
+        return togglePin(for: hits[row].source.url)
+    }
+
+    @discardableResult
+    private func togglePin(for targetURL: URL) -> Bool {
+        guard let updatedPins = onTogglePinNote?(targetURL) else { return false }
+        snapshot = snapshot?.updatingPinnedPaths(updatedPins)
+        updateResults(preservingSelectedURL: targetURL)
+        return true
+    }
+
+    private func updateResults(preservingSelectedURL: URL? = nil) {
         let q = searchField.stringValue
         let browsing = q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         var nextHits = snapshot?.search(q) ?? []
         if browsing {
             nextHits.sort {
+                if $0.source.isPinned != $1.source.isPinned {
+                    return $0.source.isPinned && !$1.source.isPinned
+                }
                 let left = modifiedDates[$0.source.url] ?? .distantPast
                 let right = modifiedDates[$1.source.url] ?? .distantPast
                 return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
@@ -1241,8 +1432,11 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         hits = nextHits
         table.reloadData()
         if !hits.isEmpty {
-            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-            table.scrollRowToVisible(0)
+            let targetRow = preservingSelectedURL.flatMap { url in
+                hits.firstIndex(where: { $0.source.url == url })
+            } ?? 0
+            table.selectRowIndexes(IndexSet(integer: targetRow), byExtendingSelection: false)
+            table.scrollRowToVisible(targetRow)
         } else {
             table.deselectAll(nil)
         }
@@ -1264,7 +1458,12 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        SearchHitRow()
+        let rowView = SearchHitRow()
+        rowView.isLastPinnedBeforeUnpinned = hits.indices.contains(row)
+            && hits[row].source.isPinned
+            && row + 1 < hits.count
+            && !hits[row + 1].source.isPinned
+        return rowView
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -1273,6 +1472,10 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         let cell = (tableView.makeView(withIdentifier: id, owner: self) as? SearchHitCell) ?? SearchHitCell(frame: .zero)
         cell.identifier = id
         let hit = hits[row]
+        let noteURL = hit.source.url
+        cell.onTogglePin = hit.source.kind == .note ? { [weak self] in
+            _ = self?.togglePin(for: noteURL)
+        } : nil
         cell.show(hit, modifiedAt: modifiedDates[hit.source.url])
         return cell
     }

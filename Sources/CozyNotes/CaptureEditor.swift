@@ -87,6 +87,7 @@ import CozyCore
     var onOpenWikiLink: ((WikiLink) -> Void)?
     var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
     var onOpenCurrentNoteInNewWindow: (() -> Void)?
+    var onTogglePinCurrentNote: (() -> Void)?
     var onInsertWikiLinkShortcut: (() -> Void)?
     var onWikiAutocompleteCommand: ((Selector) -> Bool)?
     var onQuickSwitcher: (() -> Void)?
@@ -1012,6 +1013,11 @@ import CozyCore
             case "g":
                 onFindPreviousInNote?()
                 return true
+            case "p":
+                if let onTogglePinCurrentNote {
+                    onTogglePinCurrentNote()
+                    return true
+                }
             case "\r", "\n":
                 if let link = wikiLinkAtCursor() {
                     onOpenWikiLinkInNewWindow?(link)
@@ -3574,6 +3580,7 @@ import CozyCore
     var onOpenWikiLink: ((WikiLink) -> Void)?
     var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
     var onOpenCurrentNoteInNewWindow: (() -> Void)?
+    var onTogglePinCurrentNote: (() -> Void)?
     var onQuickSwitcher: (() -> Void)?
     var onOutlineVisibilityChange: ((Bool) -> Void)?
     var noteRecordsProvider: (() -> [NoteRecord])?
@@ -3700,6 +3707,7 @@ import CozyCore
         textView.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
         textView.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
         textView.onOpenCurrentNoteInNewWindow = { [weak self] in self?.onOpenCurrentNoteInNewWindow?() }
+        textView.onTogglePinCurrentNote = { [weak self] in self?.onTogglePinCurrentNote?() }
         textView.onInsertWikiLinkShortcut = { [weak self] in self?.handleInsertWikiLinkShortcut() }
         textView.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
         textView.onShowInNoteFind = { [weak self] in self?.showInNoteFind() }
@@ -4943,6 +4951,7 @@ import CozyCore
                 let aIsCurrent = (a.url == currentNoteURL)
                 let bIsCurrent = (b.url == currentNoteURL)
                 if aIsCurrent != bIsCurrent { return !aIsCurrent }
+                if a.isPinned != b.isPinned { return a.isPinned && !b.isPinned }
                 return a.modifiedAt > b.modifiedAt
             }
             for note in ordered.prefix(8) {

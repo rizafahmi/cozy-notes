@@ -196,6 +196,13 @@ import CozyCore
         }
         workspace?.openCurrentNoteInNewWindow()
     }
+    @objc private func togglePinNote() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            noteWin.togglePinCurrentNote()
+        } else {
+            workspace?.togglePinCurrentNote()
+        }
+    }
     @objc private func save() {
         if NSApp.keyWindow === quickCapture?.window {
             if let link = quickCapture?.editor.textView.wikiLinkAtCursor() {
@@ -312,6 +319,7 @@ import CozyCore
         add("New Note", action: #selector(newCapture), key: "n", to: file)
         add("Quick Capture", action: #selector(quick), key: " ", modifiers: [.command, .shift], to: file)
         add("Open in New Window", action: #selector(openInNewWindow), key: "o", modifiers: [.command, .option], to: file)
+        add("Pin Note", action: #selector(togglePinNote), key: "p", modifiers: [.command, .shift], to: file)
         add("Save Note", action: #selector(save), key: "s", to: file)
         add("Keep / Save", action: #selector(save), key: "\r", to: file)
         add("Delete Note…", action: #selector(deleteNote), key: "\u{08}", to: file)
@@ -416,6 +424,18 @@ import CozyCore
             }
             guard let workspace, NSApp.keyWindow === workspace.window || NSApp.keyWindow == nil else { return false }
             return workspace.canOpenInNewWindow
+        }
+        if menuItem.action == #selector(togglePinNote) {
+            if let noteWin = workspace?.activeNoteWindowController {
+                menuItem.title = noteWin.isCurrentNotePinned ? "Unpin Note" : "Pin Note"
+                return noteWin.noteURL != nil
+            }
+            guard let workspace, NSApp.keyWindow === workspace.window || NSApp.keyWindow == nil else {
+                menuItem.title = "Pin Note"
+                return false
+            }
+            menuItem.title = workspace.targetNoteIsPinned ? "Unpin Note" : "Pin Note"
+            return workspace.canPinNote
         }
         if menuItem.action == #selector(toggleVimMode) {
             menuItem.state = Theme.vimModeEnabled ? .on : .off
