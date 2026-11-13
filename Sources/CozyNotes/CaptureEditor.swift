@@ -2754,6 +2754,14 @@ import CozyCore
                 onNext?()
             }
             return true
+        case #selector(NSResponder.moveToEndOfDocument(_:)):
+            // Field editors treat the single-line query as the whole document; AppKit's
+            // moveToEndOfDocument is a no-op there, so route ⌘↓ to the line end.
+            textView.moveToEndOfLine(nil)
+            return true
+        case #selector(NSResponder.moveToBeginningOfDocument(_:)):
+            textView.moveToBeginningOfLine(nil)
+            return true
         case #selector(NSResponder.cancelOperation(_:)):
             onClose?()
             return true

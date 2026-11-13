@@ -1145,6 +1145,14 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
             table.selectRowIndexes(IndexSet(integer: prev), byExtendingSelection: false)
             table.scrollRowToVisible(prev)
             return true
+        case #selector(NSResponder.moveToEndOfDocument(_:)):
+            // Field editors treat the single-line query as the whole document; AppKit's
+            // moveToEndOfDocument is a no-op there, so route ⌘↓ to the line end.
+            textView.moveToEndOfLine(nil)
+            return true
+        case #selector(NSResponder.moveToBeginningOfDocument(_:)):
+            textView.moveToBeginningOfLine(nil)
+            return true
         case #selector(NSResponder.insertNewline(_:)),
              #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
             let inNewWindow = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.option) == true
