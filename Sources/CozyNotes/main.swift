@@ -415,6 +415,9 @@ import CozyCore
         item.keyEquivalentModifierMask = modifiers
     }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if NSApp.keyWindow?.sheetParent != nil {
+            return false
+        }
         if menuItem.action == #selector(deleteNote) {
             if let noteWin = workspace?.activeNoteWindowController {
                 return noteWin.noteURL != nil

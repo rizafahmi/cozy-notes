@@ -179,6 +179,8 @@ import CozyCore
     private var watcher: VaultWatcher?
     private(set) var noteWindows: [NoteWindowController] = []
     private(set) var activeMergeSheet: MergeNotesSheetController?
+    private(set) var activeDeleteAlert: NSAlert?
+    var deleteAlertMovesToTrash = true
     var activeNoteWindowController: NoteWindowController? {
         noteWindows.first { $0.window === NSApp.keyWindow }
     }
@@ -1221,8 +1223,10 @@ import CozyCore
         confirmAndDeleteNote(targetURL)
     }
 
-    func confirmAndDeleteNote(_ url: URL, in hostWindow: NSWindow? = nil) {
+    func confirmAndDeleteNote(_ url: URL, in hostWindow: NSWindow? = nil, moveToTrash: Bool? = nil) {
         let alertHost = hostWindow ?? window
+        let shouldMoveToTrash = moveToTrash ?? deleteAlertMovesToTrash
+        guard alertHost?.attachedSheet == nil else { return }
         guard !searchPanel.isExtracting else {
             showError(NSError(domain: "CozyNotes", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "Wait for extraction to finish or cancel it before deleting notes."
@@ -1237,14 +1241,53 @@ import CozyCore
         alert.informativeText = "This note and its attachments will be moved to the Trash. A recovery checkpoint is saved first so you can also restore it from Recovery."
         let trashBtn = alert.addButton(withTitle: "Move to Trash")
         trashBtn.hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
+        let cancelBtn = alert.addButton(withTitle: "Cancel")
         guard let alertHost else {
-            _ = performDeleteNote(url)
+            _ = performDeleteNote(url, moveToTrash: shouldMoveToTrash)
             return
         }
-        alert.beginSheetModal(for: alertHost) { [weak self] response in
-            guard let self, response == .alertFirstButtonReturn else { return }
-            _ = self.performDeleteNote(url)
+        activeDeleteAlert = alert
+        alert.beginSheetModal(for: alertHost) { [weak self, weak alert] response in
+            guard let self else { return }
+            if self.activeDeleteAlert === alert {
+                self.activeDeleteAlert = nil
+            }
+            guard response == .alertFirstButtonReturn else { return }
+            _ = self.performDeleteNote(url, moveToTrash: shouldMoveToTrash)
+        }
+        configureDeleteConfirmationAlert(alert, confirmButton: trashBtn, cancelButton: cancelBtn)
+    }
+
+    private func configureDeleteConfirmationAlert(
+        _ alert: NSAlert,
+        confirmButton: NSButton,
+        cancelButton: NSButton
+    ) {
+        let applyDefaultButtonState = { [weak alert, weak confirmButton, weak cancelButton] in
+            guard let alert, let confirmButton else { return }
+            confirmButton.keyEquivalent = "\r"
+            confirmButton.keyEquivalentModifierMask = []
+            cancelButton?.keyEquivalent = "\u{1B}"
+            cancelButton?.keyEquivalentModifierMask = []
+            alert.window.defaultButtonCell = confirmButton.cell as? NSButtonCell
+            alert.window.enableKeyEquivalentForDefaultButtonCell()
+            alert.window.initialFirstResponder = confirmButton
+            if alert.window.firstResponder == nil
+                || alert.window.firstResponder === alert.window
+                || alert.window.firstResponder === cancelButton {
+                _ = alert.window.makeFirstResponder(confirmButton)
+            }
+        }
+        applyDefaultButtonState()
+        if let contentView = alert.window.contentView,
+           !contentView.subviews.contains(where: { $0 is DeleteAlertShortcutView }) {
+            let shortcutView = DeleteAlertShortcutView(frame: .zero)
+            shortcutView.confirmButton = confirmButton
+            shortcutView.cancelButton = cancelButton
+            contentView.addSubview(shortcutView)
+        }
+        DispatchQueue.main.async {
+            applyDefaultButtonState()
         }
     }
 
@@ -1497,6 +1540,11 @@ import CozyCore
 
     func shutdown() {
         autosave?.invalidate()
+        if let alertWindow = activeDeleteAlert?.window {
+            alertWindow.sheetParent?.endSheet(alertWindow, returnCode: .alertSecondButtonReturn)
+            alertWindow.orderOut(nil)
+        }
+        activeDeleteAlert = nil
         activeMergeSheet?.dismissSheet()
         activeMergeSheet = nil
         for win in noteWindows {
@@ -2238,3 +2286,35 @@ import CozyCore
         onWillClose?(self)
     }
 }
+
+@MainActor
+private final class DeleteAlertShortcutView: NSView {
+    weak var confirmButton: NSButton?
+    weak var cancelButton: NSButton?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return super.performKeyEquivalent(with: event) }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if (event.keyCode == 36 || event.keyCode == 76) && (flags.isEmpty || flags == .command) {
+            if flags.isEmpty,
+               let cancelButton,
+               window?.firstResponder === cancelButton,
+               cancelButton.isEnabled {
+                cancelButton.performClick(nil)
+                return true
+            }
+            if let confirmButton, confirmButton.isEnabled {
+                confirmButton.performClick(nil)
+                return true
+            }
+        }
+        if event.keyCode == 53 && flags.isEmpty {
+            if let cancelButton, cancelButton.isEnabled {
+                cancelButton.performClick(nil)
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+

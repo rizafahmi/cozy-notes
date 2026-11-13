@@ -967,6 +967,12 @@ private final class SearchResultsTable: NSTableView {
                     return true
                 }
             }
+            if flags == .command, window?.firstResponder === self,
+               event.keyCode == 51 || event.keyCode == 117,
+               selectedRowIndexes.count == 1 {
+                onDelete?()
+                return true
+            }
         }
         return super.performKeyEquivalent(with: event)
     }

@@ -296,6 +296,7 @@ struct MobyDickWorkoutSuite {
 
         // Opening the note reveals deleteButton and enables note deletion
         workspace.openNote(note.url)
+        workspace.deleteAlertMovesToTrash = false
         #expect(workspace.noteURL == note.url)
         #expect(!workspace.deleteButton.isHidden)
         #expect(workspace.canDeleteNote)
@@ -303,8 +304,41 @@ struct MobyDickWorkoutSuite {
         let attachmentFolder = try #require(workspace.editor.linkedAttachments.first?.url.deletingLastPathComponent())
         #expect(FileManager.default.fileExists(atPath: attachmentFolder.path))
 
-        // Deleting the active note checkpoints history, removes note & attachment folder, and resets to blank New Folio
-        #expect(workspace.performDeleteNote(note.url, moveToTrash: false))
+        func sheetKeyEvent(_ chars: String, modifiers: NSEvent.ModifierFlags = [], keyCode: UInt16, in sheetWindow: NSWindow) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: modifiers,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: sheetWindow.windowNumber,
+                context: nil,
+                characters: chars,
+                charactersIgnoringModifiers: chars,
+                isARepeat: false,
+                keyCode: keyCode
+            ))
+        }
+
+        // 1. Triggering deleteCurrentNote() (⌘⌫) presents confirmation sheet; Escape cancels without deleting
+        workspace.deleteCurrentNote()
+        let firstAlert = try #require(workspace.activeDeleteAlert)
+        let firstConfirmBtn = try #require(firstAlert.buttons.first)
+        #expect(firstConfirmBtn.hasDestructiveAction)
+        #expect(firstConfirmBtn.keyEquivalent == "\r")
+        #expect(firstAlert.window.defaultButtonCell === firstConfirmBtn.cell)
+        #expect(firstAlert.window.firstResponder === firstConfirmBtn)
+        #expect(firstAlert.window.performKeyEquivalent(with: try sheetKeyEvent("\u{1B}", keyCode: 53, in: firstAlert.window)))
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        #expect(workspace.activeDeleteAlert == nil)
+        #expect(FileManager.default.fileExists(atPath: note.url.path))
+        #expect(workspace.noteURL == note.url)
+
+        // 2. Triggering deleteCurrentNote() (⌘⌫) and pressing Return (\r) on the sheet confirms deletion
+        workspace.deleteCurrentNote()
+        let secondAlert = try #require(workspace.activeDeleteAlert)
+        #expect(secondAlert.window.performKeyEquivalent(with: try sheetKeyEvent("\r", keyCode: 36, in: secondAlert.window)))
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        #expect(workspace.activeDeleteAlert == nil)
         #expect(!FileManager.default.fileExists(atPath: note.url.path))
         #expect(!FileManager.default.fileExists(atPath: attachmentFolder.path))
         #expect(workspace.noteURL == nil)
@@ -315,6 +349,17 @@ struct MobyDickWorkoutSuite {
         let snapshots = try vault.snapshots()
         #expect(snapshots.count == 1)
         #expect(snapshots[0].label == "Before deleting Disposable Note")
+
+        // 3. Triggering deleteCurrentNote() (⌘⌫) and pressing ⌘Return while holding Command also confirms deletion
+        let secondNote = try vault.capture(text: "# Second Disposable Note\nBody.")
+        workspace.openNote(secondNote.url)
+        workspace.deleteCurrentNote()
+        let thirdAlert = try #require(workspace.activeDeleteAlert)
+        #expect(thirdAlert.window.performKeyEquivalent(with: try sheetKeyEvent("\r", modifiers: .command, keyCode: 36, in: thirdAlert.window)))
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        #expect(workspace.activeDeleteAlert == nil)
+        #expect(!FileManager.default.fileExists(atPath: secondNote.url.path))
+        #expect(workspace.noteURL == nil)
     }
 
     @Test("Markdown formatting keyboard shortcuts toggle bold, italic, underline, strikethrough, inline code, code blocks, links, headings, quotes, and lists")
