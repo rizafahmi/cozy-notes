@@ -16,7 +16,53 @@ import CozyCore
     }
 }
 
-@MainActor final class MarkdownTextView: NSTextView, NSLayoutManagerDelegate {
+@MainActor private final class FoldTypesetter: NSATSTypesetter {
+    weak var textView: MarkdownTextView?
+
+    nonisolated override func layoutParagraph(at lineFragmentOrigin: UnsafeMutablePointer<NSPoint>) -> Int {
+        MainActor.assumeIsolated {
+            guard let textView, !textView.foldedSections.isEmpty,
+                  let container = currentTextContainer, let layoutManager else {
+                return super.layoutParagraph(at: lineFragmentOrigin)
+            }
+            let paragraph = NSUnionRange(paragraphCharacterRange, paragraphSeparatorCharacterRange)
+            guard paragraph.length > 0 else { return super.layoutParagraph(at: lineFragmentOrigin) }
+            let folds = textView.foldedSections
+            var lo = 0
+            var hi = folds.count
+            while lo < hi {
+                let mid = (lo + hi) >> 1
+                if NSMaxRange(folds[mid].foldedCharRange) <= paragraph.location {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            guard lo < folds.count else { return super.layoutParagraph(at: lineFragmentOrigin) }
+            let fold = folds[lo].foldedCharRange
+            guard paragraph.location >= fold.location, NSMaxRange(paragraph) <= NSMaxRange(fold) else {
+                return super.layoutParagraph(at: lineFragmentOrigin)
+            }
+            // Lay out the whole hidden remainder once, not one empty fragment per font or paragraph.
+            let hidden = NSRange(location: paragraph.location, length: NSMaxRange(fold) - paragraph.location)
+            layoutManager.ensureGlyphs(forCharacterRange: hidden)
+            let glyphs = layoutManager.glyphRange(forCharacterRange: hidden, actualCharacterRange: nil)
+            setParagraphGlyphRange(glyphs, separatorGlyphRange: NSRange(location: NSMaxRange(glyphs), length: 0))
+            beginParagraph()
+            beginLine(withGlyphAt: glyphs.location)
+            let rect = NSRect(origin: lineFragmentOrigin.pointee, size: NSSize(width: container.containerSize.width, height: 0))
+            layoutManager.setTextContainer(container, forGlyphRange: glyphs)
+            setLineFragmentRect(rect, forGlyphRange: glyphs, usedRect: NSRect(origin: rect.origin, size: .zero), baselineOffset: 0)
+            setLocation(.zero, withAdvancements: nil, forStartOfGlyphRange: glyphs)
+            endLine(withGlyphRange: glyphs)
+            endParagraph()
+            setNotShownAttribute(true, forGlyphRange: glyphs)
+            return NSMaxRange(glyphs)
+        }
+    }
+}
+
+@MainActor final class MarkdownTextView: NSTextView {
     private let editorUndoManager: UndoManager = {
         let um = CozyUndoManager()
         um.levelsOfUndo = 2
@@ -1119,91 +1165,6 @@ import CozyCore
         super.insertBacktab(sender)
     }
 
-    nonisolated func layoutManager(
-        _ layoutManager: NSLayoutManager,
-        shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
-        properties props: UnsafePointer<NSLayoutManager.GlyphProperty>,
-        characterIndexes charIndexes: UnsafePointer<Int>,
-        font aFont: NSFont,
-        forGlyphRange glyphRange: NSRange
-    ) -> Int {
-        MainActor.assumeIsolated {
-            guard !foldedSections.isEmpty, glyphRange.length > 0, let ns = textStorage?.mutableString else { return 0 }
-            let totalLen = ns.length
-            let firstChar = charIndexes[0]
-            let lastChar = charIndexes[glyphRange.length - 1]
-            let minChar = min(firstChar, lastChar)
-            let maxChar = max(firstChar, lastChar)
-
-            var lo = 0
-            var hi = foldedSections.count
-            while lo < hi {
-                let mid = (lo + hi) >> 1
-                if NSMaxRange(foldedSections[mid].foldedCharRange) <= minChar {
-                    lo = mid + 1
-                } else {
-                    hi = mid
-                }
-            }
-            guard lo < foldedSections.count,
-                  foldedSections[lo].foldedCharRange.location <= maxChar else {
-                return 0
-            }
-
-            let firstFold = foldedSections[lo].foldedCharRange
-            if minChar >= firstFold.location && maxChar < NSMaxRange(firstFold) {
-                var mutableProps = [NSLayoutManager.GlyphProperty](repeating: .null, count: glyphRange.length)
-                for i in 0..<glyphRange.length {
-                    let c = charIndexes[i]
-                    if c < totalLen && ns.character(at: c) > 0x20 {
-                        mutableProps[i] = .controlCharacter
-                        break
-                    }
-                }
-                layoutManager.setGlyphs(
-                    glyphs,
-                    properties: &mutableProps,
-                    characterIndexes: charIndexes,
-                    font: aFont,
-                    forGlyphRange: glyphRange
-                )
-                return glyphRange.length
-            }
-            var mutableProps = Array(UnsafeBufferPointer(start: props, count: glyphRange.length))
-            var didModify = false
-            var cursor = lo
-            let count = foldedSections.count
-            for i in 0..<glyphRange.length {
-                let c = charIndexes[i]
-                while cursor < count && NSMaxRange(foldedSections[cursor].foldedCharRange) <= c {
-                    cursor += 1
-                }
-                if cursor < count {
-                    let r = foldedSections[cursor].foldedCharRange
-                    if c >= r.location && c < NSMaxRange(r) {
-                        if c == r.location && c < totalLen && ns.character(at: c) > 0x20 {
-                            mutableProps[i] = .controlCharacter
-                        } else {
-                            mutableProps[i] = .null
-                        }
-                        didModify = true
-                    } else if c < r.location && cursor > lo && isCharacterFolded(c) {
-                        mutableProps[i] = .null
-                        didModify = true
-                    }
-                }
-            }
-            guard didModify else { return 0 }
-            layoutManager.setGlyphs(
-                glyphs,
-                properties: &mutableProps,
-                characterIndexes: charIndexes,
-                font: aFont,
-                forGlyphRange: glyphRange
-            )
-            return glyphRange.length
-        }
-    }
 
     func isCharacterFolded(_ charIndex: Int) -> Bool {
         guard !foldedSections.isEmpty else { return false }
@@ -1271,7 +1232,7 @@ import CozyCore
             }
             foldEnd = nextSameOrHigher ?? totalLen
         }
-        let foldStart = foldEnd == totalLen ? NSMaxRange(item.range) : NSMaxRange(headingLineRange)
+        let foldStart = NSMaxRange(headingLineRange)
         guard foldEnd > foldStart else { return nil }
         let foldedRange = NSRange(location: foldStart, length: foldEnd - foldStart)
         let sliceStart = min(NSMaxRange(headingLineRange), foldEnd)
@@ -1529,6 +1490,36 @@ import CozyCore
         }
     }
 
+    func refreshFoldLayoutAfterGeometryChange(visibleCharacterRange: NSRange?) {
+        guard !foldedSections.isEmpty, let lm = layoutManager, let tc = textContainer,
+              let ns = textStorage?.mutableString else { return }
+        let visible: NSRange
+        if let visibleCharacterRange {
+            visible = visibleCharacterRange
+        } else {
+            let rect = visibleRect.offsetBy(dx: -textContainerOrigin.x, dy: -textContainerOrigin.y)
+            lm.ensureLayout(forBoundingRect: rect, in: tc)
+            let glyphs = lm.glyphRange(forBoundingRectWithoutAdditionalLayout: rect, in: tc)
+            guard glyphs.length > 0 else { return }
+            visible = lm.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+        }
+        var start = ns.length
+        var end = 0
+        for fold in foldedSections {
+            if fold.headingLocation > NSMaxRange(visible) { break }
+            let foldEnd = NSMaxRange(fold.foldedCharRange)
+            guard foldEnd >= visible.location else { continue }
+            lm.invalidateLayout(forCharacterRange: fold.foldedCharRange, actualCharacterRange: nil)
+            start = min(start, fold.headingLocation)
+            let followingLineEnd = foldEnd < ns.length
+                ? NSMaxRange(ns.lineRange(for: NSRange(location: foldEnd, length: 0)))
+                : ns.length
+            end = max(end, followingLineEnd)
+        }
+        guard end > start else { return }
+        lm.ensureLayout(forCharacterRange: NSRange(location: start, length: end - start))
+    }
+
     private func invalidateFoldLayout(forChangedRanges ranges: [NSRange]) {
         guard let lm = layoutManager, let tc = textContainer, let storage = textStorage else { return }
         let totalLen = storage.length
@@ -1544,7 +1535,6 @@ import CozyCore
         }
         guard maxEnd > minStart else { return }
         let span = NSRange(location: minStart, length: maxEnd - minStart)
-        lm.invalidateGlyphs(forCharacterRange: span, changeInLength: 0, actualCharacterRange: nil)
         lm.invalidateLayout(forCharacterRange: span, actualCharacterRange: nil)
         if totalLen <= 65_536 {
             lm.ensureLayout(for: tc)
@@ -2085,6 +2075,7 @@ import CozyCore
 
     override func didChangeText() {
         let wasLarge = lastEditWasLarge
+        let editLocation = pendingEdit?.affectedRange.location
         lastEditWasLarge = false
         isEditingText = false
         super.didChangeText()
@@ -2095,7 +2086,16 @@ import CozyCore
         } else {
             updateCaret(animated: true)
             if !wasLarge && !suppressCaretUpdates {
-                ensureCaretVisible(animated: true, useTypewriterStep: true)
+                // Same-line edits must not recenter a caret already visible near a viewport edge.
+                let useTypewriterStep: Bool
+                if let editLocation, let ns = textStorage?.mutableString {
+                    let editLine = ns.lineRange(for: NSRange(location: min(editLocation, ns.length), length: 0))
+                    let caretLine = ns.lineRange(for: NSRange(location: min(selectedRange().location, ns.length), length: 0))
+                    useTypewriterStep = editLine.location != caretLine.location
+                } else {
+                    useTypewriterStep = true
+                }
+                ensureCaretVisible(animated: true, useTypewriterStep: useTypewriterStep)
             }
         }
     }
@@ -3240,7 +3240,9 @@ import CozyCore
         textView.drawsBackground = false
         textView.insertionPointColor = Theme.accent
         textView.delegate = self
-        textView.layoutManager?.delegate = textView
+        let typesetter = FoldTypesetter()
+        typesetter.textView = textView
+        textView.layoutManager?.typesetter = typesetter
         textView.registerForDraggedTypes([.fileURL])
         textView.onFiles = { [weak self] in self?.addAttachments($0) }
         textView.onClipboardImage = { [weak self] in self?.addClipboardImage($0) }
@@ -3373,6 +3375,15 @@ import CozyCore
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func layout() {
+        // Snapshot the viewport before changing geometry; estimated post-resize layout can contain gaps.
+        let visibleCharacters: NSRange?
+        if !textView.foldedSections.isEmpty, let lm = textView.layoutManager, let tc = textView.textContainer {
+            let rect = textView.visibleRect.offsetBy(dx: -textView.textContainerOrigin.x, dy: -textView.textContainerOrigin.y)
+            let glyphs = lm.glyphRange(forBoundingRectWithoutAdditionalLayout: rect, in: tc)
+            visibleCharacters = glyphs.length > 0 ? lm.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil) : nil
+        } else {
+            visibleCharacters = nil
+        }
         let available = max(bounds.width, 320)
         let minPad: CGFloat = compactLayout ? 22 : 40
         let maxMeasure: CGFloat = 640
@@ -3437,6 +3448,7 @@ import CozyCore
         }
         onHorizontalInsetChange?(insetX)
         if geometryChanged {
+            textView.refreshFoldLayoutAfterGeometryChange(visibleCharacterRange: visibleCharacters)
             textView.updateCaret(animated: false)
             textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             if isWikiAutocompleteVisible {

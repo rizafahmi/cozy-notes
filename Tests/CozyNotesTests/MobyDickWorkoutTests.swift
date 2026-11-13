@@ -511,6 +511,62 @@ struct MobyDickWorkoutSuite {
         #expect(editor.textView.bulletItems.first?.level == 0)
     }
 
+    @Test("Checking and unchecking tasks near viewport edges preserves the caret line, indentation, and scroll position", arguments: [false, true])
+    @MainActor
+    func checklistMarkerEditsPreserveViewport(includesCodeFence: Bool) throws {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 640, height: 420))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        defer { window.orderOut(nil) }
+
+        let prefix = includesCodeFence ? "```text\nExample\n```\n\n" : ""
+        editor.text = prefix + (1...40).map { "  - [ ] Task number \($0)" }.joined(separator: "\n")
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+
+        let textView = editor.textView
+        let scrollView = try #require(textView.enclosingScrollView)
+        let clipView = scrollView.contentView
+        let marker = editor.nsText.range(of: "[ ] Task number 20")
+        let stateRange = NSRange(location: marker.location + 1, length: 1)
+        let taskLine = editor.nsText.lineRange(for: marker)
+
+        for nearTop in [true, false] {
+            textView.setSelectedRange(stateRange)
+            let caretBefore = textView.currentCaretRect()
+            let originY = nearTop
+                ? caretBefore.minY - 12
+                : caretBefore.maxY - clipView.bounds.height + 18
+            clipView.setBoundsOrigin(NSPoint(x: 0, y: originY))
+            scrollView.reflectScrolledClipView(clipView)
+
+            for state in ["x", " ", "X", " "] {
+                textView.setSelectedRange(stateRange)
+                let savedOrigin = clipView.bounds.origin
+                let caretY = textView.currentCaretRect().minY - savedOrigin.y
+                textView.insertText(state, replacementRange: stateRange)
+                textView.completeScrollSpringImmediately()
+
+                #expect(editor.nsText.substring(with: NSRange(location: marker.location, length: 3)) == "[\(state)]")
+                #expect(textView.selectedRange() == NSRange(location: NSMaxRange(stateRange), length: 0))
+                #expect(editor.nsText.lineRange(for: textView.selectedRange()) == taskLine)
+                #expect(clipView.bounds.origin == savedOrigin, "Changing a visible checkbox must not scroll the viewport")
+                #expect(abs(textView.currentCaretRect().minY - clipView.bounds.origin.y - caretY) <= 0.5)
+                let task = try #require(textView.bulletItems.first { $0.lineRange.location == taskLine.location })
+                #expect(task.level == 1)
+                #expect(task.kind == .task(completed: state != " "))
+            }
+        }
+    }
+
     @Test("Typing, newlines, and arrow navigation below the fold automatically scroll the cursor up with ~30% breathing room")
     @MainActor
     func belowTheFoldAutoScroll() throws {
@@ -643,7 +699,9 @@ struct MobyDickWorkoutSuite {
         #expect(editor.text == markdown, "Folding must never alter underlying Markdown text")
 
         let partTwoFoldedY = yOfHeading(h1PartTwo)
-        #expect(partTwoFoldedY < partTwoUnfoldedY - 40, "Folding Part One must visually pull Part Two up directly beneath Part One")
+        let firstGlyphs = lm.glyphRange(forCharacterRange: h1PartOne.range, actualCharacterRange: nil)
+        let firstHeadingRect = lm.boundingRect(forGlyphRange: firstGlyphs, in: tc)
+        #expect(partTwoFoldedY - firstHeadingRect.maxY <= 40, "Folding must leave only normal heading spacing, not hidden body height")
 
         // Pressing Tab again on "# Part One" unfolds it
         textView.insertTab(nil)
@@ -683,6 +741,240 @@ struct MobyDickWorkoutSuite {
         #expect(textView.foldedSections.count == 1)
         textView.insertText("!", replacementRange: NSRange(location: NSMaxRange(currentSub.range), length: 0))
         #expect(textView.foldedSections.isEmpty, "Editing a folded heading automatically unfolds its section")
+    }
+
+    @Test("Folding mixed Markdown removes hidden layout height and preserves the next heading through resize, unfold, and outline cycles", arguments: [1, 160], ["\n", "\r\n"])
+    @MainActor
+    func foldedSectionsCollapseMixedContent(repetitions: Int, newline: String) throws {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 760, height: 520))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        defer { window.orderOut(nil) }
+
+        let block = """
+        ### Nested heading
+
+        Prose with **bold**, *italic*, __underline__, `inline code`, and [[Reference]].
+        A second paragraph keeps its own font and paragraph spacing before the next construct.
+
+        ```swift
+        let message = "Hidden code"
+        print(message)
+        ```
+
+        - [ ] Open task
+          - [x] Nested completed task
+
+        > Quoted text with a different font and indentation.
+
+        | Name | Description |
+        |------|-------------|
+        | Item | A table cell with `inline code` and enough text to exercise wrapping. |
+
+
+        """
+        let markdown = ("## First section\n\n" + String(repeating: block, count: repetitions)
+            + "## Next section\n\nVisible body.\n\n## Final section\n\n" + block)
+            .replacingOccurrences(of: "\n", with: newline)
+        editor.text = markdown
+        window.contentView?.layoutSubtreeIfNeeded()
+        let textView = editor.textView
+        let lm = try #require(textView.layoutManager)
+        let tc = try #require(textView.textContainer)
+        let storage = try #require(textView.textStorage)
+        let first = try #require(textView.headingGutterItems.first { $0.title == "First section" })
+        let next = try #require(textView.headingGutterItems.first { $0.title == "Next section" })
+        let final = try #require(textView.headingGutterItems.first { $0.title == "Final section" })
+        textView.setSelectedRange(NSRange(location: first.range.location + 3, length: 0))
+        lm.ensureLayout(for: tc)
+        window.displayIfNeeded()
+
+        func headingRect(_ heading: MarkdownTextView.HeadingGutter) -> NSRect {
+            lm.ensureLayout(forCharacterRange: heading.range)
+            let glyphs = lm.glyphRange(forCharacterRange: heading.range, actualCharacterRange: nil)
+            return lm.boundingRect(forGlyphRange: glyphs, in: tc)
+        }
+        let unfoldedNext = headingRect(next)
+        let firstParagraph = try #require(storage.attribute(.paragraphStyle, at: first.range.location, effectiveRange: nil) as? NSParagraphStyle)
+        let nextParagraph = try #require(storage.attribute(.paragraphStyle, at: next.range.location, effectiveRange: nil) as? NSParagraphStyle)
+        let normalSpacing = firstParagraph.paragraphSpacing + nextParagraph.paragraphSpacingBefore
+
+        func expectCompactFold() throws {
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            let firstRect = headingRect(first)
+            let nextRect = headingRect(next)
+            #expect(abs(nextRect.minY - firstRect.maxY - normalSpacing) <= 1)
+            #expect(abs(nextRect.minX - unfoldedNext.minX) <= 0.5)
+            #expect(abs(nextRect.height - unfoldedNext.height) <= 0.5)
+            #expect(textView.visibleRect.intersects(nextRect.offsetBy(dx: textView.textContainerOrigin.x, dy: textView.textContainerOrigin.y)), "The next header must be visible without scrolling through hidden content")
+            let fold = try #require(textView.foldedSection(forHeadingAt: first.range.location))
+            let glyphs = lm.glyphRange(forCharacterRange: fold.foldedCharRange, actualCharacterRange: nil)
+            lm.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, fragmentGlyphs, _ in
+                let characters = lm.characterRange(forGlyphRange: fragmentGlyphs, actualGlyphRange: nil)
+                if characters.location >= fold.foldedCharRange.location, NSMaxRange(characters) <= NSMaxRange(fold.foldedCharRange) {
+                    #expect(rect.height == 0, "Hidden paragraphs must occupy no vertical layout space")
+                }
+                for index in fragmentGlyphs.location..<NSMaxRange(fragmentGlyphs) {
+                    #expect(lm.notShownAttribute(forGlyphAt: index), "Folded text must not draw over the next visible section")
+                }
+            }
+            #expect(editor.text == markdown)
+        }
+
+        textView.toggleFold(forHeadingAt: first.range.location)
+        try expectCompactFold()
+        window.setContentSize(NSSize(width: 620, height: 520))
+        try expectCompactFold()
+        window.setContentSize(NSSize(width: 760, height: 520))
+        try expectCompactFold()
+
+        textView.toggleFold(forHeadingAt: first.range.location)
+        lm.ensureLayout(for: tc)
+        #expect(abs(headingRect(next).minY - unfoldedNext.minY) <= 1, "Unfolding must restore the original section layout")
+        textView.cycleOutlineFolding(nil)
+        try expectCompactFold()
+        let finalRect = headingRect(final)
+        #expect(lm.usedRect(for: tc).maxY - finalRect.maxY <= 40, "Folding the last section must not leave a blank document tail")
+        textView.cycleOutlineFolding(nil)
+        #expect(!textView.isCharacterFolded(textView.headingGutterItems[1].range.location), "Headings Only must retain nested headings")
+        for fold in textView.foldedSections {
+            let glyphs = lm.glyphRange(forCharacterRange: fold.foldedCharRange, actualCharacterRange: nil)
+            lm.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, fragmentGlyphs, _ in
+                let characters = lm.characterRange(forGlyphRange: fragmentGlyphs, actualGlyphRange: nil)
+                if characters.location >= fold.foldedCharRange.location, NSMaxRange(characters) <= NSMaxRange(fold.foldedCharRange) {
+                    #expect(rect.height == 0, "Headings Only must collapse body layout without hiding nested titles")
+                }
+            }
+        }
+        textView.cycleOutlineFolding(nil)
+        lm.ensureLayout(for: tc)
+        #expect(abs(headingRect(next).minY - unfoldedNext.minY) <= 1)
+        #expect(editor.text == markdown)
+    }
+
+    @Test("Gutter and outline folding stay compact after resizing with the caret outside the folded headings", arguments: [false, true], [false, true])
+    @MainActor
+    func foldedMouseControlsResizeWithCaretElsewhere(useOutline: Bool, caretBelow: Bool) throws {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 540),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let editor = CaptureEditor(frame: NSRect(x: 0, y: 0, width: 1120, height: 540))
+        window.contentView = editor
+        window.makeKeyAndOrderFront(nil)
+        #expect(window.makeFirstResponder(editor.textView))
+        defer { window.orderOut(nil) }
+        let block = """
+        Prose with **bold**, *italic*, and `inline code`.
+
+        ```swift
+        let message = "Hidden code"
+        print(message)
+        ```
+
+        - [ ] Open task
+          - [x] Nested completed task
+
+        > Quoted text with different indentation.
+
+        | Name | Description |
+        |------|-------------|
+        | Item | Hidden table cell |
+
+
+        """
+        let body = String(repeating: block, count: 40)
+        let markdown = "# Preface\n\nKeep writing above.\n\n## First fold\n\n" + body
+            + "## Second fold\n\n" + body + "## Next section\n\nKeep writing below."
+        editor.text = markdown
+        editor.setOutlineVisible(useOutline)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let textView = editor.textView
+        let lm = try #require(textView.layoutManager)
+        let tc = try #require(textView.textContainer)
+        let scrollView = try #require(textView.enclosingScrollView)
+        lm.ensureLayout(for: tc)
+        let first = try #require(textView.headingGutterItems.first { $0.title == "First fold" })
+        let second = try #require(textView.headingGutterItems.first { $0.title == "Second fold" })
+        let next = try #require(textView.headingGutterItems.first { $0.title == "Next section" })
+        let caretText = caretBelow ? "Keep writing below." : "Keep writing above."
+        let selection = NSRange(location: editor.nsText.range(of: caretText).location + 5, length: 0)
+        textView.setSelectedRange(selection)
+        scrollView.contentView.setBoundsOrigin(.zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+
+        func headingRect(_ heading: MarkdownTextView.HeadingGutter) -> NSRect {
+            lm.ensureLayout(forCharacterRange: heading.range)
+            return lm.boundingRect(forGlyphRange: lm.glyphRange(forCharacterRange: heading.range, actualCharacterRange: nil), in: tc)
+        }
+        func clickFold(_ heading: MarkdownTextView.HeadingGutter) throws {
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            textView.display()
+            let target: NSView
+            let point: NSPoint
+            if useOutline {
+                let outline = try #require(editor.subviews.compactMap { $0 as? DocumentOutlineView }.first)
+                let outlineScroll = try #require(outline.subviews.compactMap { $0 as? NSScrollView }.first)
+                target = try #require(outlineScroll.documentView)
+                let index = try #require(outline.items.firstIndex { $0.headingLocation == heading.range.location })
+                point = NSPoint(x: 16, y: 6 + CGFloat(index) * DocumentOutlineView.rowHeight + DocumentOutlineView.rowHeight / 2)
+            } else {
+                target = textView
+                let rect = headingRect(heading)
+                let origin = textView.textContainerOrigin
+                let badgeSize = ("▾ \(heading.label)" as NSString).size(withAttributes: [.font: Theme.monoFont(9.5, weight: .semibold)])
+                point = NSPoint(
+                    x: origin.x - 18 - badgeSize.width / 2,
+                    y: origin.y + rect.minY + max(0, (rect.height - badgeSize.height) / 2) - 2 + badgeSize.height / 2
+                )
+            }
+            let event = try #require(NSEvent.mouseEvent(
+                with: .leftMouseDown,
+                location: target.convert(point, to: nil),
+                modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber,
+                context: nil,
+                eventNumber: 0,
+                clickCount: 1,
+                pressure: 1
+            ))
+            target.mouseDown(with: event)
+            #expect(textView.foldedSection(forHeadingAt: heading.range.location) != nil)
+            #expect(textView.selectedRange() == selection, "Folding through mouse controls must preserve the caret elsewhere")
+        }
+
+        try clickFold(first)
+        try clickFold(second)
+        let firstParagraph = try #require(textView.textStorage?.attribute(.paragraphStyle, at: first.range.location, effectiveRange: nil) as? NSParagraphStyle)
+        let secondParagraph = try #require(textView.textStorage?.attribute(.paragraphStyle, at: second.range.location, effectiveRange: nil) as? NSParagraphStyle)
+        let nextParagraph = try #require(textView.textStorage?.attribute(.paragraphStyle, at: next.range.location, effectiveRange: nil) as? NSParagraphStyle)
+        for width: CGFloat in [1120, 620, 1120] {
+            window.setContentSize(NSSize(width: width, height: 540))
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            let firstRect = headingRect(first)
+            let secondRect = headingRect(second)
+            let nextRect = headingRect(next)
+            #expect(abs(secondRect.minY - firstRect.maxY - firstParagraph.paragraphSpacing - secondParagraph.paragraphSpacingBefore) <= 1)
+            #expect(abs(nextRect.minY - secondRect.maxY - secondParagraph.paragraphSpacing - nextParagraph.paragraphSpacingBefore) <= 1)
+            #expect(textView.visibleRect.intersects(nextRect.offsetBy(dx: textView.textContainerOrigin.x, dy: textView.textContainerOrigin.y)), "Visible mouse-folded spans must stay collapsed regardless of caret location")
+            #expect(textView.selectedRange() == selection)
+            #expect(editor.text == markdown)
+        }
     }
 
     @Test("Wiki-links highlight, trigger floating [[ autocomplete, and navigate or create notes on ⌘-Click and ⌥⌘Return")

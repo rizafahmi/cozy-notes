@@ -30,6 +30,8 @@ The workspace is designed as a tactile commonplace book: an index desk on the le
 Three curated atmospheres (**Obsidian & Ivory**, **Midnight Ink & Porcelain**, and **Neo-Acid & Plaster**) and five long-form writing voices (**Avenir Next + New York**, **Charter Book Serif**, **Iowan Old Style**, **SF Mono Typewriter**, and **Unbounded + Avenir Neo-Acid Display**) are built in. The editor uses a three-tier ink luminance hierarchy (luminous heading/bold ink, zero-halation body prose ink, and muted callout ink), element-specific paragraph rhythm (airy prose leading, grouped checklists with hanging indents, and compact code blocks), scholarly `H1`–`H3` left-gutter badges, custom-drawn blockquote ink bars, and monospace reading-time telemetry.
 
 - **Live continuous writing:** typing in the main editor writes and autosaves directly to the active note in place—your note never vanishes after saving, and there is no read-only lock on Markdown notes.
+- **Stable checklist edits:** checking or unchecking `- [ ]` / `- [x]` keeps a visible caret on the same row without recentering the viewport. Newlines and arrow navigation retain automatic scrolling.
+- **Heading folding:** click a heading's gutter badge or press **Tab** on the heading to collapse its section without leaving blank layout space. Code blocks, tables, lists, and blank paragraphs collapse together; resizing preserves the next heading's layout. **Shift–Tab** cycles Overview, Headings Only, and Show All.
 - **Command–N:** save any pending edits and start a fresh note in the editor.
 - **Command–\\:** toggle the index sidebar to enter or leave distraction-free Focus Mode.
 - **Command–Shift–Y (or click `Aa AVENIR` / `CHARTER` / `IOWAN` / `MONO` / `UNBOUNDED` in the folio header):** cycle through the five writing voices.
@@ -130,6 +132,10 @@ Temporary executable smoke runs exercised actual Vision OCR on English/Indonesia
 Focused-mode native smoke runs additionally exercised deferred Find loading, recent-source ordering, capture text/attachment/undo preservation across modes, read-only note opening and explicit editing, query/scroll restoration, external-edit conflict copies, unavailable/restored originals, background extraction while capturing, checkpoint recovery with an unsaved draft, lifecycle saves without duplicate captures, and both screens at the actual 760-point minimum width.
 
 Notebook-redesign smoke runs exercised light/dark Capture, Find, note reading, and quick capture; real OCR/PDF/text matches; attachment previews/removal/overflow scrolling; draft/undo preservation; autosave; and actual 760×540 workspace layouts. The accented action retained the native accessible button role and press action, committed one capture through that action, and preserved Command–Return activation in quick capture. This was not a full VoiceOver audit.
+
+Checkbox regression checks cover repeated checking/unchecking with lowercase and uppercase markers, nested items at both viewport edges, and notes with or without code fences. Native AppKit smoke verification confirmed the checkbox row stayed fixed after editing. The existing below-the-fold scrolling test and full Moby-Dick workout also passed.
+
+Heading-folding regressions cover mixed Markdown in small and large notes, LF/CRLF line endings, window resizing, unfolding, outline cycles, and the final section's document tail. Gutter and outline mouse-fold regressions resize two visible folded sections with the caret above or below them; refresh follows the viewport, not the caret. Native AppKit verification confirmed the next header stayed visible with normal spacing after both click paths and resizing. The full Moby-Dick workout passed its existing layout, typing, memory, and folding performance budgets.
 
 A separate smoke process denied all network access and still performed actual Indonesian screenshot OCR, selectable-PDF extraction, and search with the correct PDF page reference.
 
