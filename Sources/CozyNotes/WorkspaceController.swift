@@ -212,6 +212,8 @@ import CozyCore
         window.delegate = self
         buildUI()
         wireCallbacks()
+        editor.allowsVimMode = true
+        editor.syncVimModePreference()
         watcher = VaultWatcher(root: vault.root) { [weak self] in self?.refresh() }
         searchPanel.refresh()
         updateEditorChrome()
@@ -852,6 +854,7 @@ import CozyCore
             if created {
                 let end = editor.nsText.length
                 editor.textView.setSelectedRange(NSRange(location: end, length: 0))
+                editor.enterVimInsertMode()
                 editor.status.stringValue = "Created “\(record.title)”"
                 searchPanel.refresh()
             }
@@ -879,6 +882,7 @@ import CozyCore
             if created, let controller {
                 let end = controller.editor.nsText.length
                 controller.editor.textView.setSelectedRange(NSRange(location: end, length: 0))
+                controller.editor.enterVimInsertMode()
                 controller.editor.status.stringValue = "Created “\(record.title)”"
                 searchPanel.refresh()
             }
@@ -1242,6 +1246,13 @@ import CozyCore
         noteWindows.removeAll()
         searchPanel.shutdown()
     }
+
+    func syncVimModePreference() {
+        editor.syncVimModePreference()
+        for win in noteWindows {
+            win.syncVimModePreference()
+        }
+    }
     func windowDidBecomeKey(_ notification: Notification) {
         onDidBecomeActive?(self)
     }
@@ -1338,6 +1349,8 @@ import CozyCore
         window.delegate = self
         buildUI()
         wireCallbacks()
+        editor.allowsVimMode = true
+        editor.syncVimModePreference()
         updateEditorChrome()
     }
 
@@ -1454,6 +1467,10 @@ import CozyCore
         updateEditorChrome()
     }
 
+    func syncVimModePreference() {
+        editor.syncVimModePreference()
+    }
+
     private func syncFolioMargins(_ inset: CGFloat) {
         folioSurface.marginX = max(24, inset - 22)
         let lead = inset
@@ -1514,6 +1531,7 @@ import CozyCore
             if created {
                 let end = editor.nsText.length
                 editor.textView.setSelectedRange(NSRange(location: end, length: 0))
+                editor.enterVimInsertMode()
                 editor.status.stringValue = "Created “\(record.title)”"
                 onDidSaveNote?(record.url, editor.text)
             }

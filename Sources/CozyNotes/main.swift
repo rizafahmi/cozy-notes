@@ -264,6 +264,12 @@ import CozyCore
     @objc private func toggleAppearance() { workspace?.toggleAppearance(); workspace?.showWindow(nil) }
     @objc private func cycleAtmosphere() { workspace?.cycleAtmosphere(); workspace?.showWindow(nil) }
     @objc private func cycleVoice() { workspace?.cycleVoice(); workspace?.showWindow(nil) }
+    @objc func toggleVimMode() {
+        Theme.vimModeEnabled.toggle()
+        for ws in workspaces {
+            ws.syncVimModePreference()
+        }
+    }
     @objc private func zoomIn() { workspace?.increaseFontSize() }
     @objc private func zoomOut() { workspace?.decreaseFontSize() }
     @objc private func zoomReset() { workspace?.resetFontSize() }
@@ -373,6 +379,7 @@ import CozyCore
         add("Toggle Light / Dark Mode", action: #selector(toggleAppearance), key: "d", modifiers: [.command, .shift], to: view)
         add("Switch Atmosphere (Obsidian / Midnight / Neo-Acid)", action: #selector(cycleAtmosphere), key: "t", modifiers: [.command, .shift], to: view)
         add("Cycle Writing Font (Avenir / Charter / Iowan / Mono / Unbounded)", action: #selector(cycleVoice), key: "y", modifiers: [.command, .shift], to: view)
+        add("Vim Mode", action: #selector(toggleVimMode), key: "v", modifiers: [.command, .control], to: view)
         view.addItem(.separator())
         add("Bigger Text", action: #selector(zoomIn), key: "=", to: view)
         add("Smaller Text", action: #selector(zoomOut), key: "-", to: view)
@@ -409,6 +416,10 @@ import CozyCore
             }
             guard let workspace, NSApp.keyWindow === workspace.window || NSApp.keyWindow == nil else { return false }
             return workspace.canOpenInNewWindow
+        }
+        if menuItem.action == #selector(toggleVimMode) {
+            menuItem.state = Theme.vimModeEnabled ? .on : .off
+            return true
         }
         return true
     }
