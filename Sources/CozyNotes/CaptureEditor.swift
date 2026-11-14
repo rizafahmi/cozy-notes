@@ -5280,11 +5280,26 @@ import CozyCore
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
+    private static func isBlockSyntaxLead(_ ch: unichar) -> Bool {
+        ch == 0x23 || ch == 0x3E || ch == 0x2D || ch == 0x2A || ch == 0x2B || ch == 0x20 || ch == 0x09 || (ch >= 0x30 && ch <= 0x39)
+    }
+
     private func lineHasMarkdownSyntax(_ ns: NSString, lineRange: NSRange) -> Bool {
         guard lineRange.length > 0, NSMaxRange(lineRange) <= ns.length else { return false }
-        let c0 = ns.character(at: lineRange.location)
-        if c0 == 0x23 || c0 == 0x3E || c0 == 0x2D || c0 == 0x2A || c0 == 0x2B || c0 == 0x20 || c0 == 0x09 || (c0 >= 0x30 && c0 <= 0x39) {
+        let rangeEnd = NSMaxRange(lineRange)
+        if Self.isBlockSyntaxLead(ns.character(at: lineRange.location)) {
             return true
+        }
+        let firstLineEnd = NSMaxRange(ns.lineRange(for: NSRange(location: lineRange.location, length: 0)))
+        if firstLineEnd < rangeEnd {
+            var pos = firstLineEnd
+            while pos < rangeEnd {
+                if Self.isBlockSyntaxLead(ns.character(at: pos)) {
+                    return true
+                }
+                let nextEnd = NSMaxRange(ns.lineRange(for: NSRange(location: pos, length: 0)))
+                pos = max(pos + 1, nextEnd)
+            }
         }
         if ns.range(of: "*", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
@@ -5304,8 +5319,9 @@ import CozyCore
         let ns = storage.mutableString as NSString
         let newLen = ns.length
         let editLoc = min(edit.affectedRange.location, newLen)
-        let newEditedRange = NSRange(location: editLoc, length: min(edit.replacementLength, newLen - editLoc))
-        let newLineRange = ns.lineRange(for: newEditedRange)
+        let editEnd = min(newLen, editLoc + edit.replacementLength)
+        let spanEnd = editEnd < newLen ? editEnd + 1 : editEnd
+        let newLineRange = ns.lineRange(for: NSRange(location: editLoc, length: spanEnd - editLoc))
         let oldLineEnd = max(newLineRange.location, NSMaxRange(newLineRange) - edit.delta)
         let oldLineRange = NSRange(location: newLineRange.location, length: oldLineEnd - newLineRange.location)
         let delta = edit.delta
@@ -5379,7 +5395,7 @@ import CozyCore
         for item in textView.headingGutterItems {
             if NSMaxRange(item.range) <= oldLineRange.location && item.range.location < oldLineRange.location {
                 updatedHeadings.append(item)
-            } else if item.range.location >= oldEnd && oldEnd > oldLineRange.location {
+            } else if item.range.location >= oldEnd {
                 if !insertedHeadings {
                     updatedHeadings.append(contentsOf: newHeadings)
                     insertedHeadings = true
@@ -5400,7 +5416,7 @@ import CozyCore
         for r in textView.blockquoteRanges {
             if NSMaxRange(r) <= oldLineRange.location && r.location < oldLineRange.location {
                 updatedQuotes.append(r)
-            } else if r.location >= oldEnd && oldEnd > oldLineRange.location {
+            } else if r.location >= oldEnd {
                 if !insertedQuotes {
                     updatedQuotes.append(contentsOf: newQuotes)
                     insertedQuotes = true
@@ -5416,7 +5432,7 @@ import CozyCore
         for r in textView.inlineCodeRanges {
             if NSMaxRange(r) <= oldLineRange.location && r.location < oldLineRange.location {
                 updatedCodes.append(r)
-            } else if r.location >= oldEnd && oldEnd > oldLineRange.location {
+            } else if r.location >= oldEnd {
                 if !insertedCodes {
                     updatedCodes.append(contentsOf: newCodes)
                     insertedCodes = true
@@ -5432,7 +5448,7 @@ import CozyCore
         for item in textView.wikiLinkItems {
             if NSMaxRange(item.fullRange) <= oldLineRange.location && item.fullRange.location < oldLineRange.location {
                 updatedWikiLinks.append(item)
-            } else if item.fullRange.location >= oldEnd && oldEnd > oldLineRange.location {
+            } else if item.fullRange.location >= oldEnd {
                 if !insertedWikiLinks {
                     updatedWikiLinks.append(contentsOf: newWikiLinks)
                     insertedWikiLinks = true
@@ -5448,7 +5464,7 @@ import CozyCore
         for item in textView.bulletItems {
             if NSMaxRange(item.lineRange) <= oldLineRange.location && item.lineRange.location < oldLineRange.location {
                 updatedBullets.append(item)
-            } else if item.lineRange.location >= oldEnd && oldEnd > oldLineRange.location {
+            } else if item.lineRange.location >= oldEnd {
                 if !insertedBullets {
                     updatedBullets.append(contentsOf: newBullets)
                     insertedBullets = true
