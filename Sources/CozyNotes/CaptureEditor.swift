@@ -156,6 +156,7 @@ import CozyCore
     }
 
     var blockquoteRanges: [NSRange] = []
+    var horizontalRuleRanges: [NSRange] = []
     var fencedBlocks: [FencedBlock] = []
     var tableBlocks: [TableBlock] = []
     var inlineCodeRanges: [NSRange] = []
@@ -267,7 +268,7 @@ import CozyCore
         if queryRect.width > 0 && queryRect.height > 0 {
             layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
         }
-        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
+        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !horizontalRuleRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         let columnWidth = max(0, bounds.width - 2 * origin.x)
 
         let visibleGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: queryRect, in: textContainer)
@@ -516,6 +517,62 @@ import CozyCore
             )
             Theme.accent.setFill()
             bar.fill()
+        }
+
+        if !horizontalRuleRanges.isEmpty {
+            let ruleColor = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+                ? Theme.muted
+                : Theme.codeBorder
+            let selected = selectedRange()
+            var hrLo = 0
+            var hrHi = horizontalRuleRanges.count
+            while hrLo < hrHi {
+                let mid = (hrLo + hrHi) >> 1
+                if NSMaxRange(horizontalRuleRanges[mid]) < visStart {
+                    hrLo = mid + 1
+                } else {
+                    hrHi = mid
+                }
+            }
+            for hrIdx in hrLo..<horizontalRuleRanges.count {
+                let range = horizontalRuleRanges[hrIdx]
+                if range.location > visEnd { break }
+                guard range.length > 0, NSMaxRange(range) <= totalLength else { continue }
+                if isCharacterFolded(range.location) { continue }
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+                guard glyphRange.length > 0 else { continue }
+
+                let fg = storage.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor
+                let showsSyntax = (fg != nil && fg != NSColor.clear) || NSIntersectionRange(selected, range).length > 0
+
+                let targetGlyph = showsSyntax ? max(glyphRange.location, NSMaxRange(glyphRange) - 1) : glyphRange.location
+                let lineFrag = layoutManager.lineFragmentRect(forGlyphAt: targetGlyph, effectiveRange: nil, withoutAdditionalLayout: true)
+                let glyphLoc = layoutManager.location(forGlyphAt: targetGlyph)
+                let hrFont = (storage.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont)
+                    ?? Theme.monoFont(Theme.baseProseSize - 2.0, weight: .semibold)
+                let centerY = origin.y + lineFrag.minY + glyphLoc.y - hrFont.xHeight * 0.52
+
+                let startX: CGFloat
+                if showsSyntax {
+                    let usedRect = layoutManager.lineFragmentUsedRect(forGlyphAt: targetGlyph, effectiveRange: nil, withoutAdditionalLayout: true)
+                    startX = origin.x + usedRect.maxX + 10
+                } else {
+                    startX = origin.x
+                }
+                let endX = origin.x + columnWidth
+                let ruleWidth = endX - startX
+                guard ruleWidth >= 8 else { continue }
+
+                let ruleRect = NSRect(
+                    x: startX,
+                    y: round(centerY) - 0.75,
+                    width: ruleWidth,
+                    height: 1.5
+                )
+                let rulePath = NSBezierPath(roundedRect: ruleRect, xRadius: 0.75, yRadius: 0.75)
+                ruleColor.setFill()
+                rulePath.fill()
+            }
         }
 
         foldHitTargets.removeAll(keepingCapacity: true)
@@ -5236,10 +5293,45 @@ import CozyCore
         }
     }
 
+    static func isHorizontalRuleLine(_ ns: NSString, lineStart: Int, contentEnd: Int) -> Bool {
+        guard contentEnd - lineStart >= 3 else { return false }
+        var p = lineStart
+        var leadSpaces = 0
+        while p < contentEnd && ns.character(at: p) == 0x20 {
+            leadSpaces += 1
+            if leadSpaces > 3 { return false }
+            p += 1
+        }
+        guard p < contentEnd else { return false }
+        let marker = ns.character(at: p)
+        guard marker == 0x2D || marker == 0x2A || marker == 0x5F else { return false }
+        var count = 0
+        while p < contentEnd {
+            let ch = ns.character(at: p)
+            if ch == marker {
+                count += 1
+            } else if ch != 0x20 && ch != 0x09 {
+                return false
+            }
+            p += 1
+        }
+        return count >= 3
+    }
+
     private func lineHasCursorSensitiveSyntax(_ ns: NSString, lineRange: NSRange) -> Bool {
         guard lineRange.location != NSNotFound, lineRange.length > 0, NSMaxRange(lineRange) <= ns.length else { return false }
         let first = ns.character(at: lineRange.location)
         if first == 0x23 || first == 0x60 || first == 0x7C { return true }
+        if first == 0x2D || first == 0x2A || first == 0x5F || first == 0x20 {
+            var contentEnd = NSMaxRange(lineRange)
+            while contentEnd > lineRange.location {
+                let ch = ns.character(at: contentEnd - 1)
+                if ch == 10 || ch == 13 { contentEnd -= 1 } else { break }
+            }
+            if Self.isHorizontalRuleLine(ns, lineStart: lineRange.location, contentEnd: contentEnd) {
+                return true
+            }
+        }
         if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "|", options: .literal, range: lineRange).location != NSNotFound { return true }
         return false
@@ -5262,26 +5354,29 @@ import CozyCore
         storage.beginEditing()
         if oldNeeds, NSMaxRange(oldLine) <= ns.length {
             var q: [NSRange] = []
+            var hr: [NSRange] = []
             var h: [MarkdownTextView.HeadingGutter] = []
             var c: [NSRange] = []
             var w: [WikiLink] = []
             var b: [MarkdownTextView.BulletItem] = []
-            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c, wikiLinks: &w, bullets: &b)
+            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, bullets: &b)
         }
         if newNeeds, newLine != oldLine, NSMaxRange(newLine) <= ns.length {
             var q: [NSRange] = []
+            var hr: [NSRange] = []
             var h: [MarkdownTextView.HeadingGutter] = []
             var c: [NSRange] = []
             var w: [WikiLink] = []
             var b: [MarkdownTextView.BulletItem] = []
-            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, headings: &h, codes: &c, wikiLinks: &w, bullets: &b)
+            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, bullets: &b)
         }
         storage.endEditing()
+        applyEditorChromeAttributes()
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
     private static func isBlockSyntaxLead(_ ch: unichar) -> Bool {
-        ch == 0x23 || ch == 0x3E || ch == 0x2D || ch == 0x2A || ch == 0x2B || ch == 0x20 || ch == 0x09 || (ch >= 0x30 && ch <= 0x39)
+        ch == 0x23 || ch == 0x3E || ch == 0x2D || ch == 0x2A || ch == 0x2B || ch == 0x5F || ch == 0x20 || ch == 0x09 || (ch >= 0x30 && ch <= 0x39)
     }
 
     private func lineHasMarkdownSyntax(_ ns: NSString, lineRange: NSRange) -> Bool {
@@ -5328,6 +5423,7 @@ import CozyCore
 
         let hadItemsInOldLine = textView.headingGutterItems.contains { NSIntersectionRange($0.range, oldLineRange).length > 0 || $0.range.location == oldLineRange.location }
             || textView.blockquoteRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
+            || textView.horizontalRuleRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
             || textView.inlineCodeRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
             || textView.wikiLinkItems.contains { NSIntersectionRange($0.fullRange, oldLineRange).length > 0 || $0.fullRange.location == oldLineRange.location }
             || textView.bulletItems.contains { NSIntersectionRange($0.lineRange, oldLineRange).length > 0 || $0.lineRange.location == oldLineRange.location }
@@ -5353,6 +5449,10 @@ import CozyCore
                     let r = textView.blockquoteRanges[i]
                     textView.blockquoteRanges[i] = NSRange(location: r.location + delta, length: r.length)
                 }
+                for i in textView.horizontalRuleRanges.indices where textView.horizontalRuleRanges[i].location >= shiftStart {
+                    let r = textView.horizontalRuleRanges[i]
+                    textView.horizontalRuleRanges[i] = NSRange(location: r.location + delta, length: r.length)
+                }
                 for i in textView.inlineCodeRanges.indices where textView.inlineCodeRanges[i].location >= shiftStart {
                     let r = textView.inlineCodeRanges[i]
                     textView.inlineCodeRanges[i] = NSRange(location: r.location + delta, length: r.length)
@@ -5376,6 +5476,7 @@ import CozyCore
         }
 
         var newQuotes: [NSRange] = []
+        var newHorizontalRules: [NSRange] = []
         var newHeadings: [MarkdownTextView.HeadingGutter] = []
         var newCodes: [NSRange] = []
         var newWikiLinks: [WikiLink] = []
@@ -5384,7 +5485,7 @@ import CozyCore
 
         textView.undoManager?.disableUndoRegistration()
         storage.beginEditing()
-        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, bullets: &newBullets)
+        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, horizontalRules: &newHorizontalRules, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, bullets: &newBullets)
         storage.endEditing()
         textView.undoManager?.enableUndoRegistration()
 
@@ -5426,6 +5527,22 @@ import CozyCore
         }
         if !insertedQuotes { updatedQuotes.append(contentsOf: newQuotes) }
         textView.blockquoteRanges = updatedQuotes
+
+        var updatedHorizontalRules: [NSRange] = []
+        var insertedHorizontalRules = false
+        for r in textView.horizontalRuleRanges {
+            if NSMaxRange(r) <= oldLineRange.location && r.location < oldLineRange.location {
+                updatedHorizontalRules.append(r)
+            } else if r.location >= oldEnd {
+                if !insertedHorizontalRules {
+                    updatedHorizontalRules.append(contentsOf: newHorizontalRules)
+                    insertedHorizontalRules = true
+                }
+                updatedHorizontalRules.append(NSRange(location: r.location + delta, length: r.length))
+            }
+        }
+        if !insertedHorizontalRules { updatedHorizontalRules.append(contentsOf: newHorizontalRules) }
+        textView.horizontalRuleRanges = updatedHorizontalRules
 
         var updatedCodes: [NSRange] = []
         var insertedCodes = false
@@ -5482,6 +5599,7 @@ import CozyCore
         if delta != 0 {
             textView.shiftFoldedSections(from: oldEnd, by: delta)
         }
+        applyEditorChromeAttributes()
 
         lastCursorLine = ns.lineRange(for: NSRange(location: min(cursor.location, newLen), length: 0))
         return true
@@ -5543,6 +5661,7 @@ import CozyCore
         ]
         guard totalLen > 0 else {
             textView.blockquoteRanges = []
+            textView.horizontalRuleRanges = []
             textView.headingGutterItems = []
             textView.inlineCodeRanges = []
             textView.wikiLinkItems = []
@@ -5558,13 +5677,14 @@ import CozyCore
         storage.setAttributes(baseAttrs, range: range)
 
         var quotes: [NSRange] = []
+        var horizontalRules: [NSRange] = []
         var headings: [MarkdownTextView.HeadingGutter] = []
         var inlinePills: [NSRange] = []
         var wikiLinks: [WikiLink] = []
         var bullets: [MarkdownTextView.BulletItem] = []
         var parsedFences: [MarkdownTextView.FencedBlock] = []
 
-        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, headings: &headings, codes: &inlinePills, wikiLinks: &wikiLinks, bullets: &bullets)
+        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, horizontalRules: &horizontalRules, headings: &headings, codes: &inlinePills, wikiLinks: &wikiLinks, bullets: &bullets)
         if scan.hasTripleBacktick && ns.range(of: "```", options: .literal, range: range).location != NSNotFound {
             let codeBodyParagraph = NSMutableParagraphStyle()
             codeBodyParagraph.lineSpacing = 4.5
@@ -5651,6 +5771,9 @@ import CozyCore
             quotes.removeAll { r in
                 parsedFences.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
             }
+            horizontalRules.removeAll { r in
+                parsedFences.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
+            }
             inlinePills.removeAll { r in
                 parsedFences.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
             }
@@ -5674,6 +5797,9 @@ import CozyCore
                 quotes.removeAll { r in
                     parsedTables.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
                 }
+                horizontalRules.removeAll { r in
+                    parsedTables.contains { NSIntersectionRange($0.fullRange, r).length > 0 }
+                }
                 headings.removeAll { item in
                     parsedTables.contains { NSIntersectionRange($0.fullRange, item.range).length > 0 }
                 }
@@ -5681,6 +5807,7 @@ import CozyCore
         }
 
         textView.blockquoteRanges = quotes
+        textView.horizontalRuleRanges = horizontalRules
         textView.headingGutterItems = headings
         textView.inlineCodeRanges = inlinePills
         textView.wikiLinkItems = wikiLinks
@@ -6153,6 +6280,7 @@ import CozyCore
         cursor: NSRange,
         scan: DocumentScanResult? = nil,
         quotes: inout [NSRange],
+        horizontalRules: inout [NSRange],
         headings: inout [MarkdownTextView.HeadingGutter],
         codes: inout [NSRange],
         wikiLinks: inout [WikiLink],
@@ -6356,11 +6484,12 @@ import CozyCore
             }
         }
 
-        // 2. Line-anchored constructs (headings, blockquotes, lists) by stepping line-by-line
+        // 2. Line-anchored constructs (headings, blockquotes, horizontal rules, lists) by stepping line-by-line
         var linePos = targetRange.location
         let targetEnd = NSMaxRange(targetRange)
         let isFocused = textView.window?.firstResponder === textView
         var lazyQuoteParagraph: NSMutableParagraphStyle?
+        var lazyHRParagraph: NSMutableParagraphStyle?
         let hiddenAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 0.1),
             .foregroundColor: NSColor.clear
@@ -6465,6 +6594,29 @@ import CozyCore
                         .kern: 0.05
                     ], range: g2)
                 }
+            } else if (c0 == 0x2D || c0 == 0x2A || c0 == 0x5F || c0 == 0x20)
+                && Self.isHorizontalRuleLine(ns, lineStart: lineRange.location, contentEnd: contentEnd) {
+                let matchRange = NSRange(location: lineRange.location, length: contentLen)
+                horizontalRules.append(matchRange)
+                let hrParagraph: NSMutableParagraphStyle
+                if let existing = lazyHRParagraph {
+                    hrParagraph = existing
+                } else {
+                    let created = NSMutableParagraphStyle()
+                    created.lineSpacing = 6.0
+                    created.paragraphSpacingBefore = 6.0
+                    created.paragraphSpacing = 14.0
+                    lazyHRParagraph = created
+                    hrParagraph = created
+                }
+                let cursorOnRule = ((cursor.length == 0 && cursor.location >= matchRange.location && cursor.location <= NSMaxRange(matchRange))
+                    || NSIntersectionRange(cursor, matchRange).length > 0) && isFocused
+                storage.setAttributes([
+                    .font: Theme.monoFont(proseSize - 2.0, weight: .semibold),
+                    .foregroundColor: (cursorOnRule || compactLayout) ? Theme.subtle : NSColor.clear,
+                    .paragraphStyle: hrParagraph,
+                    .kern: 0.0
+                ], range: matchRange)
             } else if c0 == 0x2D || c0 == 0x2A || c0 == 0x2B || c0 == 0x20 || c0 == 0x09 || (c0 >= 0x30 && c0 <= 0x39) {
                 var p = lineRange.location
                 while p < contentEnd {
