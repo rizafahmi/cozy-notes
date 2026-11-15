@@ -8,13 +8,34 @@ public struct NoteRecord: Equatable, Sendable {
     public let modifiedAt: Date
     public let excerpt: String
     public let isPinned: Bool
+    public let tags: [String]
 
-    public init(url: URL, title: String, modifiedAt: Date, excerpt: String, isPinned: Bool = false) {
+    public init(
+        url: URL,
+        title: String,
+        modifiedAt: Date,
+        excerpt: String,
+        isPinned: Bool = false,
+        tags: [String] = []
+    ) {
         self.url = url
         self.title = title
         self.modifiedAt = modifiedAt
         self.excerpt = excerpt
         self.isPinned = isPinned
+        self.tags = tags
+    }
+}
+
+public struct NoteTag: Equatable, Sendable {
+    public let name: String
+    public let fullRange: NSRange
+    public let nameRange: NSRange
+
+    public init(name: String, fullRange: NSRange, nameRange: NSRange) {
+        self.name = name
+        self.fullRange = fullRange
+        self.nameRange = nameRange
     }
 }
 
@@ -1198,6 +1219,261 @@ public final class Vault: @unchecked Sendable {
         return (NSRange(location: openStart, length: replaceEnd - openStart), query)
     }
 
+    // MARK: - Inline Tags (#tag)
+
+    public static func isTagChar(_ u: unichar) -> Bool {
+        if (u >= 0x61 && u <= 0x7A) || (u >= 0x41 && u <= 0x5A) || (u >= 0x30 && u <= 0x39) {
+            return true
+        }
+        if u == 0x5F || u == 0x2D || u == 0x2F { // '_', '-', '/'
+            return true
+        }
+        guard u > 0x7F, let scalar = UnicodeScalar(u) else { return false }
+        return CharacterSet.letters.contains(scalar) || CharacterSet.decimalDigits.contains(scalar)
+    }
+
+    private static func isTagLetter(_ u: unichar) -> Bool {
+        if (u >= 0x61 && u <= 0x7A) || (u >= 0x41 && u <= 0x5A) {
+            return true
+        }
+        guard u > 0x7F, let scalar = UnicodeScalar(u) else { return false }
+        return CharacterSet.letters.contains(scalar)
+    }
+
+    private static func isHexDigit(_ u: unichar) -> Bool {
+        (u >= 0x30 && u <= 0x39) || (u >= 0x61 && u <= 0x66) || (u >= 0x41 && u <= 0x46)
+    }
+
+    private static func isAsciiDigit(_ u: unichar) -> Bool {
+        u >= 0x30 && u <= 0x39
+    }
+
+    private static func isValidTagPrefix(in ns: NSString, hashLocation: Int, lineStart: Int) -> Bool {
+        if hashLocation <= lineStart { return true }
+        let prev = ns.character(at: hashLocation - 1)
+        if prev == 0x20 || prev == 0x09 { return true }
+        if prev == 0x28 { // '('
+            if hashLocation >= lineStart + 2 && ns.character(at: hashLocation - 2) == 0x5D {
+                return false
+            }
+            return true
+        }
+        return false
+    }
+
+    public static func tags(in text: String) -> [NoteTag] {
+        tags(inNSString: text as NSString)
+    }
+
+    public static func tags(inNSString ns: NSString, range: NSRange? = nil) -> [NoteTag] {
+        let searchRange = range ?? NSRange(location: 0, length: ns.length)
+        guard searchRange.length >= 2,
+              NSMaxRange(searchRange) <= ns.length,
+              ns.range(of: "#", options: .literal, range: searchRange).location != NSNotFound else {
+            return []
+        }
+
+        let fullDocCodeRanges: [NSRange] = (range == nil) ? markdownCodeRanges(in: ns) : []
+        var results: [NoteTag] = []
+        var searchStart = searchRange.location
+        let searchEnd = NSMaxRange(searchRange)
+
+        while searchStart < searchEnd {
+            let hit = ns.range(of: "#", options: .literal, range: NSRange(location: searchStart, length: searchEnd - searchStart))
+            guard hit.location != NSNotFound else { break }
+            let lineRange = NSIntersectionRange(ns.lineRange(for: hit), searchRange)
+            defer { searchStart = NSMaxRange(lineRange) }
+
+            let lineStr = ns.substring(with: lineRange)
+            let lineNS = lineStr as NSString
+            let lineLen = lineNS.length
+            guard lineLen >= 2 else { continue }
+
+            var lineExcludedRanges: [NSRange] = []
+            if range != nil, lineNS.range(of: "`", options: .literal).location != NSNotFound {
+                for r in markdownCodeRanges(in: lineNS) {
+                    lineExcludedRanges.append(NSRange(location: lineRange.location + r.location, length: r.length))
+                }
+            }
+            if lineNS.range(of: "[[", options: .literal).location != NSNotFound {
+                for link in wikiLinks(inNSString: lineNS) {
+                    lineExcludedRanges.append(NSRange(location: lineRange.location + link.fullRange.location, length: link.fullRange.length))
+                }
+            }
+            if lineNS.range(of: "](", options: .literal).location != NSNotFound {
+                for match in linkedAttachmentRegex.matches(in: lineStr, range: NSRange(location: 0, length: lineLen)) {
+                    lineExcludedRanges.append(NSRange(location: lineRange.location + match.range.location, length: match.range.length))
+                }
+            }
+
+            var idx = 0
+            while idx < lineLen {
+                let ch = lineNS.character(at: idx)
+                guard ch == 0x23 else {
+                    idx += 1
+                    continue
+                }
+                if idx + 1 < lineLen && lineNS.character(at: idx + 1) == 0x23 {
+                    while idx < lineLen && lineNS.character(at: idx) == 0x23 {
+                        idx += 1
+                    }
+                    continue
+                }
+                guard isValidTagPrefix(in: lineNS, hashLocation: idx, lineStart: 0) else {
+                    idx += 1
+                    continue
+                }
+                let nameStart = idx + 1
+                var end = nameStart
+                while end < lineLen && isTagChar(lineNS.character(at: end)) {
+                    end += 1
+                }
+                let nameLen = end - nameStart
+                guard nameLen >= 1 && nameLen <= 64 else {
+                    idx = max(idx + 1, end)
+                    continue
+                }
+                if end < lineLen && lineNS.character(at: end) == 0x23 {
+                    idx = end + 1
+                    continue
+                }
+                let firstCh = lineNS.character(at: nameStart)
+                let lastCh = lineNS.character(at: end - 1)
+                if firstCh == 0x2F || firstCh == 0x2D || lastCh == 0x2F || lastCh == 0x2D {
+                    idx = end
+                    continue
+                }
+                var hasLetter = false
+                var hasDigit = false
+                var allHex = true
+                var hasDoubleSlash = false
+                var prevSlash = false
+                for pos in nameStart..<end {
+                    let c = lineNS.character(at: pos)
+                    if isTagLetter(c) { hasLetter = true }
+                    if isAsciiDigit(c) { hasDigit = true }
+                    if !isHexDigit(c) { allHex = false }
+                    if c == 0x2F {
+                        if prevSlash {
+                            hasDoubleSlash = true
+                            break
+                        }
+                        prevSlash = true
+                    } else {
+                        prevSlash = false
+                    }
+                }
+                if !hasLetter || hasDoubleSlash {
+                    idx = end
+                    continue
+                }
+                if (nameLen == 3 || nameLen == 6 || nameLen == 8) && hasDigit && allHex {
+                    idx = end
+                    continue
+                }
+
+                let fullRange = NSRange(location: lineRange.location + idx, length: 1 + nameLen)
+                let nameRange = NSRange(location: lineRange.location + nameStart, length: nameLen)
+                let isExcluded = fullDocCodeRanges.contains(where: { NSIntersectionRange($0, fullRange).length > 0 })
+                    || lineExcludedRanges.contains(where: { NSIntersectionRange($0, fullRange).length > 0 })
+                if !isExcluded {
+                    let tagName = lineNS.substring(with: NSRange(location: nameStart, length: nameLen)).lowercased()
+                    results.append(NoteTag(name: tagName, fullRange: fullRange, nameRange: nameRange))
+                }
+                idx = end
+            }
+        }
+        return results
+    }
+
+    public static func tag(in text: String, at location: Int, includeTrailingEdge: Bool = false) -> NoteTag? {
+        tag(inNSString: text as NSString, at: location, includeTrailingEdge: includeTrailingEdge)
+    }
+
+    public static func tag(inNSString ns: NSString, at location: Int, includeTrailingEdge: Bool = false) -> NoteTag? {
+        guard ns.length >= 2, location >= 0, location <= ns.length else { return nil }
+        let probe = min(location, ns.length - 1)
+        let lineRange = ns.lineRange(for: NSRange(location: probe, length: 0))
+        let lineTags = tags(inNSString: ns, range: lineRange)
+        return lineTags.first { tag in
+            if includeTrailingEdge {
+                return location >= tag.fullRange.location && location <= NSMaxRange(tag.fullRange)
+            } else {
+                return NSLocationInRange(location, tag.fullRange)
+            }
+        }
+    }
+
+    public static func extractTagNames(from text: String) -> [String] {
+        let parsed = tags(in: text)
+        guard !parsed.isEmpty else { return [] }
+        var seen: Set<String> = []
+        var unique: [String] = []
+        for item in parsed {
+            let key = item.name.lowercased()
+            if seen.insert(key).inserted {
+                unique.append(item.name)
+            }
+        }
+        return unique
+    }
+
+    /// Detects an active `#query` being typed at `cursorLocation`.
+    /// Returns the full range (including `#`) to replace when a tag is chosen and the current query string.
+    public static func activeTagQuery(inNSString ns: NSString, cursorLocation: Int) -> (replacementRange: NSRange, query: String)? {
+        guard cursorLocation >= 1, cursorLocation <= ns.length else { return nil }
+        let lineRange = ns.lineRange(for: NSRange(location: min(cursorLocation, max(0, ns.length - 1)), length: 0))
+        guard cursorLocation > lineRange.location else { return nil }
+
+        var idx = cursorLocation - 1
+        while idx >= lineRange.location && isTagChar(ns.character(at: idx)) {
+            idx -= 1
+        }
+        guard idx >= lineRange.location, ns.character(at: idx) == 0x23 else {
+            return nil
+        }
+        let hashLocation = idx
+        guard isValidTagPrefix(in: ns, hashLocation: hashLocation, lineStart: lineRange.location) else {
+            return nil
+        }
+        if hashLocation > lineRange.location && ns.character(at: hashLocation - 1) == 0x23 {
+            return nil
+        }
+
+        let queryStart = hashLocation + 1
+        let queryRange = NSRange(location: queryStart, length: cursorLocation - queryStart)
+        let query = ns.substring(with: queryRange)
+        if query.hasPrefix("/") || query.hasPrefix("-") || query.contains("//") || query.count > 64 {
+            return nil
+        }
+
+        let lineStr = ns.substring(with: lineRange)
+        let lineNS = lineStr as NSString
+        let localHashRange = NSRange(location: hashLocation - lineRange.location, length: 1)
+        if lineNS.range(of: "`", options: .literal).location != NSNotFound {
+            let codeSpans = markdownCodeRanges(in: lineNS)
+            if codeSpans.contains(where: { NSIntersectionRange($0, localHashRange).length > 0 }) {
+                return nil
+            }
+        }
+        if lineNS.range(of: "[[", options: .literal).location != NSNotFound {
+            let links = wikiLinks(inNSString: lineNS)
+            if links.contains(where: { NSIntersectionRange($0.fullRange, localHashRange).length > 0 }) {
+                return nil
+            }
+        }
+
+        var replaceEnd = cursorLocation
+        let lineEnd = NSMaxRange(lineRange)
+        while replaceEnd < lineEnd && isTagChar(ns.character(at: replaceEnd)) {
+            replaceEnd += 1
+        }
+        if replaceEnd < lineEnd && ns.character(at: replaceEnd) == 0x23 {
+            return nil
+        }
+        return (NSRange(location: hashLocation, length: replaceEnd - hashLocation), query)
+    }
+
     public static func normalizedWikiTarget(_ rawTarget: String) -> String {
         let firstPart = rawTarget.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? rawTarget
         return firstPart.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1435,7 +1711,8 @@ public final class Vault: @unchecked Sendable {
         let modified = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
         let pinnedSet = pinnedPaths ?? pinnedRelativePathsLocked()
         let isPinned = (try? relativeNotePathLocked(url)).map { pinnedSet.contains($0) } ?? false
-        return NoteRecord(url: url, title: title, modifiedAt: modified, excerpt: String(excerpt.prefix(240)), isPinned: isPinned)
+        let tags = Self.extractTagNames(from: text)
+        return NoteRecord(url: url, title: title, modifiedAt: modified, excerpt: String(excerpt.prefix(240)), isPinned: isPinned, tags: tags)
     }
 
     private func relativeNotePathLocked(_ noteURL: URL) throws -> String {

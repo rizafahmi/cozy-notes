@@ -639,6 +639,53 @@ final class VaultTests: XCTestCase {
         XCTAssertFalse(fixture.vault.isPinned(targetNote.url))
         XCTAssertTrue(fixture.vault.isPinned(secondNote.url))
     }
+
+    func testHashtagParsingDisambiguationAndActiveTagQuery() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+
+        let markdown = """
+        # Heading Should Not Be A Tag
+        ## Second Heading
+        Body with #work, #work/q2, #2026-goals, and duplicate #WORK.
+        Ignore hex colors like #ff00aa or #123456, pure numbers #42, URLs https://example.com/#section, and WikiLinks [[Roadmap#Milestones]].
+        Ignore inline code `#secret-tag` and fenced code:
+        ```swift
+        // #fenced-tag should be ignored
+        let tag = "#also-ignored"
+        ```
+        End with (#parenthesized_tag).
+        """
+
+        let parsed = Vault.tags(in: markdown)
+        XCTAssertEqual(parsed.map(\.name), ["work", "work/q2", "2026-goals", "work", "parenthesized_tag"])
+
+        let uniqueNames = Vault.extractTagNames(from: markdown)
+        XCTAssertEqual(uniqueNames, ["work", "work/q2", "2026-goals", "parenthesized_tag"])
+
+        let note = try fixture.vault.capture(text: markdown)
+        XCTAssertEqual(note.tags, ["work", "work/q2", "2026-goals", "parenthesized_tag"])
+        let listed = try XCTUnwrap(fixture.vault.notes().first { $0.url == note.url })
+        XCTAssertEqual(listed.tags, ["work", "work/q2", "2026-goals", "parenthesized_tag"])
+
+        // Active tag query detection while typing #...
+        let typing = "Planning #work/q" as NSString
+        let active = try XCTUnwrap(Vault.activeTagQuery(inNSString: typing, cursorLocation: typing.length))
+        XCTAssertEqual(active.query, "work/q")
+        XCTAssertEqual(active.replacementRange, NSRange(location: 9, length: 7))
+
+        // Bare # at start of line or after space triggers empty query
+        let bare = "Note #" as NSString
+        let bareActive = try XCTUnwrap(Vault.activeTagQuery(inNSString: bare, cursorLocation: bare.length))
+        XCTAssertEqual(bareActive.query, "")
+        XCTAssertEqual(bareActive.replacementRange, NSRange(location: 5, length: 1))
+
+        // Markdown heading "## " or mid-word "foo#bar" does not trigger tag autocomplete
+        let heading = "## " as NSString
+        XCTAssertTrue(Vault.activeTagQuery(inNSString: heading, cursorLocation: heading.length) == nil)
+        let midWord = "https://example.com/#frag" as NSString
+        XCTAssertTrue(Vault.activeTagQuery(inNSString: midWord, cursorLocation: midWord.length) == nil)
+    }
 }
 
 #if canImport(Testing)
@@ -719,6 +766,11 @@ struct VaultCoreSuite {
     @Test("Merging notes combines bodies with rules, relinks attachments, rewrites WikiLinks, preserves pins, and recovers")
     func mergeNotesEndToEnd() throws {
         try VaultTests().testMergeNotesCombinesBodiesRelinksAttachmentsRewritesWikiLinksPreservesPinsAndRecovers()
+    }
+
+    @Test("Hashtags parse inline, ignore headings/hex/code/URLs, and detect active #tag queries")
+    func hashtagParsingAndActiveTagQuery() throws {
+        try VaultTests().testHashtagParsingDisambiguationAndActiveTagQuery()
     }
 }
 #endif
