@@ -257,6 +257,49 @@ final class CaptureSearchTests: XCTestCase {
         )
         XCTAssertTrue(snapshot.search("#nonexistent").isEmpty)
     }
+
+    func testProjectFolderPathMatchingCrossFieldQueriesAndDuplicateTitleRanking() throws {
+        let fixture = try Fixture(); defer { fixture.cleanup() }
+        let fm = FileManager.default
+        try fm.createDirectory(at: fixture.file(".git"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fixture.file("docs"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fixture.file("packages/a"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fixture.file("packages/b"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fixture.file("node_modules/dep"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fixture.file("build/generated"), withIntermediateDirectories: true)
+
+        try "# Overview\nWorkspace root summary.".write(to: fixture.file("README.md"), atomically: true, encoding: .utf8)
+        try "# System Architecture\nClean boundaries and local-first snapshots.".write(to: fixture.file("docs/architecture.md"), atomically: true, encoding: .utf8)
+        try "# Overview\nCore token parser.".write(to: fixture.file("packages/a/README.md"), atomically: true, encoding: .utf8)
+        try "# Overview\nWebhook retry queue.".write(to: fixture.file("packages/b/README.md"), atomically: true, encoding: .utf8)
+        try "# Overview\nIgnored dependency.".write(to: fixture.file("node_modules/dep/README.md"), atomically: true, encoding: .utf8)
+        try "# Overview\nIgnored build artifact.".write(to: fixture.file("build/generated/README.md"), atomically: true, encoding: .utf8)
+
+        let snapshot = try CaptureSearch(vault: fixture.vault).scan()
+        XCTAssertEqual(
+            Set(snapshot.sources.map(\.relativePath)),
+            Set(["README.md", "docs/architecture.md", "packages/a/README.md", "packages/b/README.md"])
+        )
+
+        // Exact stem match ("readme") prioritizes root README.md over nested README.md files
+        let readmeHits = snapshot.search("readme")
+        XCTAssertEqual(readmeHits.first?.source.relativePath, "README.md")
+        XCTAssertEqual(readmeHits.count, 3)
+
+        // Cross-field folder path + duplicate H1 title narrows directly to the target package note
+        let packageBOverview = snapshot.search("packages/b overview")
+        XCTAssertEqual(packageBOverview.map(\.source.relativePath), ["packages/b/README.md"])
+        XCTAssertFalse(try XCTUnwrap(packageBOverview.first).highlights.isEmpty)
+
+        // Cross-field folder path + body keyword matches across relativePath and page text
+        let docsBoundaries = snapshot.search("docs boundaries")
+        XCTAssertEqual(docsBoundaries.map(\.source.relativePath), ["docs/architecture.md"])
+
+        // Exact relative path without extension ranks target package first even if another note mentions it in body
+        try "# Overview\nDepends on packages/a/readme for parsing.".write(to: fixture.file("packages/b/README.md"), atomically: true, encoding: .utf8)
+        let updatedSnapshot = try CaptureSearch(vault: fixture.vault).scan()
+        XCTAssertEqual(updatedSnapshot.search("packages/a/readme").first?.source.relativePath, "packages/a/README.md")
+    }
 }
 
 #if canImport(Testing)
@@ -312,6 +355,11 @@ struct CaptureSearchSuite {
     @Test("Tag aggregation, hierarchical tag filtering, and #tag query tokens")
     func tagAggregationAndFiltering() throws {
         try CaptureSearchTests().testTagAggregationHierarchicalFilteringAndQueryTagTokens()
+    }
+
+    @Test("Project folder path matching, cross-field queries, and duplicate README ranking")
+    func projectFolderPathMatchingAndRanking() throws {
+        try CaptureSearchTests().testProjectFolderPathMatchingCrossFieldQueriesAndDuplicateTitleRanking()
     }
 }
 #endif

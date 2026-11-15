@@ -188,19 +188,29 @@ public struct SearchSnapshot: Sendable {
         let cleanQuery = terms.joined(separator: " ")
         var scored: [(score: Int, order: Int, hit: SearchHit)] = []
         for entry in filteredEntries {
-            let score = Self.titleScore(for: entry.source, query: cleanQuery, terms: terms)
+            let baseScore = Self.titleScore(for: entry.source, query: cleanQuery, terms: terms)
+                + Self.pathScore(for: entry.source, query: cleanQuery, terms: terms)
             var matched = false
-            for page in entry.pages where Self.matches(page.text, terms: terms) {
-                let snippet = Self.snippet(page.text, terms: highlightTerms)
-                let hit = SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page.number)
-                scored.append((score, scored.count, hit))
-                matched = true
+            for page in entry.pages {
+                let matchesPageDirectly = Self.matches(page.text, terms: terms)
+                let matchesCombined = !matchesPageDirectly
+                    && Self.matchesCombined(title: entry.source.title, relativePath: entry.source.relativePath, body: page.text, terms: terms)
+                if matchesPageDirectly || matchesCombined {
+                    let bodyHasAnyTerm = terms.contains { page.text.range(of: $0, options: .caseInsensitive) != nil }
+                    let snippetSource = bodyHasAnyTerm ? page.text : entry.source.relativePath
+                    let snippet = Self.snippet(snippetSource, terms: highlightTerms)
+                    let hit = SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page.number)
+                    scored.append((baseScore, scored.count, hit))
+                    matched = true
+                }
             }
-            if !matched && (Self.matches(entry.source.title, terms: terms) || Self.matches(entry.source.relativePath, terms: terms)) {
-                let targetText = Self.matches(entry.source.title, terms: terms) ? entry.source.title : entry.source.relativePath
+            if !matched && Self.matchesCombined(title: entry.source.title, relativePath: entry.source.relativePath, body: "", terms: terms) {
+                let titleHasAll = Self.matches(entry.source.title, terms: terms)
+                let pathHasAny = terms.contains { entry.source.relativePath.range(of: $0, options: .caseInsensitive) != nil }
+                let targetText = (!titleHasAll && pathHasAny) ? entry.source.relativePath : entry.source.title
                 let snippet = Self.snippet(targetText, terms: highlightTerms)
                 let hit = SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: nil)
-                scored.append((score, scored.count, hit))
+                scored.append((baseScore, scored.count, hit))
             }
         }
         scored.sort { a, b in
@@ -212,24 +222,52 @@ public struct SearchSnapshot: Sendable {
     }
 
     private static func titleScore(for source: SearchSource, query: String, terms: [String]) -> Int {
-        let kindBonus = source.kind == .note ? 10 : 0
+        let kindBonus = source.kind == .note ? 200 : 0
         if source.title.caseInsensitiveCompare(query) == .orderedSame {
-            return 400 + kindBonus
+            return 4000 + kindBonus
         }
         if source.title.lowercased().hasPrefix(query.lowercased()) {
-            return 300 + kindBonus
+            return 3000 + kindBonus
         }
         if matches(source.title, terms: terms) {
-            return 200 + kindBonus
+            return 2000 + kindBonus
         }
         if terms.contains(where: { source.title.range(of: $0, options: .caseInsensitive) != nil }) {
-            return 100 + kindBonus
+            return 1000 + kindBonus
         }
         return kindBonus
     }
 
+    private static func pathScore(for source: SearchSource, query: String, terms: [String]) -> Int {
+        guard !source.relativePath.hasPrefix("Inbox/") else { return 0 }
+        let rel = source.relativePath
+        let relNoExt = (rel as NSString).deletingPathExtension
+        if rel.caseInsensitiveCompare(query) == .orderedSame
+            || relNoExt.caseInsensitiveCompare(query) == .orderedSame {
+            return 90
+        }
+        if matches(rel, terms: terms) {
+            return 60
+        }
+        let matchingCount = terms.reduce(0) { count, term in
+            count + (rel.range(of: term, options: .caseInsensitive) != nil ? 1 : 0)
+        }
+        if matchingCount > 0 {
+            return min(50, matchingCount * 25)
+        }
+        return 0
+    }
+
     private static func matches(_ text: String, terms: [String]) -> Bool {
         terms.allSatisfy { text.range(of: $0, options: .caseInsensitive) != nil }
+    }
+
+    private static func matchesCombined(title: String, relativePath: String, body: String, terms: [String]) -> Bool {
+        terms.allSatisfy { term in
+            title.range(of: term, options: .caseInsensitive) != nil
+                || relativePath.range(of: term, options: .caseInsensitive) != nil
+                || (!body.isEmpty && body.range(of: term, options: .caseInsensitive) != nil)
+        }
     }
 
     private static func snippet(_ text: String, terms: [String]) -> (String, [NSRange]) {
