@@ -6,22 +6,61 @@ Notes and attachments are ordinary local files. Syncthing handles synchronizatio
 
 ## macOS
 
-Requires macOS 14+ and Swift 5.9+ (Command Line Tools or Xcode). The Mac app has no external package dependencies. Screenshot recognition uses the English and Indonesian language models supplied by the installed macOS Vision framework; actual recognition was verified on macOS 27. Older systems without the requested language support report an OCR error rather than pretending extraction succeeded.
+Requires **macOS 14.0+** and **Swift 5.9+** (Apple Command Line Tools or Xcode) on **Apple Silicon (`arm64`)** (or the host architecture when building from source). The Mac app is pure AppKit with **no external Swift package dependencies**. Screenshot recognition uses the English (`en-US`) and Indonesian (`id-ID`) language models supplied by the installed macOS Vision framework; actual recognition was verified on macOS 27. Older systems without the requested language support report an OCR error rather than pretending extraction succeeded.
+
+### 1. Build, Install, and Dogfood from Source (Development)
+
+`scripts/build-macos.sh` compiles the Swift package, generates/bundles `AppIcon.icns` (`packaging/generate-icon.swift`) and `packaging/Info.plist`, ad-hoc signs and verifies a staged `.build-app/Cozy Notes.app` bundle, gracefully quits any running instance so open windows and Quick Capture drafts are saved (`applicationShouldTerminate`), installs the verified bundle into `/Applications/Cozy Notes.app`, and launches that installed copy:
 
 ```sh
+# Optimized release build, install to /Applications/Cozy Notes.app, and launch (default)
+scripts/build-macos.sh release
+
+# Debug build, install to /Applications/Cozy Notes.app, and launch
 scripts/build-macos.sh debug
-open '.build-app/Cozy Notes.app'
+
+# Assemble and verify only in .build-app/Cozy Notes.app (skip install & launch)
+scripts/build-macos.sh release --build-only
+
+# Install to /Applications/Cozy Notes.app without launching
+scripts/build-macos.sh release --no-run
+
+# Install to a user-writable directory if /Applications is not writable
+scripts/build-macos.sh release --install-dir "$HOME/Applications"
 ```
 
-Use `scripts/build-macos.sh release` for an optimized build. The bundle is locally ad-hoc signed, not notarized for distribution. Rebuilding replaces only the generated bundle under `.build-app/`, never your notes folder.
+- **Safe replacement & data preservation:** If compilation, bundle verification, or code-signing fails—or if `/Applications` is not writable or a running instance cancels termination—the script aborts before replacing `/Applications/Cozy Notes.app`. Rebuilding or reinstalling replaces only the application bundle and never modifies your notes folder, `Attachments/`, `Extracted Text/`, recovery checkpoints (`~/Library/Application Support/CozyNotes/History/`), or `local.cozy.notes` preferences.
+- **Updating from source:** Pull the latest commits and re-run `scripts/build-macos.sh release`.
+- **Packaging a release archive:** Run `scripts/package-release-macos.sh` to build a verified release bundle and package `.build-app/release/Cozy-Notes-v0.1.0-macOS-14.0-arm64.zip` with `ditto -c -k --sequesterRsrc --keepParent` alongside a `.sha256` checksum file.
 
-The app initially uses `~/Documents/Cozy Notes`. The sidebar menu (`⋯`) or **File → Choose Notes Folder…** selects another collection; **Open Notes Folder** opens it in Finder. To launch with an explicit collection:
+### 2. Install and Update from a Downloaded Release (Off-Store)
+
+Pre-built GitHub releases are packaged as `Cozy-Notes-v<version>-macOS-14.0-arm64.zip` (Apple Silicon `arm64`, macOS 14.0+) with a matching `.sha256` checksum file:
+
+1. **Verify the checksum:**
+   ```sh
+   shasum -a 256 -c Cozy-Notes-v0.1.0-macOS-14.0-arm64.zip.sha256
+   ```
+2. **Extract and install:** Extract the archive using Archive Utility (double-click in Finder) or `ditto -x -k Cozy-Notes-v0.1.0-macOS-14.0-arm64.zip .`, then drag **`Cozy Notes.app`** into **`/Applications`**.
+3. **First-launch security (unsigned / ad-hoc signed builds):** Pre-App-Store builds are locally ad-hoc signed (`Signature=adhoc`) rather than Developer ID signed and Apple-notarized. When downloaded via a browser, macOS attaches `com.apple.quarantine` and Gatekeeper blocks the first normal double-click launch (`spctl` status: `rejected`).
+   - **Recommended approval path:** Try to open `/Applications/Cozy Notes.app` in Finder, then open **System Settings → Privacy & Security**, scroll down to the **Security** section where *"Cozy Notes" was blocked from use because it is not from an identified developer* appears, click **Open Anyway**, and confirm with your macOS login password or Touch ID. (On macOS 14 Sonoma, **Control-click → Open** in Finder also presents an **Open** confirmation dialog.)
+   - Do **not** disable Gatekeeper globally (`sudo spctl --master-disable`) or run blanket recursive attribute stripping as a default habit.
+4. **Manual updates:** Quit **Cozy Notes** (`⌘Q`), verify and extract the new release ZIP, and replace `/Applications/Cozy Notes.app` in Finder. Your notes folder, attachments, extracted text companions, recovery history, and `local.cozy.notes` preferences are stored outside the app bundle and remain untouched.
+
+### 3. Choosing a Notes Folder & Explicit Vault Overrides
+
+On first launch, Cozy Notes opens `~/Documents/Cozy Notes` (creating it if needed).
+- Use the sidebar menu (`⋯`) or **File → Choose Notes Folder…** (`⌘⇧O`) to switch your active workspace to any local notes folder or project repository.
+- Use **File → Open Folder in New Window…** (`⌃⌘O`) to open another collection alongside your current workspace, or **File → Open Notes Folder** to reveal the current folder in Finder.
+- To launch the installed app against a specific folder without overwriting your saved default folder preference, pass `--vault` or set `COZY_VAULT`:
 
 ```sh
-open '.build-app/Cozy Notes.app' --args --vault '/path/to/notes'
+open -a '/Applications/Cozy Notes.app' --args --vault '/path/to/notes'
+# Or via environment variable:
+COZY_VAULT='/path/to/notes' '/Applications/Cozy Notes.app/Contents/MacOS/CozyNotes'
 ```
 
-`COZY_VAULT` also overrides the device-local folder preference. Existing files—including legacy `AGENTS.md`—are not removed. New collections no longer generate agent instructions, and existing `AGENTS.md` files are excluded from notes/search, not from recovery snapshots.
+Existing files—including legacy `AGENTS.md`—are never removed. New collections no longer generate agent instructions, and existing `AGENTS.md` files are excluded from notes/search, not from recovery snapshots.
 
 ### Workspace and Live Notes
 
