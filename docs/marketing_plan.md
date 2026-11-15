@@ -43,7 +43,7 @@ flowchart LR
 
 Before posting anywhere, the GitHub repository must convert casual visitors into stars and testers within 10 seconds:
 
-1. **Above-the-Fold Visual in [README.md](file:///Users/riza/code/cozy-notes/README.md):**
+1. **Above-the-Fold Visual in [README.md](../README.md):**
    - Record a **12-second looping GIF / MP4** showing:
      1. Pressing `Cmd+Shift+Space` over another app to drop a screenshot + messy thought.
      2. Clicking **Make searchable** as Vision OCR turns the screenshot into a plain Markdown companion file in `Extracted Text/`.
@@ -119,8 +119,8 @@ Keep HN and Reddit purely for **English-speaking open-source traction** ( takes 
 ## 5. Phased Execution Roadmap
 
 ### Phase 1: Open-Source Readiness (Days 1–3)
-- [ ] Capture 3 high-DPI screenshots (one per atmosphere) and 1 short demo video for [README.md](file:///Users/riza/code/cozy-notes/README.md).
-- [ ] Add an open-source `LICENSE` file (e.g., MIT or GPLv3) and a brief "Roadmap: The Second Brain Harness" section in [README.md](file:///Users/riza/code/cozy-notes/README.md).
+- [ ] Capture 3 high-DPI screenshots (one per atmosphere) and 1 short demo video for [README.md](../README.md).
+- [ ] Add an open-source `LICENSE` file (e.g., MIT or GPLv3) and a brief "Roadmap: The Second Brain Harness" section in [README.md](../README.md).
 - [ ] Create 4–6 `good first issue` tickets (e.g., additional OCR languages, custom harness scripts/hooks, export utilities) so early visitors have an easy way to contribute.
 
 ### Phase 2: The Initial Wave (Week 1–2)

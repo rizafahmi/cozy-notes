@@ -1,6 +1,8 @@
 .build/
 .build-app/
 .tools/
+.agents/
+.delta/
 .DS_Store
 .swiftpm/
 android/.gradle/
