@@ -244,12 +244,14 @@ final class HorizontalRuleRenderingTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Horizontal Rule Rendering", .serialized)
-@MainActor
-struct HorizontalRuleRenderingSuite {
-    @Test("CommonMark horizontal rules parse, update incrementally, reveal syntax on cursor, and draw")
-    func horizontalRuleParsingIncrementalAndRendering() throws {
-        try verifyHorizontalRuleParsingIncrementalAndRendering()
+extension MobyDickWorkoutSuite {
+    @Suite("Horizontal Rule Rendering", .serialized)
+    @MainActor
+    struct HorizontalRuleRenderingSuite {
+        @Test("CommonMark horizontal rules parse, update incrementally, reveal syntax on cursor, and draw")
+        func horizontalRuleParsingIncrementalAndRendering() throws {
+            try verifyHorizontalRuleParsingIncrementalAndRendering()
+        }
     }
 }
 #endif

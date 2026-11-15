@@ -78,12 +78,14 @@ final class NewNoteTextColorTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("New note plain text attributes", .serialized)
-struct NewNoteTextColorSuite {
-    @Test("Typing plain text in a new note after Cmd+N applies Theme.ink and body font")
-    @MainActor
-    func newNotePlainTextUsesThemeInk() throws {
-        try verifyNewNotePlainTextUsesThemeInk()
+extension MobyDickWorkoutSuite {
+    @Suite("New note plain text attributes", .serialized)
+    struct NewNoteTextColorSuite {
+        @Test("Typing plain text in a new note after Cmd+N applies Theme.ink and body font")
+        @MainActor
+        func newNotePlainTextUsesThemeInk() throws {
+            try verifyNewNotePlainTextUsesThemeInk()
+        }
     }
 }
 #endif

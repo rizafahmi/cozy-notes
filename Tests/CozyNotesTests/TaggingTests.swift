@@ -1,7 +1,9 @@
+#if canImport(Testing)
+import Testing
+#endif
 #if canImport(XCTest)
 import XCTest
 #else
-import Testing
 private func XCTAssertNil<T>(_ value: T?, _ message: String = "") { #expect(value == nil) }
 #endif
 import AppKit
@@ -160,12 +162,14 @@ final class TaggingTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Tagging UI", .serialized)
-struct TaggingSuite {
-    @Test("Sidebar tag filter bar, editor #tag pills, ⌘-Click filtering, and #tag autocomplete")
-    @MainActor
-    func taggingWorkflow() async throws {
-        try await runTaggingWorkflowAssertion()
+extension MobyDickWorkoutSuite {
+    @Suite("Tagging UI", .serialized)
+    struct TaggingSuite {
+        @Test("Sidebar tag filter bar, editor #tag pills, ⌘-Click filtering, and #tag autocomplete")
+        @MainActor
+        func taggingWorkflow() async throws {
+            try await runTaggingWorkflowAssertion()
+        }
     }
 }
 #endif

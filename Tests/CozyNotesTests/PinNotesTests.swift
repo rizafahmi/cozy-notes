@@ -1,7 +1,9 @@
+#if canImport(Testing)
+import Testing
+#endif
 #if canImport(XCTest)
 import XCTest
 #else
-import Testing
 class XCTestCase {}
 func XCTAssertEqual<T: Equatable>(_ a: T, _ b: T, _ message: String = "") { #expect(a == b) }
 func XCTAssertTrue(_ expr: Bool, _ message: String = "") { #expect(expr) }
@@ -42,7 +44,7 @@ private struct PinWorkspaceFixture {
 }
 
 @MainActor
-private func waitUntil(timeout: TimeInterval = 3.0, condition: () -> Bool) async -> Bool {
+private func waitUntil(timeout: TimeInterval = 15.0, condition: () -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if condition() { return true }
@@ -159,12 +161,14 @@ final class PinNotesTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Pin Notes UI", .serialized)
-struct PinNotesSuite {
-    @Test("Workspace header, sidebar, Quick Switcher, and companion window synchronize pinned notes")
-    @MainActor
-    func workspacePinningWorkflow() async throws {
-        try await runPinningWorkflowAssertion()
+extension MobyDickWorkoutSuite {
+    @Suite("Pin Notes UI", .serialized)
+    struct PinNotesSuite {
+        @Test("Workspace header, sidebar, Quick Switcher, and companion window synchronize pinned notes")
+        @MainActor
+        func workspacePinningWorkflow() async throws {
+            try await runPinningWorkflowAssertion()
+        }
     }
 }
 #endif

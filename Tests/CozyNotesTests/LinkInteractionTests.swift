@@ -424,12 +424,14 @@ final class LinkInteractionTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Markdown Link Interactions", .serialized)
-@MainActor
-struct LinkInteractionSuite {
-    @Test("Markdown links, autolinks, and bare URLs parse, update incrementally, and support click/open/copy")
-    func markdownLinkParsingIncrementalAndInteractions() throws {
-        try verifyMarkdownLinkParsingIncrementalAndInteractions()
+extension MobyDickWorkoutSuite {
+    @Suite("Markdown Link Interactions", .serialized)
+    @MainActor
+    struct LinkInteractionSuite {
+        @Test("Markdown links, autolinks, and bare URLs parse, update incrementally, and support click/open/copy")
+        func markdownLinkParsingIncrementalAndInteractions() throws {
+            try verifyMarkdownLinkParsingIncrementalAndInteractions()
+        }
     }
 }
 #endif

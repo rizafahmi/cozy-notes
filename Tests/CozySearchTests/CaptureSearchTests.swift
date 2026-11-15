@@ -1,7 +1,9 @@
+#if canImport(Testing)
+import Testing
+#endif
 #if canImport(XCTest)
 import XCTest
 #else
-import Testing
 class XCTestCase {}
 func XCTAssertEqual<T: Equatable>(_ a: T, _ b: T, _ message: String = "") { #expect(a == b) }
 func XCTAssertTrue(_ expr: Bool, _ message: String = "") { #expect(expr) }

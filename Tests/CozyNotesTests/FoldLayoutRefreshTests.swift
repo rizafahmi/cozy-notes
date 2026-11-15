@@ -203,20 +203,22 @@ final class FoldLayoutRefreshTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Fold layout refresh", .serialized)
-struct FoldLayoutRefreshSuite {
-    @Test("A folded body stays collapsed after a full reformat in a small document")
-    @MainActor
-    func smallDocumentFoldRefresh() {
-        let failures = foldedLayoutFailures(markdown: smallFoldMarkdown, label: "small")
-        #expect(failures.isEmpty, "\(failures)")
-    }
+extension MobyDickWorkoutSuite {
+    @Suite("Fold layout refresh", .serialized)
+    struct FoldLayoutRefreshSuite {
+        @Test("A folded body stays collapsed after a full reformat in a small document")
+        @MainActor
+        func smallDocumentFoldRefresh() {
+            let failures = foldedLayoutFailures(markdown: smallFoldMarkdown, label: "small")
+            #expect(failures.isEmpty, "\(failures)")
+        }
 
-    @Test("A folded body stays collapsed after a full reformat in a large lazy document")
-    @MainActor
-    func largeDocumentFoldRefresh() {
-        let failures = foldedLayoutFailures(markdown: largeFoldMarkdown, label: "large")
-        #expect(failures.isEmpty, "\(failures)")
+        @Test("A folded body stays collapsed after a full reformat in a large lazy document")
+        @MainActor
+        func largeDocumentFoldRefresh() {
+            let failures = foldedLayoutFailures(markdown: largeFoldMarkdown, label: "large")
+            #expect(failures.isEmpty, "\(failures)")
+        }
     }
 }
 #endif

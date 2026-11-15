@@ -161,12 +161,14 @@ final class DocumentOutlineRefreshTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Document outline incremental refresh", .serialized)
-struct DocumentOutlineRefreshSuite {
-    @Test("Outline renders all headings immediately after paste and prepending H2 before H2")
-    @MainActor
-    func outlineUpdatesOnPasteAndPrependingHeading() throws {
-        try verifyOutlineUpdatesOnPasteAndPrependingHeading()
+extension MobyDickWorkoutSuite {
+    @Suite("Document outline incremental refresh", .serialized)
+    struct DocumentOutlineRefreshSuite {
+        @Test("Outline renders all headings immediately after paste and prepending H2 before H2")
+        @MainActor
+        func outlineUpdatesOnPasteAndPrependingHeading() throws {
+            try verifyOutlineUpdatesOnPasteAndPrependingHeading()
+        }
     }
 }
 #endif

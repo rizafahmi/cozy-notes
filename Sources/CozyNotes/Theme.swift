@@ -386,8 +386,8 @@ import AppKit
         let fallbackName = level == 1 ? "AvenirNext-Bold" : "AvenirNext-DemiBold"
         return NSFont(name: preferredName, size: scaled)
             ?? NSFont(name: "Unbounded-ExtraBold", size: scaled)
-            ?? NSFont(name: fallbackName, size: size)
-            ?? NSFont.systemFont(ofSize: size, weight: .heavy)
+            ?? NSFont(name: fallbackName, size: scaled)
+            ?? NSFont.systemFont(ofSize: scaled, weight: .heavy)
     }
 
     static func headingFont(level: Int) -> NSFont {

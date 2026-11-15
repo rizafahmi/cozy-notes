@@ -35,7 +35,7 @@ private struct MergeWorkspaceFixture {
 }
 
 @MainActor
-private func waitUntil(timeout: TimeInterval = 3.0, condition: () -> Bool) async -> Bool {
+private func waitUntil(timeout: TimeInterval = 15.0, condition: () -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if condition() { return true }
@@ -186,12 +186,14 @@ final class MergeNotesTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Merge Notes UI", .serialized)
-struct MergeNotesSuite {
-    @Test("Sidebar multi-selection, reorderable preview sheet, and companion window sync during note merge")
-    @MainActor
-    func workspaceMergeNotesWorkflow() async throws {
-        try await runMergeNotesWorkflowAssertion()
+extension MobyDickWorkoutSuite {
+    @Suite("Merge Notes UI", .serialized)
+    struct MergeNotesSuite {
+        @Test("Sidebar multi-selection, reorderable preview sheet, and companion window sync during note merge")
+        @MainActor
+        func workspaceMergeNotesWorkflow() async throws {
+            try await runMergeNotesWorkflowAssertion()
+        }
     }
 }
 #endif

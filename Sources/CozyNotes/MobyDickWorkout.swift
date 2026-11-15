@@ -218,11 +218,15 @@ struct MobyDickWorkout {
     }
 
     static func loadMobyDickMarkdown() throws -> String {
-        let candidateRoots: [URL] = [
-            ProcessInfo.processInfo.environment["COZY_VAULT"].map { URL(fileURLWithPath: $0, isDirectory: true) },
-            UserDefaults.standard.string(forKey: "vaultPath").map { URL(fileURLWithPath: $0, isDirectory: true) },
-            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent("Cozy Notes", isDirectory: true)
-        ].compactMap { $0 }
+        let candidateRoots: [URL]
+        if let envVault = ProcessInfo.processInfo.environment["COZY_VAULT"] {
+            candidateRoots = [URL(fileURLWithPath: envVault, isDirectory: true)]
+        } else {
+            candidateRoots = [
+                UserDefaults.standard.string(forKey: "vaultPath").map { URL(fileURLWithPath: $0, isDirectory: true) },
+                FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent("Cozy Notes", isDirectory: true)
+            ].compactMap { $0 }
+        }
 
         for root in candidateRoots {
             if let vault = try? Vault(root: root),
@@ -232,10 +236,10 @@ struct MobyDickWorkout {
             }
         }
 
-        var chapters: [String] = ["# MOBY DICK; OR THE WHALE\n\nby Herman Melville\n"]
-        let paragraph = "Call me Ishmael. Some years ago--never mind how long precisely--having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. "
+        var chapters: [String] = ["# Moby-Dick; or, The Whale\n"]
+        let para = "Call me Ishmael. Some years ago—never mind how long precisely—having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world and the White Whale. It is a way I have of driving off the spleen and regulating the circulation. Whenever I find myself growing grim about the mouth; whenever it is a damp, drizzly November in my soul, I account it high time to get to sea as soon as I can.\n\n"
         for ch in 1...135 {
-            chapters.append("## CHAPTER \(ch)\n\nLoomings.\n\n" + String(repeating: paragraph, count: 35) + "\n")
+            chapters.append("## CHAPTER \(ch). Loomings.\n\n" + String(repeating: para, count: 16))
         }
         return chapters.joined(separator: "\n")
     }
@@ -569,6 +573,7 @@ struct MobyDickWorkout {
 
                 textView.setSelectedRange(NSRange(location: 0, length: 0))
                 textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+                textView.layoutManager?.ensureGlyphs(forCharacterRange: NSRange(location: 0, length: expectedLength))
                 window.contentView?.layoutSubtreeIfNeeded()
                 window.displayIfNeeded()
 

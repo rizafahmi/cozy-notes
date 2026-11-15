@@ -98,46 +98,48 @@ final class CommandDownNavigationTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Command-arrow navigation", .serialized)
-struct CommandDownNavigationSuite {
-    @Test("Command+Down moves the Quick Switcher query to the line end and Command+Up returns to the start")
-    @MainActor
-    func quickSwitcherFieldNavigation() throws {
-        _ = NSApplication.shared
-        let overlay = QuickSwitcherOverlay(frame: .zero)
-        let window = makeKeyWindow(contentView: overlay)
-        defer { window.orderOut(nil) }
-        let ranges = try #require(fieldNavigationRanges(field: overlay.searchField, in: window))
-        #expect(ranges.down == NSRange(location: 11, length: 0))
-        #expect(ranges.up == NSRange(location: 0, length: 0))
-    }
+extension MobyDickWorkoutSuite {
+    @Suite("Command-arrow navigation", .serialized)
+    struct CommandDownNavigationSuite {
+        @Test("Command+Down moves the Quick Switcher query to the line end and Command+Up returns to the start")
+        @MainActor
+        func quickSwitcherFieldNavigation() throws {
+            _ = NSApplication.shared
+            let overlay = QuickSwitcherOverlay(frame: .zero)
+            let window = makeKeyWindow(contentView: overlay)
+            defer { window.orderOut(nil) }
+            let ranges = try #require(fieldNavigationRanges(field: overlay.searchField, in: window))
+            #expect(ranges.down == NSRange(location: 11, length: 0))
+            #expect(ranges.up == NSRange(location: 0, length: 0))
+        }
 
-    @Test("Command+Down moves the Find in Note query to the line end and Command+Up returns to the start")
-    @MainActor
-    func findInNoteFieldNavigation() throws {
-        _ = NSApplication.shared
-        let bar = InNoteFindBar(frame: .zero)
-        let window = makeKeyWindow(contentView: bar)
-        defer { window.orderOut(nil) }
-        let ranges = try #require(fieldNavigationRanges(field: bar.searchBar.field, in: window))
-        #expect(ranges.down == NSRange(location: 11, length: 0))
-        #expect(ranges.up == NSRange(location: 0, length: 0))
-    }
+        @Test("Command+Down moves the Find in Note query to the line end and Command+Up returns to the start")
+        @MainActor
+        func findInNoteFieldNavigation() throws {
+            _ = NSApplication.shared
+            let bar = InNoteFindBar(frame: .zero)
+            let window = makeKeyWindow(contentView: bar)
+            defer { window.orderOut(nil) }
+            let ranges = try #require(fieldNavigationRanges(field: bar.searchBar.field, in: window))
+            #expect(ranges.down == NSRange(location: 11, length: 0))
+            #expect(ranges.up == NSRange(location: 0, length: 0))
+        }
 
-    @Test("Command+Down still moves the note editor to the end of the document")
-    @MainActor
-    func noteEditorDocumentEnd() throws {
-        _ = NSApplication.shared
-        let editor = CaptureEditor(frame: .zero)
-        let window = makeKeyWindow(contentView: editor)
-        defer { window.orderOut(nil) }
-        editor.text = "first line\nsecond line\nthird line"
-        window.contentView?.layoutSubtreeIfNeeded()
-        let textView = editor.textView
-        #expect(window.makeFirstResponder(textView))
-        textView.setSelectedRange(NSRange(location: 3, length: 0))
-        sendCommandArrow(to: window, keyCode: 125, characters: "\u{F701}")
-        #expect(textView.selectedRange() == NSRange(location: editor.nsText.length, length: 0))
+        @Test("Command+Down still moves the note editor to the end of the document")
+        @MainActor
+        func noteEditorDocumentEnd() throws {
+            _ = NSApplication.shared
+            let editor = CaptureEditor(frame: .zero)
+            let window = makeKeyWindow(contentView: editor)
+            defer { window.orderOut(nil) }
+            editor.text = "first line\nsecond line\nthird line"
+            window.contentView?.layoutSubtreeIfNeeded()
+            let textView = editor.textView
+            #expect(window.makeFirstResponder(textView))
+            textView.setSelectedRange(NSRange(location: 3, length: 0))
+            sendCommandArrow(to: window, keyCode: 125, characters: "\u{F701}")
+            #expect(textView.selectedRange() == NSRange(location: editor.nsText.length, length: 0))
+        }
     }
 }
 #endif

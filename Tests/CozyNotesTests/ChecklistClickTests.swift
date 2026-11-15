@@ -260,12 +260,14 @@ final class ChecklistClickTests: XCTestCase {
 #endif
 
 #if canImport(Testing)
-@Suite("Checklist Click Interactions", .serialized)
-@MainActor
-struct ChecklistClickSuite {
-    @Test("Clicking task checkbox toggles between todo and done with undo support and without stealing caret")
-    func checklistMouseClickToggle() throws {
-        try verifyChecklistMouseClickToggle()
+extension MobyDickWorkoutSuite {
+    @Suite("Checklist Click Interactions", .serialized)
+    @MainActor
+    struct ChecklistClickSuite {
+        @Test("Clicking task checkbox toggles between todo and done with undo support and without stealing caret")
+        func checklistMouseClickToggle() throws {
+            try verifyChecklistMouseClickToggle()
+        }
     }
 }
 #endif
