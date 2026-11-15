@@ -113,10 +113,13 @@ fi
 
 # Request a graceful quit of any running Cozy Notes instance so applicationShouldTerminate
 # persists all open windows and Quick Capture drafts. Never force-kill (-9).
-running_pids="$(pgrep -x CozyNotes || true)"
-if [[ -n "$running_pids" ]]; then
-    printf 'Requesting graceful quit of running Cozy Notes (PID: %s)...\n' "$(echo "$running_pids" | tr '\n' ' ')"
-    osascript -e 'tell application id "local.cozy.notes" to quit' >/dev/null 2>&1 || kill -TERM $running_pids 2>/dev/null || true
+running_pids=()
+while IFS= read -r pid; do
+    [[ -n "$pid" ]] && running_pids+=("$pid")
+done < <(pgrep -x CozyNotes || true)
+if [[ ${#running_pids[@]} -gt 0 ]]; then
+    printf 'Requesting graceful quit of running Cozy Notes (PID: %s)...\n' "${running_pids[*]}"
+    osascript -e 'tell application id "local.cozy.notes" to quit' >/dev/null 2>&1 || kill -TERM "${running_pids[@]}" 2>/dev/null || true
     waited=0
     while pgrep -x CozyNotes >/dev/null 2>&1; do
         if [[ "$waited" -ge 100 ]]; then

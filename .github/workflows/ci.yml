@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS Build, Test & Package
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify toolchain
+        run: |
+          sw_vers
+          swift --version
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install shellcheck
+          fi
+          shellcheck --version
+
+      - name: Lint shell scripts
+        run: |
+          shellcheck scripts/build-macos.sh scripts/package-release-macos.sh
+
+      - name: Build Swift package
+        run: |
+          swift build -c release
+
+      - name: Run full test suite (Swift Testing)
+        run: |
+          swift test -c release --disable-xctest --no-parallel
+
+      - name: Verify release bundle and archive packaging
+        run: |
+          scripts/package-release-macos.sh
+          cd .build-app/release
+          shasum -a 256 -c Cozy-Notes-v*-macOS-*.zip.sha256
