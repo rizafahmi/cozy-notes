@@ -567,10 +567,17 @@ import CozyCore
     }
 
     @objc func showQuickSwitcher() {
+        showQuickSwitcher(initialQuery: nil)
+    }
+
+    func showQuickSwitcher(initialQuery: String?) {
         _ = persistCurrent()
         editor.hideWikiAutocomplete()
         let (snap, dates) = searchPanel.freshSnapshotAndModifiedDates()
         quickSwitcher.present(snapshot: snap, modifiedDates: dates)
+        if let initialQuery, !initialQuery.isEmpty {
+            quickSwitcher.query = initialQuery
+        }
     }
 
     func dismissQuickSwitcher() {

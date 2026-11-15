@@ -53,6 +53,22 @@ import CozyCore
             hotKey = try GlobalHotKey { [weak self] in self?.quickCapture?.summon() }
         } catch { showError(error, in: workspace?.window) }
         workspace?.showAndFocus()
+        if let openNoteIdx = arguments.firstIndex(of: "--open-note"),
+           arguments.indices.contains(openNoteIdx + 1),
+           let ws = workspace {
+            let rel = arguments[openNoteIdx + 1]
+            let target = ws.vault.root.appendingPathComponent(rel)
+            if FileManager.default.fileExists(atPath: target.path) {
+                ws.openNote(target)
+            }
+        }
+        if let qsIdx = arguments.firstIndex(of: "--quick-switcher") {
+            let nextIdx = qsIdx + 1
+            let initialQuery: String? = (arguments.indices.contains(nextIdx) && !arguments[nextIdx].hasPrefix("--"))
+                ? arguments[nextIdx]
+                : nil
+            workspace?.showQuickSwitcher(initialQuery: initialQuery)
+        }
     }
     @discardableResult
     func openVault(_ root: URL, persistPreference: Bool = true, replacing targetWorkspace: WorkspaceController? = nil) throws -> WorkspaceController {
