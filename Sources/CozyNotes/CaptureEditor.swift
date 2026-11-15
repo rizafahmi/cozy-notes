@@ -86,6 +86,7 @@ import CozyCore
     var onFoldStatusChange: ((String) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
     var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
+    var onClickTag: ((String) -> Void)?
     var onOpenMarkdownLink: ((MarkdownLink) -> Void)?
     var onClickMarkdownLink: ((MarkdownLink, NSPoint) -> Void)?
     var onCopyMarkdownLink: ((MarkdownLink) -> Void)?
@@ -173,6 +174,7 @@ import CozyCore
     var tableBlocks: [TableBlock] = []
     var inlineCodeRanges: [NSRange] = []
     var wikiLinkItems: [WikiLink] = []
+    var tagItems: [NoteTag] = []
     var markdownLinkItems: [MarkdownLink] = []
     var inNoteFindRanges: [NSRange] = []
     var activeInNoteFindIndex: Int = -1
@@ -285,7 +287,7 @@ import CozyCore
         if queryRect.width > 0 && queryRect.height > 0 {
             layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
         }
-        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !horizontalRuleRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
+        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !tagItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !horizontalRuleRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         let columnWidth = max(0, bounds.width - 2 * origin.x)
 
         let visibleGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: queryRect, in: textContainer)
@@ -467,6 +469,44 @@ import CozyCore
                     Theme.accentSoft.withAlphaComponent(0.65).setFill()
                     path.fill()
                     Theme.accent.withAlphaComponent(0.28).setStroke()
+                    path.lineWidth = 1
+                    path.stroke()
+                }
+            }
+        }
+
+        if !tagItems.isEmpty {
+            var lo = 0
+            var hi = tagItems.count
+            while lo < hi {
+                let mid = (lo + hi) >> 1
+                if NSMaxRange(tagItems[mid].fullRange) < visStart {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            for idx in lo..<tagItems.count {
+                let item = tagItems[idx]
+                if item.fullRange.location > visEnd { break }
+                guard NSMaxRange(item.fullRange) <= totalLength else { continue }
+                if isCharacterFolded(item.fullRange.location) { continue }
+                let glyphRange = layoutManager.glyphRange(forCharacterRange: item.fullRange, actualCharacterRange: nil)
+                layoutManager.enumerateEnclosingRects(
+                    forGlyphRange: glyphRange,
+                    withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                    in: textContainer
+                ) { raw, _ in
+                    let pill = NSRect(
+                        x: origin.x + raw.minX - 3,
+                        y: origin.y + raw.minY + 1,
+                        width: raw.width + 6,
+                        height: max(14, raw.height - 4)
+                    )
+                    let path = NSBezierPath(roundedRect: pill, xRadius: 5, yRadius: 5)
+                    Theme.sage.withAlphaComponent(0.14).setFill()
+                    path.fill()
+                    Theme.sage.withAlphaComponent(0.34).setStroke()
                     path.lineWidth = 1
                     path.stroke()
                 }
@@ -825,7 +865,7 @@ import CozyCore
     }
 
     private func refreshLinkHoverCursor(at windowPoint: NSPoint?, modifierFlags: NSEvent.ModifierFlags) {
-        if wikiLinkItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
+        if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
             if isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = false
                 NSCursor.iBeam.set()
@@ -849,7 +889,7 @@ import CozyCore
         }
         let overTaskCheckbox = isEditable && taskCheckbox(atPoint: pt) != nil
         let cmdHeld = modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
-        let overLink = (cmdHeld || !isEditable) && (markdownLink(atPoint: pt) != nil || wikiLink(atPoint: pt) != nil)
+        let overLink = (cmdHeld || !isEditable) && (markdownLink(atPoint: pt) != nil || wikiLink(atPoint: pt) != nil || noteTag(atPoint: pt) != nil)
         if overTaskCheckbox || overLink {
             if !isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = true
@@ -862,7 +902,7 @@ import CozyCore
     }
 
     override func mouseMoved(with event: NSEvent) {
-        if wikiLinkItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
+        if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
             super.mouseMoved(with: event)
             return
         }
@@ -1125,6 +1165,10 @@ import CozyCore
                     onOpenMarkdownLink?(mdLink)
                     return true
                 }
+                if let tag = noteTagAtCursor() {
+                    onClickTag?(tag.name)
+                    return true
+                }
             default:
                 break
             }
@@ -1289,6 +1333,10 @@ import CozyCore
                     onOpenMarkdownLink?(mdLink)
                     return true
                 }
+                if let tag = noteTagAtCursor() {
+                    onClickTag?(tag.name)
+                    return true
+                }
             }
         } else if flags == [.command, .option, .shift] {
             if key == "\r" || key == "\n" || key == "o" {
@@ -1384,6 +1432,11 @@ import CozyCore
                 onOpenMarkdownLink?(mdLink)
                 return
             }
+            if let tag = noteTag(atPoint: pt) {
+                onDismissLinkActionBar?()
+                onClickTag?(tag.name)
+                return
+            }
         }
         let clickedMarkdownLink = (!flags.contains(.control) && event.clickCount == 1)
             ? markdownLink(atPoint: pt)
@@ -1477,6 +1530,37 @@ import CozyCore
         let origin = textContainerOrigin
         let containerPt = NSPoint(x: pt.x - origin.x, y: pt.y - origin.y)
         for item in wikiLinkItems {
+            if isCharacterFolded(item.fullRange.location) { continue }
+            guard NSMaxRange(item.fullRange) <= totalLength else { continue }
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: item.fullRange, actualCharacterRange: nil)
+            guard glyphRange.length > 0 else { continue }
+            var matched = false
+            layoutManager.enumerateEnclosingRects(
+                forGlyphRange: glyphRange,
+                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                in: textContainer
+            ) { rect, stop in
+                if rect.insetBy(dx: -3, dy: -2).contains(containerPt) {
+                    matched = true
+                    stop.pointee = true
+                }
+            }
+            if matched {
+                return item
+            }
+        }
+        return nil
+    }
+
+    func noteTag(atPoint pt: NSPoint) -> NoteTag? {
+        guard !tagItems.isEmpty,
+              let layoutManager = layoutManager,
+              let textContainer = textContainer,
+              let storage = textStorage else { return nil }
+        let totalLength = storage.length
+        let origin = textContainerOrigin
+        let containerPt = NSPoint(x: pt.x - origin.x, y: pt.y - origin.y)
+        for item in tagItems {
             if isCharacterFolded(item.fullRange.location) { continue }
             guard NSMaxRange(item.fullRange) <= totalLength else { continue }
             let glyphRange = layoutManager.glyphRange(forCharacterRange: item.fullRange, actualCharacterRange: nil)
@@ -2272,6 +2356,18 @@ import CozyCore
         return Vault.wikiLink(inNSString: ns, at: sel.location, includeTrailingEdge: true)
     }
 
+    func noteTagAtCursor() -> NoteTag? {
+        let sel = selectedRange()
+        if let item = tagItems.first(where: {
+            !isCharacterFolded($0.fullRange.location)
+                && sel.location >= $0.fullRange.location
+                && sel.location <= NSMaxRange($0.fullRange)
+        }) {
+            return item
+        }
+        return nil
+    }
+
     func markdownLinkAtCursor() -> MarkdownLink? {
         let sel = selectedRange()
         return markdownLinkItems.first { item in
@@ -2286,6 +2382,8 @@ import CozyCore
             onOpenWikiLink?(link)
         } else if let mdLink = markdownLinkAtCursor() {
             onOpenMarkdownLink?(mdLink)
+        } else if let tag = noteTagAtCursor() {
+            onClickTag?(tag.name)
         }
     }
 
@@ -3317,8 +3415,24 @@ import CozyCore
         let subtitle: String
         let isCreateNew: Bool
         let noteURL: URL?
+        let tagName: String?
+
+        init(title: String, subtitle: String, isCreateNew: Bool, noteURL: URL?, tagName: String? = nil) {
+            self.title = title
+            self.subtitle = subtitle
+            self.isCreateNew = isCreateNew
+            self.noteURL = noteURL
+            self.tagName = tagName
+        }
     }
 
+    var headerTitle: String = "LINK TO NOTE" {
+        didSet {
+            if headerTitle != oldValue {
+                needsDisplay = true
+            }
+        }
+    }
     var items: [Item] = [] {
         didSet {
             if selectedIndex >= items.count {
@@ -3437,7 +3551,7 @@ import CozyCore
             .font: Theme.monoFont(9.0, weight: .regular),
             .foregroundColor: Theme.subtle
         ]
-        ("LINK TO NOTE" as NSString).draw(at: NSPoint(x: 12, y: 6), withAttributes: headerAttrs)
+        (headerTitle as NSString).draw(at: NSPoint(x: 12, y: 6), withAttributes: headerAttrs)
         let hint = "↑↓ · ↵ · esc" as NSString
         let hintSize = hint.size(withAttributes: hintAttrs)
         hint.draw(at: NSPoint(x: bounds.width - hintSize.width - 12, y: 6), withAttributes: hintAttrs)
@@ -3455,20 +3569,34 @@ import CozyCore
             let rowY = Self.headerHeight + CGFloat(visIdx) * Self.rowHeight
             let rowRect = NSRect(x: 5, y: rowY + 2, width: bounds.width - 10, height: Self.rowHeight - 4)
             let isSelected = (idx == selectedIndex)
+            let isTagItem = (item.tagName != nil)
 
             if isSelected {
                 let selPath = NSBezierPath(roundedRect: rowRect, xRadius: 6, yRadius: 6)
                 Theme.selectionFill.setFill()
                 selPath.fill()
                 let barRect = NSRect(x: rowRect.minX + 2, y: rowRect.minY + 6, width: 2.5, height: rowRect.height - 12)
-                Theme.accent.setFill()
+                (isTagItem ? Theme.sage : Theme.accent).setFill()
                 NSBezierPath(roundedRect: barRect, xRadius: 1.25, yRadius: 1.25).fill()
             }
 
-            let titleText = item.isCreateNew ? "Create “\(item.title)”" : item.title
+            let titleText: String
+            if isTagItem {
+                titleText = item.isCreateNew ? "Use #\(item.title)" : "#\(item.title)"
+            } else {
+                titleText = item.isCreateNew ? "Create “\(item.title)”" : item.title
+            }
+            let titleColor: NSColor
+            if isTagItem {
+                titleColor = item.isCreateNew ? Theme.sage : (isSelected ? Theme.headingInk : Theme.sage)
+            } else {
+                titleColor = item.isCreateNew ? Theme.accent : (isSelected ? Theme.headingInk : Theme.ink)
+            }
             let titleAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 12.5, weight: isSelected ? .semibold : .medium),
-                .foregroundColor: item.isCreateNew ? Theme.accent : (isSelected ? Theme.headingInk : Theme.ink),
+                .font: isTagItem
+                    ? Theme.monoFont(12.0, weight: isSelected ? .semibold : .medium)
+                    : NSFont.systemFont(ofSize: 12.5, weight: isSelected ? .semibold : .medium),
+                .foregroundColor: titleColor,
                 .paragraphStyle: pStyle
             ]
             let subAttrs: [NSAttributedString.Key: Any] = [
@@ -4116,6 +4244,7 @@ import CozyCore
     var onHorizontalInsetChange: ((CGFloat) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
     var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
+    var onClickTag: ((String) -> Void)?
     var urlOpener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
     var pasteboard: NSPasteboard = .general
     var onOpenCurrentNoteInNewWindow: (() -> Void)?
@@ -4252,6 +4381,7 @@ import CozyCore
         }
         textView.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
         textView.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
+        textView.onClickTag = { [weak self] tag in self?.onClickTag?(tag) }
         textView.onOpenMarkdownLink = { [weak self] link in self?.openMarkdownLink(link) }
         textView.onClickMarkdownLink = { [weak self] link, pt in self?.showLinkActionBar(for: link, preferredPoint: pt) }
         textView.onCopyMarkdownLink = { [weak self] link in self?.copyMarkdownLink(link, fromActionBar: false) }
@@ -4670,12 +4800,14 @@ import CozyCore
                 hideLinkActionBar(animated: true)
             }
         }
+        let activeOpenLoc = Vault.activeWikiLinkQuery(inNSString: ns, cursorLocation: sel.location)?.replacementRange.location
+            ?? Vault.activeTagQuery(inNSString: ns, cursorLocation: sel.location)?.replacementRange.location
         if isWikiAutocompleteVisible {
-            if sel.length > 0 || Vault.activeWikiLinkQuery(inNSString: ns, cursorLocation: sel.location)?.replacementRange.location != activeWikiOpenLocation {
+            if sel.length > 0 || activeOpenLoc != activeWikiOpenLocation {
                 hideWikiAutocomplete()
             }
         } else if let dismissed = dismissedWikiOpenLocation {
-            if Vault.activeWikiLinkQuery(inNSString: ns, cursorLocation: sel.location)?.replacementRange.location != dismissed {
+            if activeOpenLoc != dismissed {
                 dismissedWikiOpenLocation = nil
             }
         }
@@ -5537,8 +5669,11 @@ import CozyCore
             return false
         }
         let item = wikiCompletionView.items[targetIndex]
-        let replacement = "[[\(item.title)]]"
+        let replacement = item.tagName.map { "#\($0)" } ?? "[[\(item.title)]]"
         let nextCursor = NSRange(location: replaceRange.location + (replacement as NSString).length, length: 0)
+        if item.tagName != nil {
+            dismissedWikiOpenLocation = replaceRange.location
+        }
         hideWikiAutocomplete()
         textView.applyUndoableReplacement(in: replaceRange, with: replacement, selectedRangeAfter: nextCursor)
         window?.makeFirstResponder(textView)
@@ -5558,12 +5693,14 @@ import CozyCore
             return
         }
         let ns = nsText
-        guard let active = Vault.activeWikiLinkQuery(inNSString: ns, cursorLocation: cursor) else {
+        let activeWiki = Vault.activeWikiLinkQuery(inNSString: ns, cursorLocation: cursor)
+        let activeTag = activeWiki == nil ? Vault.activeTagQuery(inNSString: ns, cursorLocation: cursor) : nil
+        guard let replacementRange = activeWiki?.replacementRange ?? activeTag?.replacementRange else {
             dismissedWikiOpenLocation = nil
             hideWikiAutocomplete()
             return
         }
-        let openLoc = active.replacementRange.location
+        let openLoc = replacementRange.location
         if !force, dismissedWikiOpenLocation == openLoc {
             return
         }
@@ -5578,18 +5715,30 @@ import CozyCore
             notes = loaded
         }
 
-        let items = Self.buildWikiCompletionItems(
-            for: active.query,
-            notes: notes,
-            currentNoteURL: currentNoteURLProvider?()
-        )
+        let items: [WikiLinkCompletionView.Item]
+        if let activeWiki {
+            wikiCompletionView.headerTitle = "LINK TO NOTE"
+            items = Self.buildWikiCompletionItems(
+                for: activeWiki.query,
+                notes: notes,
+                currentNoteURL: currentNoteURLProvider?()
+            )
+        } else if let activeTag {
+            wikiCompletionView.headerTitle = "INSERT TAG"
+            items = Self.buildTagCompletionItems(
+                for: activeTag.query,
+                notes: notes
+            )
+        } else {
+            items = []
+        }
         guard !items.isEmpty else {
             hideWikiAutocomplete()
             return
         }
         let isNewPopup = (activeWikiOpenLocation != openLoc) || wikiCompletionView.isHidden
         activeWikiOpenLocation = openLoc
-        activeWikiReplacementRange = active.replacementRange
+        activeWikiReplacementRange = replacementRange
         wikiCompletionView.items = items
         if isNewPopup {
             wikiCompletionView.selectedIndex = 0
@@ -5613,6 +5762,77 @@ import CozyCore
             y = min(max(8, bounds.height - size.height - 8), caretInEditor.maxY + 6)
         }
         wikiCompletionView.frame = NSRect(x: round(x), y: round(y), width: size.width, height: size.height)
+    }
+
+    static func buildTagCompletionItems(
+        for rawQuery: String,
+        notes: [NoteRecord]
+    ) -> [WikiLinkCompletionView.Item] {
+        var counts: [String: Int] = [:]
+        for note in notes {
+            for tag in note.tags {
+                counts[tag, default: 0] += 1
+            }
+        }
+        let trimmed = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var results: [WikiLinkCompletionView.Item] = []
+        if trimmed.isEmpty {
+            let sorted = counts.sorted { a, b in
+                if a.value != b.value { return a.value > b.value }
+                return a.key < b.key
+            }
+            for entry in sorted.prefix(8) {
+                results.append(WikiLinkCompletionView.Item(
+                    title: entry.key,
+                    subtitle: "\(entry.value) \(entry.value == 1 ? "note" : "notes")",
+                    isCreateNew: false,
+                    noteURL: nil,
+                    tagName: entry.key
+                ))
+            }
+            return results
+        }
+
+        var scored: [(score: Int, count: Int, name: String)] = []
+        for (name, count) in counts {
+            let score: Int
+            if name == trimmed {
+                score = 100
+            } else if name.hasPrefix(trimmed) {
+                score = 80
+            } else if name.contains(trimmed) {
+                score = 60
+            } else {
+                continue
+            }
+            scored.append((score, count, name))
+        }
+        scored.sort { a, b in
+            if a.score != b.score { return a.score > b.score }
+            if a.count != b.count { return a.count > b.count }
+            return a.name < b.name
+        }
+        for entry in scored.prefix(6) {
+            results.append(WikiLinkCompletionView.Item(
+                title: entry.name,
+                subtitle: "\(entry.count) \(entry.count == 1 ? "note" : "notes")",
+                isCreateNew: false,
+                noteURL: nil,
+                tagName: entry.name
+            ))
+        }
+        if counts[trimmed] == nil {
+            results.append(WikiLinkCompletionView.Item(
+                title: trimmed,
+                subtitle: "New tag",
+                isCreateNew: true,
+                noteURL: nil,
+                tagName: trimmed
+            ))
+        }
+        return results
     }
 
     static func buildWikiCompletionItems(
@@ -5701,6 +5921,7 @@ import CozyCore
         let hasLinkOpen: Bool
         let hasAutoLink: Bool
         let hasWikiLink: Bool
+        let hasHash: Bool
         let hasPipe: Bool
     }
     private var lastScanResult: DocumentScanResult?
@@ -5738,6 +5959,7 @@ import CozyCore
                 hasLinkOpen: false,
                 hasAutoLink: false,
                 hasWikiLink: false,
+                hasHash: false,
                 hasPipe: false
             )
         }
@@ -5754,6 +5976,7 @@ import CozyCore
         var hasLinkOpen = false
         var hasAutoLink = false
         var hasWikiLink = false
+        var hasHash = false
         var hasPipe = false
         var prevChar: UniChar = 0
         var runBackticks = 0
@@ -5816,7 +6039,9 @@ import CozyCore
                             runBackticks &+= 1
                             if runBackticks >= 3 { hasTripleBacktick = true }
                         } else {
-                            if u == 0x7C {
+                            if u == 0x23 {
+                                hasHash = true
+                            } else if u == 0x7C {
                                 hasPipe = true
                             } else if u == 0x28 && prevChar == 0x5D {
                                 hasLinkOpen = true
@@ -5852,6 +6077,7 @@ import CozyCore
             hasLinkOpen: hasLinkOpen,
             hasAutoLink: hasAutoLink,
             hasWikiLink: hasWikiLink,
+            hasHash: hasHash,
             hasPipe: hasPipe
         )
     }
@@ -5874,6 +6100,7 @@ import CozyCore
                 hasLinkOpen: false,
                 hasAutoLink: false,
                 hasWikiLink: false,
+                hasHash: false,
                 hasPipe: false
             )
         }
@@ -5986,9 +6213,10 @@ import CozyCore
             var h: [MarkdownTextView.HeadingGutter] = []
             var c: [NSRange] = []
             var w: [WikiLink] = []
+            var t: [NoteTag] = []
             var m: [MarkdownTextView.MarkdownLink] = []
             var b: [MarkdownTextView.BulletItem] = []
-            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, markdownLinks: &m, bullets: &b)
+            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
         }
         if newNeeds, newLine != oldLine, NSMaxRange(newLine) <= ns.length {
             var q: [NSRange] = []
@@ -5996,9 +6224,10 @@ import CozyCore
             var h: [MarkdownTextView.HeadingGutter] = []
             var c: [NSRange] = []
             var w: [WikiLink] = []
+            var t: [NoteTag] = []
             var m: [MarkdownTextView.MarkdownLink] = []
             var b: [MarkdownTextView.BulletItem] = []
-            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, markdownLinks: &m, bullets: &b)
+            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
         }
         storage.endEditing()
         applyEditorChromeAttributes()
@@ -6028,6 +6257,7 @@ import CozyCore
         }
         if ns.range(of: "*", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
+        if ns.range(of: "#", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "](", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "__", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "<", options: .literal, range: lineRange).location != NSNotFound { return true }
@@ -6058,6 +6288,7 @@ import CozyCore
             || textView.horizontalRuleRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
             || textView.inlineCodeRanges.contains { NSIntersectionRange($0, oldLineRange).length > 0 || $0.location == oldLineRange.location }
             || textView.wikiLinkItems.contains { NSIntersectionRange($0.fullRange, oldLineRange).length > 0 || $0.fullRange.location == oldLineRange.location }
+            || textView.tagItems.contains { NSIntersectionRange($0.fullRange, oldLineRange).length > 0 || $0.fullRange.location == oldLineRange.location }
             || textView.markdownLinkItems.contains { NSIntersectionRange($0.fullRange, oldLineRange).length > 0 || $0.fullRange.location == oldLineRange.location }
             || textView.bulletItems.contains { NSIntersectionRange($0.lineRange, oldLineRange).length > 0 || $0.lineRange.location == oldLineRange.location }
 
@@ -6093,6 +6324,9 @@ import CozyCore
                 for i in textView.wikiLinkItems.indices where textView.wikiLinkItems[i].fullRange.location >= shiftStart {
                     textView.wikiLinkItems[i] = Self.shiftWikiLink(textView.wikiLinkItems[i], by: delta)
                 }
+                for i in textView.tagItems.indices where textView.tagItems[i].fullRange.location >= shiftStart {
+                    textView.tagItems[i] = Self.shiftNoteTag(textView.tagItems[i], by: delta)
+                }
                 for i in textView.markdownLinkItems.indices where textView.markdownLinkItems[i].fullRange.location >= shiftStart {
                     textView.markdownLinkItems[i] = Self.shiftMarkdownLink(textView.markdownLinkItems[i], by: delta)
                 }
@@ -6116,13 +6350,14 @@ import CozyCore
         var newHeadings: [MarkdownTextView.HeadingGutter] = []
         var newCodes: [NSRange] = []
         var newWikiLinks: [WikiLink] = []
+        var newTags: [NoteTag] = []
         var newMarkdownLinks: [MarkdownTextView.MarkdownLink] = []
         var newBullets: [MarkdownTextView.BulletItem] = []
         let cursor = textView.selectedRange()
 
         textView.undoManager?.disableUndoRegistration()
         storage.beginEditing()
-        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, horizontalRules: &newHorizontalRules, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, markdownLinks: &newMarkdownLinks, bullets: &newBullets)
+        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, horizontalRules: &newHorizontalRules, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, tags: &newTags, markdownLinks: &newMarkdownLinks, bullets: &newBullets)
         storage.endEditing()
         textView.undoManager?.enableUndoRegistration()
 
@@ -6212,6 +6447,22 @@ import CozyCore
         }
         if !insertedWikiLinks { updatedWikiLinks.append(contentsOf: newWikiLinks) }
         textView.wikiLinkItems = updatedWikiLinks
+
+        var updatedTags: [NoteTag] = []
+        var insertedTags = false
+        for item in textView.tagItems {
+            if NSMaxRange(item.fullRange) <= oldLineRange.location && item.fullRange.location < oldLineRange.location {
+                updatedTags.append(item)
+            } else if item.fullRange.location >= oldEnd {
+                if !insertedTags {
+                    updatedTags.append(contentsOf: newTags)
+                    insertedTags = true
+                }
+                updatedTags.append(Self.shiftNoteTag(item, by: delta))
+            }
+        }
+        if !insertedTags { updatedTags.append(contentsOf: newTags) }
+        textView.tagItems = updatedTags
 
         var updatedMarkdownLinks: [MarkdownTextView.MarkdownLink] = []
         var insertedMarkdownLinks = false
@@ -6318,6 +6569,7 @@ import CozyCore
             textView.headingGutterItems = []
             textView.inlineCodeRanges = []
             textView.wikiLinkItems = []
+            textView.tagItems = []
             textView.markdownLinkItems = []
             textView.fencedBlocks = []
             textView.tableBlocks = []
@@ -6335,11 +6587,12 @@ import CozyCore
         var headings: [MarkdownTextView.HeadingGutter] = []
         var inlinePills: [NSRange] = []
         var wikiLinks: [WikiLink] = []
+        var tags: [NoteTag] = []
         var markdownLinks: [MarkdownTextView.MarkdownLink] = []
         var bullets: [MarkdownTextView.BulletItem] = []
         var parsedFences: [MarkdownTextView.FencedBlock] = []
 
-        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, horizontalRules: &horizontalRules, headings: &headings, codes: &inlinePills, wikiLinks: &wikiLinks, markdownLinks: &markdownLinks, bullets: &bullets)
+        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, horizontalRules: &horizontalRules, headings: &headings, codes: &inlinePills, wikiLinks: &wikiLinks, tags: &tags, markdownLinks: &markdownLinks, bullets: &bullets)
         if scan.hasTripleBacktick && ns.range(of: "```", options: .literal, range: range).location != NSNotFound {
             let codeBodyParagraph = NSMutableParagraphStyle()
             codeBodyParagraph.lineSpacing = 4.5
@@ -6435,6 +6688,9 @@ import CozyCore
             wikiLinks.removeAll { link in
                 parsedFences.contains { NSIntersectionRange($0.fullRange, link.fullRange).length > 0 }
             }
+            tags.removeAll { tag in
+                parsedFences.contains { NSIntersectionRange($0.fullRange, tag.fullRange).length > 0 }
+            }
             markdownLinks.removeAll { link in
                 parsedFences.contains { NSIntersectionRange($0.fullRange, link.fullRange).length > 0 }
             }
@@ -6469,6 +6725,7 @@ import CozyCore
         textView.headingGutterItems = headings
         textView.inlineCodeRanges = inlinePills
         textView.wikiLinkItems = wikiLinks
+        textView.tagItems = tags
         textView.markdownLinkItems = markdownLinks
         textView.fencedBlocks = parsedFences
         textView.tableBlocks = parsedTables
@@ -6923,6 +7180,14 @@ import CozyCore
         )
     }
 
+    private static func shiftNoteTag(_ item: NoteTag, by delta: Int) -> NoteTag {
+        NoteTag(
+            name: item.name,
+            fullRange: NSRange(location: item.fullRange.location + delta, length: item.fullRange.length),
+            nameRange: NSRange(location: item.nameRange.location + delta, length: item.nameRange.length)
+        )
+    }
+
     private static func shiftMarkdownLink(_ item: MarkdownTextView.MarkdownLink, by delta: Int) -> MarkdownTextView.MarkdownLink {
         MarkdownTextView.MarkdownLink(
             fullRange: NSRange(location: item.fullRange.location + delta, length: item.fullRange.length),
@@ -7291,6 +7556,7 @@ import CozyCore
         headings: inout [MarkdownTextView.HeadingGutter],
         codes: inout [NSRange],
         wikiLinks: inout [WikiLink],
+        tags: inout [NoteTag],
         markdownLinks: inout [MarkdownTextView.MarkdownLink],
         bullets: inout [MarkdownTextView.BulletItem]
     ) {
@@ -7323,6 +7589,7 @@ import CozyCore
         let checkDoubleTilde = scan?.hasDoubleTilde ?? true
 
         let checkWikiLink = scan?.hasWikiLink ?? true
+        let checkHash = scan?.hasHash ?? true
         // 1. Inline spans via fast literal search on NSString
         if checkDoubleStar && ns.range(of: "**", options: .literal, range: targetRange).location != NSNotFound {
             let boldFont = Theme.bodyFont(proseSize, weight: .semibold)
@@ -7881,6 +8148,32 @@ import CozyCore
 
         if markdownLinks.count > 1 {
             markdownLinks.sort { $0.fullRange.location < $1.fullRange.location }
+        }
+
+        if checkHash && ns.range(of: "#", options: .literal, range: targetRange).location != NSNotFound {
+            let tagFont = Theme.monoFont(proseSize - 1.5, weight: .medium)
+            let hashAttrs: [NSAttributedString.Key: Any] = [
+                .font: tagFont,
+                .foregroundColor: Theme.sage.withAlphaComponent(0.72),
+                .kern: 0.1
+            ]
+            let tagAttrs: [NSAttributedString.Key: Any] = [
+                .font: tagFont,
+                .foregroundColor: Theme.sage,
+                .kern: 0.1
+            ]
+            let parsedTags = Vault.tags(inNSString: ns, range: targetRange)
+            for item in parsedTags {
+                if codes.contains(where: { NSIntersectionRange($0, item.fullRange).length > 0 })
+                    || wikiLinks.contains(where: { NSIntersectionRange($0.fullRange, item.fullRange).length > 0 })
+                    || inlineLinkSpans.contains(where: { NSIntersectionRange($0, item.fullRange).length > 0 })
+                    || markdownLinks.contains(where: { NSIntersectionRange($0.fullRange, item.fullRange).length > 0 }) {
+                    continue
+                }
+                tags.append(item)
+                storage.addAttributes(hashAttrs, range: NSRange(location: item.fullRange.location, length: 1))
+                storage.addAttributes(tagAttrs, range: item.nameRange)
+            }
         }
     }
 }

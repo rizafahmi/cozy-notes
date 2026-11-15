@@ -378,6 +378,19 @@ import CozyCore
         editor.currentNoteURLProvider = { [weak self] in self?.noteURL }
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in _ = self?.openWikiLinkInNewWindow(link) }
+        editor.onClickTag = { [weak self] tag in
+            guard let self else { return }
+            if self.isSidebarCollapsed {
+                self.toggleSidebar()
+            }
+            if self.searchPanel.activeTagFilter == tag {
+                self.searchPanel.setTagFilter(nil)
+                self.editor.status.stringValue = "Cleared #\(tag) filter."
+            } else {
+                self.searchPanel.setTagFilter(tag)
+                self.editor.status.stringValue = "Filtered sidebar by #\(tag)."
+            }
+        }
         editor.onOpenCurrentNoteInNewWindow = { [weak self] in self?.openCurrentNoteInNewWindow() }
         editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
         editor.onQuickSwitcher = { [weak self] in self?.toggleQuickSwitcher() }
