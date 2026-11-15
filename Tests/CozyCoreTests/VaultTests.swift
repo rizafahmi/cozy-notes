@@ -319,12 +319,21 @@ final class VaultTests: XCTestCase {
         try "// swift-tools-version: 5.9\n".write(to: fixture.root.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
         XCTAssertTrue(fixture.vault.isProjectRepository)
 
-        // Create Markdown docs at root and in docs/
+        // Create Markdown docs at root, in docs/, and in monorepo packages/
         let planURL = fixture.root.appendingPathComponent("PLAN.md")
         let archURL = fixture.root.appendingPathComponent("docs/architecture.md")
+        let pkgReadmeURL = fixture.root.appendingPathComponent("packages/core/README.md")
         try fm.createDirectory(at: archURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: pkgReadmeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "# Execution Plan\nStep 1".write(to: planURL, atomically: true, encoding: .utf8)
         try "# System Architecture\nLayers".write(to: archURL, atomically: true, encoding: .utf8)
+        try "# Core Package\nMonorepo module".write(to: pkgReadmeURL, atomically: true, encoding: .utf8)
+
+        // Legacy NuGet packages directory marked by repositories.config is still pruned
+        let nugetDir = fixture.root.appendingPathComponent("legacy-nuget/sub", isDirectory: true)
+        try fm.createDirectory(at: nugetDir, withIntermediateDirectories: true)
+        try "<repositories/>".write(to: fixture.root.appendingPathComponent("legacy-nuget/repositories.config"), atomically: true, encoding: .utf8)
+        try "# Ignored NuGet Doc".write(to: nugetDir.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
 
         // Create ignored directories (node_modules, build, target, vendor) containing .md files
         for ignored in ["node_modules/pkg", "build/gen", "target/debug", "vendor/bundle", "DerivedData/Index"] {
@@ -345,11 +354,12 @@ final class VaultTests: XCTestCase {
         let captured = try fixture.vault.capture(text: "# Captured Scratchpad\nNotes", attachments: [externalImg])
 
         let noteURLs = Set(try fixture.vault.notes().map(\.url))
-        XCTAssertEqual(noteURLs, Set([planURL, archURL, captured.url]))
+        XCTAssertEqual(noteURLs, Set([planURL, archURL, pkgReadmeURL, captured.url]))
 
         let sources = try fixture.vault.sourceFiles()
         XCTAssertTrue(sources.contains(planURL))
         XCTAssertTrue(sources.contains(archURL))
+        XCTAssertTrue(sources.contains(pkgReadmeURL))
         XCTAssertTrue(sources.contains(captured.url))
         XCTAssertTrue(sources.contains { $0.lastPathComponent == "screenshot.png" && $0.path.contains("/Attachments/") })
         XCTAssertFalse(sources.contains { $0.lastPathComponent == "main.swift" })

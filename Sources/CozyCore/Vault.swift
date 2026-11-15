@@ -2035,7 +2035,7 @@ public final class Vault: @unchecked Sendable {
     public static let projectIgnoredDirectoryNames: Set<String> = [
         "build", "dist", "out", "target", "vendor",
         "deps", "_build", "_checkouts", "ebin",
-        "bin", "obj", "coverage", "gradle", "packages", "checkouts",
+        "bin", "obj", "coverage", "gradle", "checkouts",
         "subprojects", "third_party", "third-party", "3rdparty", "3rd-party", "thirdparty",
         "artifacts", "testresults", "zig-out",
         "_esy", "_site", "godeps", "blib",
@@ -2067,7 +2067,8 @@ public final class Vault: @unchecked Sendable {
     private static let ignoredDirectoryMarkerFiles: [String] = [
         "pyvenv.cfg",
         "conda-meta",
-        "CACHEDIR.TAG"
+        "CACHEDIR.TAG",
+        "repositories.config"
     ]
 
     public static func shouldIgnoreDirectory(_ url: URL, inRepository: Bool, fileManager: FileManager = .default) -> Bool {
