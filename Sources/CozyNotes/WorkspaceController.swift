@@ -374,7 +374,10 @@ import CozyCore
         editor.onAttachFiles = { [weak self] urls in self?.attachFilesToCurrentNote(urls) }
         editor.onRemoveLinkedAttachment = { [weak self] item in self?.removeLinkedAttachment(item) }
         editor.onHorizontalInsetChange = { [weak self] inset in self?.syncFolioMargins(inset) }
-        editor.noteRecordsProvider = { [weak self] in (try? self?.vault.notes()) ?? [] }
+        editor.noteRecordsProvider = { [weak self] in
+            guard let self else { return [] }
+            return self.searchPanel.cachedNoteRecords() ?? (try? self.vault.notes()) ?? []
+        }
         editor.currentNoteURLProvider = { [weak self] in self?.noteURL }
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in _ = self?.openWikiLinkInNewWindow(link) }
@@ -396,13 +399,22 @@ import CozyCore
         editor.onQuickSwitcher = { [weak self] in self?.toggleQuickSwitcher() }
         editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
         quickSwitcher.onOpenNote = { [weak self] url in self?.openNote(url) }
+        quickSwitcher.onOpenNoteWithQuery = { [weak self] url, query in
+            self?.openNoteFromQuickSwitcher(url, query: query, inNewWindow: false)
+        }
         quickSwitcher.onOpenNoteInNewWindow = { [weak self] url in _ = self?.openNoteInNewWindow(url) }
+        quickSwitcher.onOpenNoteInNewWindowWithQuery = { [weak self] url, query in
+            self?.openNoteFromQuickSwitcher(url, query: query, inNewWindow: true)
+        }
         quickSwitcher.onTogglePinNote = { [weak self] url in self?.togglePinNoteReturningPaths(url) }
         quickSwitcher.onOpenExternal = { [weak self] url in
             if !NSWorkspace.shared.open(url) {
                 self?.editor.status.stringValue = "No viewer could open \(url.lastPathComponent)."
             }
             self?.editor.focus()
+        }
+        quickSwitcher.onOpenAttachmentHit = { [weak self] url, query, inNewWindow, forceExternal in
+            self?.openAttachmentFromQuickSwitcher(url, query: query, inNewWindow: inNewWindow, forceExternal: forceExternal)
         }
         quickSwitcher.onDismiss = { [weak self] in self?.editor.focus() }
         quickSwitcher.onShowSidebarSearch = { [weak self] in self?.showInNoteFind() }
@@ -1022,6 +1034,10 @@ import CozyCore
             return existing
         }
         let controller = NoteWindowController(vault: vault, appearance: window?.appearance)
+        controller.editor.noteRecordsProvider = { [weak self] in
+            guard let self else { return [] }
+            return self.searchPanel.cachedNoteRecords() ?? (try? self.vault.notes()) ?? []
+        }
         if let anchor = (noteWindows.last?.window ?? window), let win = controller.window {
             let anchorFrame = anchor.frame
             let nextOrigin = NSPoint(x: anchorFrame.minX + 36, y: anchorFrame.maxY - win.frame.height - 28)
@@ -1051,9 +1067,75 @@ import CozyCore
             self?.noteWindows.removeAll { $0 === closed }
         }
         noteWindows.append(controller)
-        controller.openNote(url)
+        if noteURL == url && !noteConflicted {
+            controller.openNote(url, initialText: noteBaseline, initialLinkedAttachments: editor.linkedAttachments)
+        } else {
+            controller.openNote(url)
+        }
         controller.showAndFocus()
         return controller
+    }
+
+    private func openNoteFromQuickSwitcher(_ url: URL, query: String, inNewWindow: Bool) {
+        if inNewWindow {
+            guard let controller = openNoteInNewWindow(url) else { return }
+            if !query.isEmpty {
+                controller.editor.revealSearchQuery(query)
+            }
+        } else {
+            openNote(url)
+            if noteURL == url, !query.isEmpty {
+                editor.revealSearchQuery(query)
+            }
+        }
+    }
+
+    private func openAttachmentFromQuickSwitcher(_ attachmentURL: URL, query: String, inNewWindow: Bool, forceExternal: Bool) {
+        if !forceExternal, let parentNoteURL = findReferencingNoteURL(for: attachmentURL) {
+            if inNewWindow {
+                guard let controller = openNoteInNewWindow(parentNoteURL) else { return }
+                if !query.isEmpty {
+                    _ = controller.editor.revealSearchQuery(query)
+                }
+                _ = controller.editor.revealLinkedAttachment(attachmentURL)
+            } else {
+                openNote(parentNoteURL)
+                guard noteURL == parentNoteURL else { return }
+                if !query.isEmpty {
+                    _ = editor.revealSearchQuery(query)
+                }
+                _ = editor.revealLinkedAttachment(attachmentURL)
+            }
+            return
+        }
+        if !NSWorkspace.shared.open(attachmentURL) {
+            editor.status.stringValue = "No viewer could open \(attachmentURL.lastPathComponent)."
+        }
+        editor.focus()
+    }
+
+    private func findReferencingNoteURL(for attachmentURL: URL) -> URL? {
+        let targetStandardized = attachmentURL.standardizedFileURL
+        if let activeURL = noteURL,
+           editor.linkedAttachments.contains(where: { $0.url.standardizedFileURL == targetStandardized }) {
+            return activeURL
+        }
+        let candidateURLs: [URL]
+        if let cached = searchPanel.cachedNoteRecords() {
+            candidateURLs = cached.map(\.url)
+        } else if let notes = try? vault.notes() {
+            candidateURLs = notes.map(\.url)
+        } else {
+            return nil
+        }
+        for candidateURL in candidateURLs {
+            guard let text = try? vault.read(candidateURL) else { continue }
+            let attachments = vault.linkedAttachments(in: text, relativeTo: candidateURL)
+            if attachments.contains(where: { $0.url.standardizedFileURL == targetStandardized }) {
+                return candidateURL
+            }
+        }
+        return nil
     }
 
     private func syncSavedNoteToCompanions(_ url: URL, content: String) {
@@ -1246,8 +1328,16 @@ import CozyCore
             ]), in: alertHost)
             return
         }
-        let title = (try? vault.notes().first(where: { $0.url == url })?.title)
-            ?? url.deletingPathExtension().lastPathComponent
+        let title: String
+        if noteURL == url {
+            title = Vault.extractedTitle(from: editor.text, fallbackURL: url)
+        } else if let cached = searchPanel.cachedNoteRecords()?.first(where: { $0.url == url })?.title {
+            title = cached
+        } else if let text = try? vault.read(url) {
+            title = Vault.extractedTitle(from: text, fallbackURL: url)
+        } else {
+            title = url.deletingPathExtension().lastPathComponent
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Delete “\(title)”?"
@@ -1859,14 +1949,14 @@ import CozyCore
         editor.focus()
     }
 
-    func openNote(_ url: URL) {
+    func openNote(_ url: URL, initialText: String? = nil, initialLinkedAttachments: [LinkedAttachment]? = nil) {
         if noteURL == url && !noteConflicted {
             editor.focus()
             return
         }
         guard persistCurrent() else { return }
         do {
-            let text = try vault.read(url)
+            let text = try initialText ?? vault.read(url)
             noteURL = url
             noteBaseline = text
             noteDirty = false
@@ -1877,7 +1967,7 @@ import CozyCore
             cachedNoteStamp = nil
             editor.clearPendingAttachments()
             editor.text = text
-            editor.linkedAttachments = vault.linkedAttachments(inNSString: editor.nsText, relativeTo: url)
+            editor.linkedAttachments = initialLinkedAttachments ?? vault.linkedAttachments(inNSString: editor.nsText, relativeTo: url)
             editor.status.stringValue = ""
             updateEditorChrome()
             editor.focus()
@@ -2237,9 +2327,13 @@ import CozyCore
             let nextContext = "\(prefix)\(stamp)\(stateSuffix)"
             if contextLabel.stringValue != nextContext { contextLabel.stringValue = nextContext }
             window?.representedURL = noteURL
-            let title = (try? vault.notes().first(where: { $0.url == noteURL })?.title)
-                ?? noteURL.deletingPathExtension().lastPathComponent
-            window?.title = title
+            let ns = editor.nsText
+            let headLen = min(ns.length, 512)
+            let head = headLen > 0 ? ns.substring(with: NSRange(location: 0, length: headLen)) : ""
+            let title = Vault.extractedTitle(from: head, fallbackURL: noteURL)
+            if window?.title != title {
+                window?.title = title
+            }
         } else {
             contextLabel.stringValue = "COMPARISON FOLIO"
             window?.representedURL = vault.root

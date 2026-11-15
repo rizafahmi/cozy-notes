@@ -741,19 +741,72 @@ public final class Vault: @unchecked Sendable {
         return relParts.isEmpty ? encodedFilename(targetFile.lastPathComponent) : relParts.joined(separator: "/")
     }
 
-    private static func extractedTitle(from text: String, fallbackURL: URL) -> String {
-        let lines = text.components(separatedBy: .newlines)
-        if let index = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
-            return title(from: lines[index])
+    public static func titleAndExcerpt(from text: String, fallbackURL: URL, maxExcerptCharacters: Int = 240) -> (title: String, excerpt: String) {
+        var resolvedTitle: String?
+        var excerpt = ""
+        excerpt.reserveCapacity(min(maxExcerptCharacters + 64, 304))
+        text.enumerateLines { line, stop in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if resolvedTitle == nil {
+                guard !trimmed.isEmpty else { return }
+                resolvedTitle = title(from: line)
+                if maxExcerptCharacters <= 0 {
+                    stop = true
+                }
+                return
+            }
+            guard !trimmed.isEmpty else { return }
+            if !excerpt.isEmpty {
+                excerpt.append(" ")
+            }
+            let remaining = maxExcerptCharacters - excerpt.count
+            if remaining <= 0 {
+                stop = true
+                return
+            }
+            if trimmed.count >= remaining {
+                excerpt.append(contentsOf: trimmed.prefix(remaining))
+                stop = true
+            } else {
+                excerpt.append(trimmed)
+            }
         }
-        return fallbackURL.deletingPathExtension().lastPathComponent
+        let finalTitle = resolvedTitle ?? fallbackURL.deletingPathExtension().lastPathComponent
+        return (finalTitle, String(excerpt.prefix(maxExcerptCharacters)))
+    }
+
+    public static func extractedTitle(from text: String, fallbackURL: URL) -> String {
+        titleAndExcerpt(from: text, fallbackURL: fallbackURL, maxExcerptCharacters: 0).title
     }
 
     private static func extractedExcerpt(from text: String) -> String {
-        let lines = text.components(separatedBy: .newlines)
-        let index = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        let excerpt = lines.enumerated().filter { $0.offset != index }.map(\.element)
-            .joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        var foundTitle = false
+        var excerpt = ""
+        excerpt.reserveCapacity(304)
+        text.enumerateLines { line, stop in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !foundTitle {
+                if !trimmed.isEmpty {
+                    foundTitle = true
+                }
+                return
+            }
+            guard !trimmed.isEmpty else { return }
+            if !excerpt.isEmpty {
+                excerpt.append(" ")
+            }
+            let remaining = 240 - excerpt.count
+            if remaining <= 0 {
+                stop = true
+                return
+            }
+            if trimmed.count >= remaining {
+                excerpt.append(contentsOf: trimmed.prefix(remaining))
+                stop = true
+            } else {
+                excerpt.append(trimmed)
+            }
+        }
         return String(excerpt.prefix(240))
     }
 
@@ -1703,16 +1756,12 @@ public final class Vault: @unchecked Sendable {
 
     private func record(_ url: URL, pinnedPaths: Set<String>? = nil) throws -> NoteRecord {
         let text = try read(url)
-        let lines = text.components(separatedBy: .newlines)
-        let index = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        let title = index.map { Self.title(from: lines[$0]) } ?? url.deletingPathExtension().lastPathComponent
-        let excerpt = lines.enumerated().filter { $0.offset != index }.map(\.element)
-            .joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let (title, excerpt) = Self.titleAndExcerpt(from: text, fallbackURL: url)
         let modified = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
         let pinnedSet = pinnedPaths ?? pinnedRelativePathsLocked()
         let isPinned = (try? relativeNotePathLocked(url)).map { pinnedSet.contains($0) } ?? false
         let tags = Self.extractTagNames(from: text)
-        return NoteRecord(url: url, title: title, modifiedAt: modified, excerpt: String(excerpt.prefix(240)), isPinned: isPinned, tags: tags)
+        return NoteRecord(url: url, title: title, modifiedAt: modified, excerpt: excerpt, isPinned: isPinned, tags: tags)
     }
 
     private func relativeNotePathLocked(_ noteURL: URL) throws -> String {

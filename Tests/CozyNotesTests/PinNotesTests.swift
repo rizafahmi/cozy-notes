@@ -151,11 +151,83 @@ private func runPinningWorkflowAssertion() async throws {
     )
 }
 
+@MainActor
+private func runQuickSwitcherSearchMatchHandoffAssertion() async throws {
+    let fixture = try PinWorkspaceFixture()
+    defer { fixture.cleanup() }
+
+    let firstNote = try fixture.vault.capture(text: "# First Note\nNothing special here.")
+    let deepBody = (1...30).map { "Paragraph \($0) filler prose." }.joined(separator: "\n\n")
+    let targetNote = try fixture.vault.capture(
+        text: "# Research Log\n\n\(deepBody)\n\n## Hidden Section\n\nThe ambergris specimen was catalogued at dawn.\n\nAnother ambergris reference appears below."
+    )
+
+    let attachmentSource = fixture.directory.appendingPathComponent("field-sketch.txt")
+    try "sketch contents".write(to: attachmentSource, atomically: true, encoding: .utf8)
+    let firstNoteText = try fixture.vault.read(firstNote.url)
+    let updatedWithAttachment = try fixture.vault.attach(
+        [attachmentSource],
+        to: firstNote.url,
+        text: firstNoteText,
+        expectedContent: firstNoteText
+    )
+    XCTAssertTrue(updatedWithAttachment.contains("field-sketch.txt"))
+
+    fixture.workspace.window?.makeKeyAndOrderFront(nil)
+    fixture.workspace.openNote(firstNote.url)
+    fixture.workspace.searchPanel.refresh()
+    let indexed = await waitUntil {
+        !fixture.workspace.searchPanel.isProcessing && fixture.workspace.searchPanel.visibleHits.count >= 2
+    }
+    XCTAssertTrue(indexed)
+
+    // Fold the "## Hidden Section" in targetNote first, then verify Quick Switcher unfolds, selects, and highlights matches
+    fixture.workspace.openNote(targetNote.url)
+    fixture.workspace.editor.textView.foldAllHeadings(nil)
+    fixture.workspace.openNote(firstNote.url)
+
+    fixture.workspace.showQuickSwitcher()
+    XCTAssertTrue(fixture.workspace.isQuickSwitcherVisible)
+    fixture.workspace.quickSwitcher.query = "ambergris"
+    XCTAssertEqual(fixture.workspace.quickSwitcher.hits.first?.source.url, targetNote.url)
+
+    XCTAssertTrue(fixture.workspace.quickSwitcher.confirmSelection())
+    XCTAssertFalse(fixture.workspace.isQuickSwitcherVisible)
+    XCTAssertEqual(fixture.workspace.noteURL, targetNote.url)
+    XCTAssertFalse(fixture.workspace.editor.inNoteFindBar.isHidden)
+    XCTAssertEqual(fixture.workspace.editor.inNoteFindBar.query, "ambergris")
+    XCTAssertEqual(fixture.workspace.editor.textView.inNoteFindRanges.count, 2)
+    XCTAssertEqual(fixture.workspace.editor.textView.activeInNoteFindIndex, 0)
+    let firstMatchRange = fixture.workspace.editor.textView.inNoteFindRanges[0]
+    XCTAssertEqual(fixture.workspace.editor.textView.selectedRange(), firstMatchRange)
+    XCTAssertTrue(fixture.workspace.window?.firstResponder === fixture.workspace.editor.textView)
+
+    // ⌘G advances directly to the second match without re-typing the query
+    fixture.workspace.findNextInNote()
+    XCTAssertEqual(fixture.workspace.editor.textView.activeInNoteFindIndex, 1)
+    XCTAssertEqual(fixture.workspace.editor.textView.selectedRange(), fixture.workspace.editor.textView.inNoteFindRanges[1])
+
+    // Confirming an attachment hit in Quick Switcher navigates to the referencing parent note and selects its markdown link
+    fixture.workspace.showQuickSwitcher()
+    fixture.workspace.quickSwitcher.query = "field-sketch"
+    let attachmentHitIndex = try XCTUnwrap(
+        fixture.workspace.quickSwitcher.hits.firstIndex(where: { $0.source.kind != .note })
+    )
+    XCTAssertTrue(fixture.workspace.quickSwitcher.confirmSelection(at: attachmentHitIndex))
+    XCTAssertEqual(fixture.workspace.noteURL, firstNote.url)
+    let selectedInFirst = (fixture.workspace.editor.nsText).substring(with: fixture.workspace.editor.textView.selectedRange())
+    XCTAssertTrue(selectedInFirst.contains("field-sketch.txt"))
+}
+
 #if canImport(XCTest)
 @MainActor
 final class PinNotesTests: XCTestCase {
     func testWorkspaceSidebarQuickSwitcherAndCompanionPinning() async throws {
         try await runPinningWorkflowAssertion()
+    }
+
+    func testQuickSwitcherSearchMatchHandoffAndAttachmentParentNavigation() async throws {
+        try await runQuickSwitcherSearchMatchHandoffAssertion()
     }
 }
 #endif
@@ -168,6 +240,12 @@ extension MobyDickWorkoutSuite {
         @MainActor
         func workspacePinningWorkflow() async throws {
             try await runPinningWorkflowAssertion()
+        }
+
+        @Test("Quick Switcher hands off search query to in-note find and resolves attachment hits to parent note")
+        @MainActor
+        func quickSwitcherSearchMatchHandoff() async throws {
+            try await runQuickSwitcherSearchMatchHandoffAssertion()
         }
     }
 }

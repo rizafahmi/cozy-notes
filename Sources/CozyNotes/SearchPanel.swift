@@ -258,6 +258,24 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         return (snapshot, dates)
     }
 
+    func cachedNoteRecords() -> [NoteRecord]? {
+        guard let snapshot else { return nil }
+        var records: [NoteRecord] = []
+        records.reserveCapacity(snapshot.sources.count)
+        for source in snapshot.sources where source.kind == .note {
+            let modified = stamps[source.url]?.modified ?? .distantPast
+            records.append(NoteRecord(
+                url: source.url,
+                title: source.title,
+                modifiedAt: modified,
+                excerpt: source.detail,
+                isPinned: source.isPinned,
+                tags: source.tags
+            ))
+        }
+        return records
+    }
+
     func selectNote(_ url: URL?) {
         activeNoteURL = url
         suppressSelectionAction = true
@@ -1300,9 +1318,12 @@ private final class SearchHitCell: NSTableCellView {
 final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     let searchField = NSSearchField()
     var onOpenNote: ((URL) -> Void)?
+    var onOpenNoteWithQuery: ((URL, String) -> Void)?
     var onOpenNoteInNewWindow: ((URL) -> Void)?
+    var onOpenNoteInNewWindowWithQuery: ((URL, String) -> Void)?
     var onTogglePinNote: ((URL) -> Set<String>?)?
     var onOpenExternal: ((URL) -> Void)?
+    var onOpenAttachmentHit: ((URL, String, Bool, Bool) -> Void)?
     var onDismiss: (() -> Void)?
     var onShowSidebarSearch: (() -> Void)?
 
@@ -1573,13 +1594,25 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         let row = explicitRow ?? (table.selectedRow >= 0 ? table.selectedRow : 0)
         guard hits.indices.contains(row) else { return false }
         let hit = hits[row]
+        let activeQuery = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let forceExternal = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command) == true
         isHidden = true
         if hit.source.kind == .note {
-            if inNewWindow, let onOpenNoteInNewWindow {
-                onOpenNoteInNewWindow(hit.source.url)
+            if inNewWindow {
+                if let onOpenNoteInNewWindowWithQuery {
+                    onOpenNoteInNewWindowWithQuery(hit.source.url, activeQuery)
+                } else {
+                    onOpenNoteInNewWindow?(hit.source.url)
+                }
             } else {
-                onOpenNote?(hit.source.url)
+                if let onOpenNoteWithQuery {
+                    onOpenNoteWithQuery(hit.source.url, activeQuery)
+                } else {
+                    onOpenNote?(hit.source.url)
+                }
             }
+        } else if let onOpenAttachmentHit {
+            onOpenAttachmentHit(hit.source.url, activeQuery, inNewWindow, forceExternal)
         } else {
             onOpenExternal?(hit.source.url)
         }

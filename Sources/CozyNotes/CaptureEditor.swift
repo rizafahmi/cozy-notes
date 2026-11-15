@@ -5436,6 +5436,66 @@ import CozyCore
         inNoteFindBar.focusField()
     }
 
+    @discardableResult
+    func revealSearchQuery(_ rawQuery: String) -> Bool {
+        let trimmed = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let ns = nsText
+        guard ns.length > 0 else { return false }
+        var candidates: [String] = [trimmed]
+        let tokens = trimmed
+            .components(separatedBy: .whitespacesAndNewlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for token in tokens where token.caseInsensitiveCompare(trimmed) != .orderedSame {
+            candidates.append(token)
+        }
+        var matchedTerm: String?
+        for candidate in candidates {
+            let cleanCandidate = candidate.hasPrefix("#") && candidate.count > 1
+                ? String(candidate.dropFirst())
+                : candidate
+            if ns.range(of: candidate, options: [.caseInsensitive]).location != NSNotFound {
+                matchedTerm = candidate
+                break
+            }
+            if cleanCandidate != candidate,
+               ns.range(of: cleanCandidate, options: [.caseInsensitive]).location != NSNotFound {
+                matchedTerm = cleanCandidate
+                break
+            }
+        }
+        guard let term = matchedTerm else { return false }
+        vimSearchWholeWord = false
+        isVimSearchingPrompt = false
+        vimSearchDirection = .forward
+        inNoteFindBar.searchBar.field.placeholderString = "Find in note…"
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        inNoteFindBar.query = term
+        inNoteFindBar.isHidden = false
+        updateInNoteFindMatches(scrollToMatch: true)
+        window?.makeFirstResponder(textView)
+        return !textView.inNoteFindRanges.isEmpty
+    }
+
+    @discardableResult
+    func revealLinkedAttachment(_ attachmentURL: URL) -> Bool {
+        let standardizedTarget = attachmentURL.standardizedFileURL
+        guard let item = linkedAttachments.first(where: { $0.url.standardizedFileURL == standardizedTarget }) else {
+            return false
+        }
+        let targetRange = item.markdownRange
+        guard NSMaxRange(targetRange) <= nsText.length else { return false }
+        if textView.isCharacterFolded(targetRange.location) {
+            textView.unfoldSectionsIntersecting(targetRange)
+        }
+        textView.setSelectedRange(targetRange)
+        textView.scrollRangeToVisible(targetRange)
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
+        window?.makeFirstResponder(textView)
+        return true
+    }
+
     @objc func hideInNoteFind() {
         let wasVimPrompt = isVimSearchingPrompt
         isVimSearchingPrompt = false
