@@ -23,13 +23,27 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onStatus: ((String) -> Void)?
     var isProcessing: Bool { busy }
     var isExtracting: Bool { extracting }
+    enum SidebarRow {
+        case sectionHeader(title: String, folderPath: String, itemCount: Int)
+        case hit(SearchHit)
+
+        var hit: SearchHit? {
+            if case .hit(let hit) = self { return hit }
+            return nil
+        }
+
+        var isSectionHeader: Bool {
+            if case .sectionHeader = self { return true }
+            return false
+        }
+    }
+
     var selectedNoteURL: URL? {
         if table.selectedRowIndexes.count > 1 {
             return selectedNoteURLs.first
         }
-        let row = table.selectedRow
-        guard hits.indices.contains(row), hits[row].source.kind == .note else { return nil }
-        return hits[row].source.url
+        guard let hit = hit(atRow: table.selectedRow), hit.source.kind == .note else { return nil }
+        return hit.source.url
     }
     var selectedNoteURLs: [URL] {
         syncOrderedSelectionFromTable()
@@ -37,6 +51,13 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
     var isSidebarFocused: Bool { window?.firstResponder === table }
     var visibleHits: [SearchHit] { hits }
+    var visibleSectionTitles: [String] {
+        rows.compactMap { row in
+            if case .sectionHeader(let title, _, _) = row { return title }
+            return nil
+        }
+    }
+    var totalRowCount: Int { rows.count }
     private(set) var activeTagFilter: String?
     var availableTags: [TagCount] { snapshot?.tagCounts ?? [] }
 
@@ -57,10 +78,13 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private var openButton: QuietButton!
     private var moreButton: QuietButton!
     private var snapshot: SearchSnapshot?
+    private var rows: [SidebarRow] = []
     private var hits: [SearchHit] = []
     private var stamps: [URL: SearchFileStamp] = [:]
     private var activeNoteURL: URL?
     private var orderedSelectedNoteURLs: [URL] = []
+    private var selectionAnchorRow: Int?
+    private var selectionCursorRow: Int?
     private var suppressSelectionAction = false
     private var scheduledRefresh: DispatchWorkItem?
     private var operation: SearchCancellation?
@@ -167,9 +191,10 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.dataSource = self
         table.target = self
         table.action = #selector(rowClicked)
-        table.doubleAction = #selector(openSelected)
+        table.doubleAction = #selector(rowDoubleClicked)
         table.onReturn = { [weak self] in self?.openSelected() }
         table.onOptionReturn = { [weak self] in self?.openSelectedInNewWindow() }
+        table.onMoveVertical = { [weak self] delta, extending in self?.moveVerticalSelection(delta: delta, extending: extending) }
         table.onTogglePin = { [weak self] in self?.togglePinSelectedNote() }
         table.onMerge = { [weak self] in self?.mergeSelectedNotes() }
         table.onDelete = { [weak self] in self?.deleteSelectedNote() }
@@ -228,15 +253,111 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         bounds.fill()
     }
 
+    func hit(atRow row: Int) -> SearchHit? {
+        guard rows.indices.contains(row) else { return nil }
+        return rows[row].hit
+    }
+
+    func isSectionHeaderRow(_ row: Int) -> Bool {
+        rows.indices.contains(row) && rows[row].isSectionHeader
+    }
+
+    var firstSelectableRowIndex: Int? {
+        rows.firstIndex(where: { $0.hit != nil })
+    }
+
+    func rowIndex(for noteURL: URL, page: Int? = nil) -> Int? {
+        let canonical = noteURL.standardizedFileURL.resolvingSymlinksInPath()
+        return rows.firstIndex { row in
+            guard let hit = row.hit else { return false }
+            return hit.source.url == canonical && (page == nil || hit.page == page)
+        }
+    }
+
+    func displayedTitle(atRow row: Int) -> String? {
+        guard rows.indices.contains(row) else { return nil }
+        table.layoutSubtreeIfNeeded()
+        if let sectionCell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? SidebarSectionHeaderCell {
+            return sectionCell.displayedTitle
+        }
+        if let hitCell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? SearchHitCell {
+            return hitCell.displayedTitle
+        }
+        return nil
+    }
+
+    func displayedPath(atRow row: Int) -> String? {
+        guard rows.indices.contains(row) else { return nil }
+        table.layoutSubtreeIfNeeded()
+        return (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? SearchHitCell)?.displayedPath
+    }
+
+    func displayedSnippet(atRow row: Int) -> String? {
+        guard rows.indices.contains(row) else { return nil }
+        table.layoutSubtreeIfNeeded()
+        return (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? SearchHitCell)?.displayedSnippet
+    }
+
     func focusSidebar() {
         guard !closed else { return }
-        if table.selectedRow < 0, !hits.isEmpty {
+        if table.selectedRow < 0, let firstRow = firstSelectableRowIndex {
             suppressSelectionAction = true
-            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            table.selectRowIndexes(IndexSet(integer: firstRow), byExtendingSelection: false)
+            selectionAnchorRow = firstRow
+            selectionCursorRow = firstRow
             suppressSelectionAction = false
             syncOrderedSelectionFromTable()
         }
         window?.makeFirstResponder(table)
+    }
+
+    private func moveVerticalSelection(delta: Int, extending: Bool) {
+        guard !closed, !busy else { return }
+        let selectable = rows.indices.filter { !rows[$0].isSectionHeader }
+        guard !selectable.isEmpty else { return }
+
+        if !extending {
+            let current = selectionCursorRow.flatMap { table.selectedRowIndexes.contains($0) ? $0 : nil }
+                ?? (table.selectedRow >= 0 && !isSectionHeaderRow(table.selectedRow) ? table.selectedRow : nil)
+            let target: Int
+            if let current {
+                if delta > 0 {
+                    target = selectable.first(where: { $0 > current }) ?? current
+                } else {
+                    target = selectable.last(where: { $0 < current }) ?? current
+                }
+            } else {
+                target = delta > 0 ? selectable[0] : selectable[selectable.count - 1]
+            }
+            selectionAnchorRow = target
+            selectionCursorRow = target
+            if table.selectedRowIndexes != IndexSet(integer: target) {
+                table.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
+            }
+            if delta < 0, target > 0, isSectionHeaderRow(target - 1) {
+                table.scrollRowToVisible(target - 1)
+            } else {
+                table.scrollRowToVisible(target)
+            }
+            return
+        }
+
+        let fallbackAnchor = table.selectedRow >= 0 && !isSectionHeaderRow(table.selectedRow) ? table.selectedRow : selectable[0]
+        let anchor = selectionAnchorRow.flatMap { !isSectionHeaderRow($0) ? $0 : nil } ?? fallbackAnchor
+        let cursor = selectionCursorRow.flatMap { !isSectionHeaderRow($0) ? $0 : nil } ?? anchor
+        let nextCursor: Int
+        if delta > 0 {
+            nextCursor = selectable.first(where: { $0 > cursor }) ?? cursor
+        } else {
+            nextCursor = selectable.last(where: { $0 < cursor }) ?? cursor
+        }
+        selectionAnchorRow = anchor
+        selectionCursorRow = nextCursor
+        let low = min(anchor, nextCursor)
+        let high = max(anchor, nextCursor)
+        let proposed = IndexSet(selectable.filter { $0 >= low && $0 <= high })
+        table.selectRowIndexes(proposed, byExtendingSelection: false)
+        table.scrollRowToVisible(nextCursor)
     }
 
     func freshSnapshotAndModifiedDates() -> (snapshot: SearchSnapshot?, dates: [URL: Date]) {
@@ -280,15 +401,19 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         activeNoteURL = url
         suppressSelectionAction = true
         defer { suppressSelectionAction = false }
-        guard let url, let row = hits.firstIndex(where: { $0.source.url == url }) else {
+        guard let url, let row = rowIndex(for: url), let selectedHit = hit(atRow: row) else {
             orderedSelectedNoteURLs = []
+            selectionAnchorRow = nil
+            selectionCursorRow = nil
             table.deselectAll(nil)
             updateOpenButtonVisibility()
             updateFooterSummary()
             return
         }
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        orderedSelectedNoteURLs = hits[row].source.kind == .note ? [url] : []
+        selectionAnchorRow = row
+        selectionCursorRow = row
+        orderedSelectedNoteURLs = selectedHit.source.kind == .note ? [selectedHit.source.url] : []
         updateOpenButtonVisibility()
         updateFooterSummary()
     }
@@ -298,16 +423,22 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         defer { suppressSelectionAction = false }
         var rowIndexes = IndexSet()
         var ordered: [URL] = []
+        var firstRow: Int?
+        var lastRow: Int?
         for url in urls {
             let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
-            if let row = hits.firstIndex(where: { $0.source.kind == .note && $0.source.url == canonical }) {
+            if let row = rowIndex(for: canonical), let rowHit = hit(atRow: row), rowHit.source.kind == .note {
                 rowIndexes.insert(row)
+                if firstRow == nil { firstRow = row }
+                lastRow = row
                 if !ordered.contains(canonical) {
                     ordered.append(canonical)
                 }
             }
         }
         orderedSelectedNoteURLs = ordered
+        selectionAnchorRow = firstRow
+        selectionCursorRow = lastRow
         if rowIndexes.isEmpty {
             table.deselectAll(nil)
         } else {
@@ -319,8 +450,9 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     private func syncOrderedSelectionFromTable() {
         var currentNotes: [URL] = []
-        for row in table.selectedRowIndexes where hits.indices.contains(row) && hits[row].source.kind == .note {
-            let url = hits[row].source.url
+        for row in table.selectedRowIndexes {
+            guard let rowHit = hit(atRow: row), rowHit.source.kind == .note else { continue }
+            let url = rowHit.source.url
             if !currentNotes.contains(url) {
                 currentNotes.append(url)
             }
@@ -545,50 +677,153 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         render()
     }
 
+    static func isManagedFlatPath(_ relativePath: String) -> Bool {
+        relativePath.hasPrefix("Inbox/") || relativePath.hasPrefix("Attachments/")
+    }
+
+    static func folderKey(for relativePath: String) -> String {
+        guard let slash = relativePath.lastIndex(of: "/") else { return "" }
+        return String(relativePath[..<slash])
+    }
+
+    static func sectionTitle(forFolderKey key: String) -> String {
+        key.isEmpty ? "ROOT" : key.uppercased()
+    }
+
+    private func compareStructuredHits(_ lhs: SearchHit, _ rhs: SearchHit) -> Bool {
+        let left = stamps[lhs.source.url]?.modified ?? .distantPast
+        let right = stamps[rhs.source.url]?.modified ?? .distantPast
+        if left != right { return left > right }
+        let lhsName = (lhs.source.relativePath as NSString).lastPathComponent
+        let rhsName = (rhs.source.relativePath as NSString).lastPathComponent
+        let lhsIsReadme = lhsName.caseInsensitiveCompare("README.md") == .orderedSame
+        let rhsIsReadme = rhsName.caseInsensitiveCompare("README.md") == .orderedSame
+        if lhsIsReadme != rhsIsReadme { return lhsIsReadme }
+        return lhs.source.relativePath.localizedStandardCompare(rhs.source.relativePath) == .orderedAscending
+    }
+
+    private func buildSidebarRows(from rawHits: [SearchHit]) -> (rows: [SidebarRow], orderedHits: [SearchHit]) {
+        guard !rawHits.isEmpty else { return ([], []) }
+        let useFolderSections = vault.isProjectRepository
+            || (snapshot?.sources.contains(where: { !Self.isManagedFlatPath($0.relativePath) }) == true)
+            || rawHits.contains(where: { !Self.isManagedFlatPath($0.source.relativePath) })
+        guard useFolderSections else {
+            var flat = rawHits
+            flat.sort {
+                if $0.source.isPinned != $1.source.isPinned {
+                    return $0.source.isPinned && !$1.source.isPinned
+                }
+                let left = stamps[$0.source.url]?.modified ?? .distantPast
+                let right = stamps[$1.source.url]?.modified ?? .distantPast
+                return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
+            }
+            return (flat.map { .hit($0) }, flat)
+        }
+
+        var pinned: [SearchHit] = []
+        var grouped: [String: [SearchHit]] = [:]
+        for item in rawHits {
+            if item.source.isPinned {
+                pinned.append(item)
+            } else {
+                let key = Self.folderKey(for: item.source.relativePath)
+                grouped[key, default: []].append(item)
+            }
+        }
+        pinned.sort(by: compareStructuredHits)
+
+        var orderedKeys: [String] = []
+        if grouped[""] != nil {
+            orderedKeys.append("")
+        }
+        let subfolderKeys = grouped.keys
+            .filter { !$0.isEmpty && $0 != "Inbox" && $0 != "Attachments" }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        orderedKeys.append(contentsOf: subfolderKeys)
+        if grouped["Inbox"] != nil {
+            orderedKeys.append("Inbox")
+        }
+        if grouped["Attachments"] != nil {
+            orderedKeys.append("Attachments")
+        }
+
+        var builtRows: [SidebarRow] = []
+        var orderedHits: [SearchHit] = []
+        orderedHits.reserveCapacity(rawHits.count)
+
+        if !pinned.isEmpty {
+            builtRows.append(.sectionHeader(title: "PINNED", folderPath: "Pinned", itemCount: pinned.count))
+            for item in pinned {
+                builtRows.append(.hit(item))
+                orderedHits.append(item)
+            }
+        }
+
+        for key in orderedKeys {
+            guard var group = grouped[key], !group.isEmpty else { continue }
+            group.sort(by: compareStructuredHits)
+            let title = Self.sectionTitle(forFolderKey: key)
+            let folderPath = key.isEmpty ? vault.root.lastPathComponent : key
+            builtRows.append(.sectionHeader(title: title, folderPath: folderPath, itemCount: group.count))
+            for item in group {
+                builtRows.append(.hit(item))
+                orderedHits.append(item)
+            }
+        }
+
+        return (builtRows, orderedHits)
+    }
+
     private func render() {
         guard !closed else { return }
         syncOrderedSelectionFromTable()
-        let previousMultiNotes = table.selectedRowIndexes.count > 1 ? orderedSelectedNoteURLs : []
-        let selectedHit = table.selectedRow >= 0 && table.selectedRow < hits.count ? hits[table.selectedRow] : nil
+        let previousMultiNotes = orderedSelectedNoteURLs.count > 1 ? orderedSelectedNoteURLs : []
+        let selectedHit = hit(atRow: table.selectedRow)
         let targetURL = selectedHit?.source.url ?? activeNoteURL
         let targetPage = selectedHit?.page
         let previousOffset = table.enclosingScrollView?.contentView.bounds.origin ?? .zero
         let allTagCounts = snapshot?.tagCounts ?? []
         tagFilterBar.update(tags: allTagCounts, activeTag: activeTagFilter)
-        hits = snapshot?.search("", tagFilter: activeTagFilter) ?? []
-        hits.sort {
-            if $0.source.isPinned != $1.source.isPinned {
-                return $0.source.isPinned && !$1.source.isPinned
-            }
-            let left = stamps[$0.source.url]?.modified ?? .distantPast
-            let right = stamps[$1.source.url]?.modified ?? .distantPast
-            return left == right ? $0.source.relativePath < $1.source.relativePath : left > right
-        }
+        let rawHits = snapshot?.search("", tagFilter: activeTagFilter) ?? []
+        let built = buildSidebarRows(from: rawHits)
+        rows = built.rows
+        hits = built.orderedHits
         suppressSelectionAction = true
         table.reloadData()
         if previousMultiNotes.count > 1 {
             var restoredIndexes = IndexSet()
             var restoredOrdered: [URL] = []
+            var firstRow: Int?
+            var lastRow: Int?
             for url in previousMultiNotes {
-                if let row = hits.firstIndex(where: { $0.source.kind == .note && $0.source.url == url }) {
+                if let row = rowIndex(for: url), let rowHit = hit(atRow: row), rowHit.source.kind == .note {
                     restoredIndexes.insert(row)
+                    if firstRow == nil { firstRow = row }
+                    lastRow = row
                     restoredOrdered.append(url)
                 }
             }
             orderedSelectedNoteURLs = restoredOrdered
+            selectionAnchorRow = firstRow
+            selectionCursorRow = lastRow
             if !restoredIndexes.isEmpty {
                 table.selectRowIndexes(restoredIndexes, byExtendingSelection: false)
             }
         } else if let targetURL,
-                  let row = hits.firstIndex(where: { $0.source.url == targetURL && (targetPage == nil || $0.page == targetPage) }) {
+                  let row = rowIndex(for: targetURL, page: targetPage),
+                  let rowHit = hit(atRow: row) {
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            orderedSelectedNoteURLs = hits[row].source.kind == .note ? [hits[row].source.url] : []
+            selectionAnchorRow = row
+            selectionCursorRow = row
+            orderedSelectedNoteURLs = rowHit.source.kind == .note ? [rowHit.source.url] : []
         } else {
             orderedSelectedNoteURLs = []
+            selectionAnchorRow = nil
+            selectionCursorRow = nil
         }
         suppressSelectionAction = false
         if let scroll = table.enclosingScrollView {
-            let height = hits.isEmpty ? 0 : table.rect(ofRow: hits.count - 1).maxY
+            let height = rows.isEmpty ? 0 : table.rect(ofRow: rows.count - 1).maxY
             let y = min(previousOffset.y, max(0, height - scroll.contentView.bounds.height))
             scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
             scroll.reflectScrolledClipView(scroll.contentView)
@@ -630,8 +865,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             openButton.isHidden = true
             return
         }
-        let row = table.selectedRow
-        let selected = row >= 0 && row < hits.count ? hits[row] : nil
+        let selected = hit(atRow: table.selectedRow)
         openButton.isEnabled = !busy && !hits.isEmpty
         openButton.isHidden = selected == nil || selected?.source.kind == .note
     }
@@ -656,41 +890,74 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         onStatus?(text)
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { hits.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        isSectionHeaderRow(row) ? 26 : 74
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        rows.indices.contains(row) && !rows[row].isSectionHeader
+    }
+
+    func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposedSelectionIndexes: IndexSet) -> IndexSet {
+        IndexSet(proposedSelectionIndexes.filter { rows.indices.contains($0) && !rows[$0].isSectionHeader })
+    }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        guard rows.indices.contains(row) else { return nil }
+        if rows[row].isSectionHeader {
+            let headerRow = SidebarSectionHeaderRow()
+            headerRow.drawsTopSeparator = row > 0
+            return headerRow
+        }
         let rowView = SearchHitRow()
-        rowView.isLastPinnedBeforeUnpinned = hits.indices.contains(row)
-            && hits[row].source.isPinned
-            && row + 1 < hits.count
-            && !hits[row + 1].source.isPinned
+        let currentHit = rows[row].hit
+        let nextHit = (row + 1 < rows.count) ? rows[row + 1].hit : nil
+        rowView.isLastPinnedBeforeUnpinned = currentHit?.source.isPinned == true
+            && nextHit != nil
+            && nextHit?.source.isPinned == false
+        rowView.hidesBottomSeparator = (row + 1 < rows.count && rows[row + 1].isSectionHeader)
         return rowView
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard hits.indices.contains(row) else { return nil }
-        let id = NSUserInterfaceItemIdentifier("SearchHit")
-        let cell = (tableView.makeView(withIdentifier: id, owner: self) as? SearchHitCell) ?? SearchHitCell(frame: .zero)
-        cell.identifier = id
-        let hit = hits[row]
-        let noteURL = hit.source.url
-        cell.onTogglePin = hit.source.kind == .note ? { [weak self] in
-            guard let self, !self.closed, !self.busy else { return }
-            self.onTogglePinNote?(noteURL)
-        } : nil
-        cell.show(hit, modifiedAt: stamps[hit.source.url]?.modified)
-        return cell
+        guard rows.indices.contains(row) else { return nil }
+        switch rows[row] {
+        case .sectionHeader(let title, let folderPath, let itemCount):
+            let id = NSUserInterfaceItemIdentifier("SidebarSectionHeader")
+            let cell = (tableView.makeView(withIdentifier: id, owner: self) as? SidebarSectionHeaderCell) ?? SidebarSectionHeaderCell(frame: .zero)
+            cell.identifier = id
+            cell.show(title: title, folderPath: folderPath, itemCount: itemCount)
+            return cell
+        case .hit(let hit):
+            let id = NSUserInterfaceItemIdentifier("SearchHit")
+            let cell = (tableView.makeView(withIdentifier: id, owner: self) as? SearchHitCell) ?? SearchHitCell(frame: .zero)
+            cell.identifier = id
+            let noteURL = hit.source.url
+            cell.onTogglePin = hit.source.kind == .note ? { [weak self] in
+                guard let self, !self.closed, !self.busy else { return }
+                self.onTogglePinNote?(noteURL)
+            } : nil
+            cell.show(hit, modifiedAt: stamps[hit.source.url]?.modified)
+            return cell
+        }
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         syncOrderedSelectionFromTable()
+        if table.selectedRowIndexes.count == 1, let single = table.selectedRowIndexes.first {
+            selectionAnchorRow = single
+            selectionCursorRow = single
+        } else if table.selectedRowIndexes.isEmpty {
+            selectionAnchorRow = nil
+            selectionCursorRow = nil
+        }
         updateOpenButtonVisibility()
         updateFooterSummary()
         guard !suppressSelectionAction, !closed, !busy else { return }
         guard table.selectedRowIndexes.count == 1 else { return }
-        let row = table.selectedRow
-        guard hits.indices.contains(row) else { return }
-        let hit = hits[row]
+        guard let hit = hit(atRow: table.selectedRow) else { return }
         let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
         let eventType = NSApp.currentEvent?.type
         let isContextClick = eventType == .rightMouseDown || (eventType == .leftMouseDown && flags.contains(.control))
@@ -703,17 +970,23 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     @objc private func rowClicked() {
         guard !closed, !busy else { return }
+        if table.clickedRow >= 0, isSectionHeaderRow(table.clickedRow) { return }
         syncOrderedSelectionFromTable()
         let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
         guard table.selectedRowIndexes.count <= 1,
               !flags.contains(.command),
               !flags.contains(.shift) else { return }
         let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
-        guard hits.indices.contains(row) else { return }
-        let hit = hits[row]
+        guard let hit = hit(atRow: row) else { return }
         if hit.source.kind == .note {
             activateHit(hit, allowExternalViewer: false, inNewWindow: flags.contains(.option))
         }
+    }
+
+    @objc private func rowDoubleClicked() {
+        guard !closed, !busy else { return }
+        if table.clickedRow >= 0, isSectionHeaderRow(table.clickedRow) { return }
+        openSelected()
     }
 
     @objc func openSelected() {
@@ -722,16 +995,18 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             mergeSelectedNotes()
             return
         }
-        let row = table.selectedRow >= 0 ? table.selectedRow : 0
-        guard hits.indices.contains(row) else { return }
-        activateHit(hits[row], allowExternalViewer: true)
+        let fallbackRow = firstSelectableRowIndex ?? 0
+        let row = table.selectedRow >= 0 ? table.selectedRow : fallbackRow
+        guard let hit = hit(atRow: row) else { return }
+        activateHit(hit, allowExternalViewer: true)
     }
 
     @objc func openSelectedInNewWindow() {
         guard !closed, !busy, !hits.isEmpty else { return }
-        let row = table.selectedRow >= 0 ? table.selectedRow : 0
-        guard hits.indices.contains(row), hits[row].source.kind == .note else { return }
-        activateHit(hits[row], allowExternalViewer: false, inNewWindow: true)
+        let fallbackRow = firstSelectableRowIndex ?? 0
+        let row = table.selectedRow >= 0 ? table.selectedRow : fallbackRow
+        guard let hit = hit(atRow: row), hit.source.kind == .note else { return }
+        activateHit(hit, allowExternalViewer: false, inNewWindow: true)
     }
 
     @objc func togglePinSelectedNote() {
@@ -752,12 +1027,11 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func contextMenuForRow(_ row: Int) -> NSMenu? {
-        guard !closed, !busy, hits.indices.contains(row) else { return nil }
+        guard !closed, !busy, let hit = hit(atRow: row) else { return nil }
         if table.selectedRowIndexes.count > 1 && table.selectedRowIndexes.contains(row) {
             let selectedNotes = selectedNoteURLs
             let allSelectedURLs = table.selectedRowIndexes.compactMap { idx -> URL? in
-                guard hits.indices.contains(idx) else { return nil }
-                return hits[idx].source.url
+                self.hit(atRow: idx)?.source.url
             }
             if selectedNotes.count >= 2 {
                 let menu = NSMenu()
@@ -784,7 +1058,6 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             }
         }
 
-        let hit = hits[row]
         let menu = NSMenu()
         let openItem = NSMenuItem(
             title: hit.source.kind == .note ? "Open Note" : "Open",
@@ -848,15 +1121,15 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     @objc private func openRowFromMenu(_ sender: NSMenuItem) {
-        guard !closed, !busy, let row = sender.representedObject as? Int, hits.indices.contains(row) else { return }
+        guard !closed, !busy, let row = sender.representedObject as? Int, let rowHit = hit(atRow: row) else { return }
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         syncOrderedSelectionFromTable()
-        activateHit(hits[row], allowExternalViewer: true)
+        activateHit(rowHit, allowExternalViewer: true)
     }
 
     @objc fileprivate func openRowInNewWindowFromMenu(_ sender: NSMenuItem) {
-        guard !closed, !busy, let row = sender.representedObject as? Int, hits.indices.contains(row) else { return }
-        activateHit(hits[row], allowExternalViewer: false, inNewWindow: true)
+        guard !closed, !busy, let row = sender.representedObject as? Int, let rowHit = hit(atRow: row) else { return }
+        activateHit(rowHit, allowExternalViewer: false, inNewWindow: true)
     }
 
     @objc private func revealRowFromMenu(_ sender: NSMenuItem) {
@@ -946,10 +1219,10 @@ private struct SearchFileStamp: Equatable {
 }
 
 @MainActor
-private final class SearchHitRow: NSTableRowView {
-    var isLastPinnedBeforeUnpinned = false {
+private final class SidebarSectionHeaderRow: NSTableRowView {
+    var drawsTopSeparator = false {
         didSet {
-            if isLastPinnedBeforeUnpinned != oldValue { needsDisplay = true }
+            if drawsTopSeparator != oldValue { needsDisplay = true }
         }
     }
 
@@ -959,6 +1232,114 @@ private final class SearchHitRow: NSTableRowView {
     }
 
     override func drawBackground(in dirtyRect: NSRect) {
+        if drawsTopSeparator {
+            Theme.border.withAlphaComponent(0.5).setFill()
+            NSRect(x: 14, y: 2, width: max(0, bounds.width - 26), height: 1).fill()
+        }
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {}
+}
+
+@MainActor
+private final class SidebarSectionHeaderCell: NSTableCellView {
+    private let icon = NSImageView()
+    private let label = Theme.label("", size: 10, color: Theme.subtle)
+    private let countLabel = Theme.label("", size: 9.5, color: Theme.subtle)
+
+    var displayedTitle: String { label.stringValue }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        icon.imageScaling = .scaleProportionallyDown
+        icon.setAccessibilityElement(false)
+        icon.widthAnchor.constraint(equalToConstant: 12).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 12).isActive = true
+
+        label.font = Theme.monoFont(10, weight: .semibold)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.maximumNumberOfLines = 1
+        label.usesSingleLineMode = true
+        label.cell?.wraps = false
+        label.cell?.truncatesLastVisibleLine = true
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        countLabel.font = Theme.monoFont(9.5, weight: .regular)
+        countLabel.alignment = .right
+        countLabel.setContentHuggingPriority(.required, for: .horizontal)
+        countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let row = NSStackView(views: [icon, label, spacer, countLabel])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 5
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
+
+    func show(title: String, folderPath: String, itemCount: Int) {
+        label.stringValue = title
+        countLabel.stringValue = "\(itemCount)"
+        countLabel.textColor = Theme.subtle.withAlphaComponent(0.85)
+        let symbolName: String
+        if title == "PINNED" {
+            symbolName = "pin.fill"
+            icon.contentTintColor = Theme.accent
+            label.textColor = Theme.accent
+        } else if title == "ROOT" {
+            symbolName = "book.closed"
+            icon.contentTintColor = Theme.subtle
+            label.textColor = Theme.subtle
+        } else if title == "INBOX" {
+            symbolName = "tray"
+            icon.contentTintColor = Theme.subtle
+            label.textColor = Theme.subtle
+        } else if title == "ATTACHMENTS" {
+            symbolName = "paperclip"
+            icon.contentTintColor = Theme.subtle
+            label.textColor = Theme.subtle
+        } else {
+            symbolName = "folder"
+            icon.contentTintColor = Theme.subtle
+            label.textColor = Theme.subtle
+        }
+        icon.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9.5, weight: .semibold))
+        toolTip = "\(folderPath) · \(itemCount) \(itemCount == 1 ? "entry" : "entries")"
+        setAccessibilityLabel(toolTip)
+    }
+}
+
+@MainActor
+private final class SearchHitRow: NSTableRowView {
+    var isLastPinnedBeforeUnpinned = false {
+        didSet {
+            if isLastPinnedBeforeUnpinned != oldValue { needsDisplay = true }
+        }
+    }
+    var hidesBottomSeparator = false {
+        didSet {
+            if hidesBottomSeparator != oldValue { needsDisplay = true }
+        }
+    }
+
+    override var isEmphasized: Bool {
+        get { false }
+        set {}
+    }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        guard !hidesBottomSeparator else { return }
         if isLastPinnedBeforeUnpinned {
             Theme.accent.withAlphaComponent(0.32).setFill()
             NSRect(x: 14, y: bounds.maxY - 1, width: max(0, bounds.width - 24), height: 1).fill()
@@ -993,6 +1374,7 @@ private final class SearchHitRow: NSTableRowView {
 private final class SearchResultsTable: NSTableView {
     var onReturn: (() -> Void)?
     var onOptionReturn: (() -> Void)?
+    var onMoveVertical: ((Int, Bool) -> Void)?
     var onTogglePin: (() -> Void)?
     var onMerge: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -1022,13 +1404,18 @@ private final class SearchResultsTable: NSTableView {
     }
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if event.keyCode == 36 || event.keyCode == 76 {
+        let modifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        if event.keyCode == 125 && (modifiers.isEmpty || modifiers == .shift), let onMoveVertical {
+            onMoveVertical(1, modifiers.contains(.shift))
+        } else if event.keyCode == 126 && (modifiers.isEmpty || modifiers == .shift), let onMoveVertical {
+            onMoveVertical(-1, modifiers.contains(.shift))
+        } else if event.keyCode == 36 || event.keyCode == 76 {
             if flags.contains(.option) {
                 onOptionReturn?()
             } else {
                 onReturn?()
             }
-        } else if (event.keyCode == 51 || event.keyCode == 117) && (flags.isEmpty || flags == .command) {
+        } else if (event.keyCode == 51 || event.keyCode == 117) && (modifiers.isEmpty || modifiers == .command) {
             onDelete?()
         } else {
             super.keyDown(with: event)
@@ -1055,14 +1442,20 @@ private final class SearchHitCell: NSTableCellView {
     var onTogglePin: (() -> Void)?
     private let title = Theme.label("", size: 14, color: Theme.ink)
     private let badge = Theme.label("", size: 10, color: Theme.muted)
+    private let pathLabel = Theme.label("", size: 10, color: Theme.subtle)
     private let snippet = Theme.label("", size: 12, color: Theme.muted)
     private let icon = NSImageView()
     private let pinButton = RowPinButton()
     private let titleRow = NSStackView()
+    private let contentStack = NSStackView()
     private var hoverTracking: NSTrackingArea?
     private var isRowHovered = false
     private var isNoteItem = false
     private var isItemPinned = false
+
+    var displayedTitle: String { title.stringValue }
+    var displayedPath: String? { pathLabel.isHidden ? nil : pathLabel.stringValue }
+    var displayedSnippet: String? { snippet.isHidden ? nil : snippet.stringValue }
 
     private static let pinnedSymbolImage: NSImage? = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: nil)?
         .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
@@ -1118,22 +1511,42 @@ private final class SearchHitCell: NSTableCellView {
         titleRow.spacing = 4
         for view in [icon, title, spacer, pinButton, badge] { titleRow.addArrangedSubview(view) }
 
+        pathLabel.font = Theme.monoFont(10, weight: .medium)
+        pathLabel.lineBreakMode = .byTruncatingMiddle
+        pathLabel.maximumNumberOfLines = 1
+        pathLabel.usesSingleLineMode = true
+        pathLabel.cell?.wraps = false
+        pathLabel.cell?.truncatesLastVisibleLine = true
+        pathLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        pathLabel.isHidden = true
+
         snippet.lineBreakMode = .byTruncatingTail
         snippet.maximumNumberOfLines = 2
         snippet.cell?.wraps = true
+        snippet.cell?.truncatesLastVisibleLine = true
+        snippet.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        for view in [titleRow, snippet] {
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = 2
+        for view in [pathLabel, snippet] { contentStack.addArrangedSubview(view) }
+        NSLayoutConstraint.activate([
+            pathLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            snippet.widthAnchor.constraint(equalTo: contentStack.widthAnchor)
+        ])
+
+        for view in [titleRow, contentStack] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
         NSLayoutConstraint.activate([
             titleRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 27),
             titleRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            titleRow.topAnchor.constraint(equalTo: topAnchor, constant: 11),
-            snippet.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 27),
-            snippet.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            snippet.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 4),
-            snippet.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -8)
+            titleRow.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 27),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            contentStack.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 3),
+            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -6)
         ])
     }
 
@@ -1201,7 +1614,7 @@ private final class SearchHitCell: NSTableCellView {
         }
     }
 
-    func show(_ hit: SearchHit, modifiedAt: Date?) {
+    func show(_ hit: SearchHit, modifiedAt: Date?, activeQuery: String = "") {
         let source = hit.source
         let kind: String
         let symbol: String?
@@ -1248,10 +1661,32 @@ private final class SearchHitCell: NSTableCellView {
             badge.textColor = Theme.subtle
         }
 
-        let customPathPrefix: String? = (source.kind == .note && !source.relativePath.hasPrefix("Inbox/"))
-            ? source.relativePath
-            : nil
+        let shouldShowPath = (source.kind == .note && !source.relativePath.hasPrefix("Inbox/"))
+            || (source.kind != .note && !SearchPanel.isManagedFlatPath(source.relativePath))
+        if shouldShowPath {
+            pathLabel.isHidden = false
+            pathLabel.attributedStringValue = Self.styledPath(
+                source.relativePath,
+                activeQuery: activeQuery,
+                directHighlights: hit.snippet == source.relativePath ? hit.highlights : []
+            )
+            snippet.maximumNumberOfLines = 1
+            snippet.usesSingleLineMode = true
+            snippet.cell?.wraps = false
+        } else {
+            pathLabel.isHidden = true
+            pathLabel.stringValue = ""
+            snippet.maximumNumberOfLines = 2
+            snippet.usesSingleLineMode = false
+            snippet.cell?.wraps = true
+        }
+        snippet.cell?.truncatesLastVisibleLine = true
+
+        let snippetParagraph = NSMutableParagraphStyle()
+        snippetParagraph.lineBreakMode = .byTruncatingTail
+
         if hit.highlights.isEmpty {
+            snippet.isHidden = false
             var preview = hit.snippet
             if source.kind == .note {
                 preview = Self.stripLeadingTitle(from: preview, title: source.title)
@@ -1259,35 +1694,42 @@ private final class SearchHitCell: NSTableCellView {
             if preview.isEmpty {
                 preview = source.kind == .note ? "No additional text" : source.detail
             }
-            if let customPathPrefix {
-                let combined = NSMutableAttributedString(
-                    string: "\(customPathPrefix) · ",
-                    attributes: [.font: Theme.monoFont(10.5, weight: .medium), .foregroundColor: Theme.subtle]
-                )
-                combined.append(NSAttributedString(
-                    string: preview,
-                    attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.muted]
-                ))
-                snippet.attributedStringValue = combined
-            } else {
-                snippet.attributedStringValue = NSAttributedString(
-                    string: preview,
-                    attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.muted]
-                )
-            }
-        } else {
-            let text = NSMutableAttributedString(
-                string: hit.snippet,
-                attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: Theme.ink]
+            snippet.attributedStringValue = NSAttributedString(
+                string: preview,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 12),
+                    .foregroundColor: Theme.muted,
+                    .paragraphStyle: snippetParagraph
+                ]
             )
-            let utf16 = hit.snippet as NSString
-            for range in hit.highlights where range.location != NSNotFound && range.location >= 0 && range.length > 0 && NSMaxRange(range) <= utf16.length {
-                let safeRange = utf16.rangeOfComposedCharacterSequences(for: range)
-                text.addAttributes([
-                    .backgroundColor: Theme.accentSoft,
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                    .foregroundColor: Theme.ink
-                ], range: safeRange)
+        } else if shouldShowPath && hit.snippet == source.relativePath {
+            snippet.isHidden = true
+            snippet.stringValue = ""
+        } else {
+            snippet.isHidden = false
+            let singleLine = shouldShowPath
+                ? hit.snippet.replacingOccurrences(of: "\\s*\\n+\\s*", with: " ", options: .regularExpression)
+                : hit.snippet
+            let text = NSMutableAttributedString(
+                string: singleLine,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 12),
+                    .foregroundColor: Theme.ink,
+                    .paragraphStyle: snippetParagraph
+                ]
+            )
+            if singleLine == hit.snippet {
+                let utf16 = hit.snippet as NSString
+                for range in hit.highlights where range.location != NSNotFound && range.location >= 0 && range.length > 0 && NSMaxRange(range) <= utf16.length {
+                    let safeRange = utf16.rangeOfComposedCharacterSequences(for: range)
+                    text.addAttributes([
+                        .backgroundColor: Theme.accentSoft,
+                        .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                        .foregroundColor: Theme.ink
+                    ], range: safeRange)
+                }
+            } else {
+                Self.applyQueryHighlights(to: text, in: singleLine, activeQuery: activeQuery, font: .systemFont(ofSize: 12, weight: .semibold))
             }
             snippet.attributedStringValue = text
         }
@@ -1297,6 +1739,58 @@ private final class SearchHitCell: NSTableCellView {
         let metaInfo = "\(pinPrefix)\(kind)\(pageInfo) · \(source.state.rawValue.capitalized)\(source.detail.isEmpty ? "" : " — \(source.detail)")"
         toolTip = "\(title.stringValue)\n\(source.relativePath)\n\(metaInfo)\n\(hit.snippet)"
         setAccessibilityLabel(toolTip)
+    }
+
+    private static func styledPath(_ relativePath: String, activeQuery: String, directHighlights: [NSRange]) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        let attributed = NSMutableAttributedString(
+            string: relativePath,
+            attributes: [
+                .font: Theme.monoFont(10, weight: .medium),
+                .foregroundColor: Theme.subtle,
+                .paragraphStyle: paragraph
+            ]
+        )
+        let utf16 = relativePath as NSString
+        if !directHighlights.isEmpty {
+            for range in directHighlights where range.location != NSNotFound && range.location >= 0 && range.length > 0 && NSMaxRange(range) <= utf16.length {
+                let safeRange = utf16.rangeOfComposedCharacterSequences(for: range)
+                attributed.addAttributes([
+                    .backgroundColor: Theme.accentSoft,
+                    .font: Theme.monoFont(10, weight: .semibold),
+                    .foregroundColor: Theme.ink
+                ], range: safeRange)
+            }
+        } else {
+            applyQueryHighlights(to: attributed, in: relativePath, activeQuery: activeQuery, font: Theme.monoFont(10, weight: .semibold))
+        }
+        return attributed
+    }
+
+    private static func applyQueryHighlights(to attributed: NSMutableAttributedString, in text: String, activeQuery: String, font: NSFont) {
+        let terms = activeQuery
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        guard !terms.isEmpty else { return }
+        let utf16 = text as NSString
+        for term in terms {
+            var searchRange = NSRange(location: 0, length: utf16.length)
+            while searchRange.length > 0 {
+                let found = utf16.range(of: term, options: .caseInsensitive, range: searchRange)
+                guard found.location != NSNotFound, found.length > 0 else { break }
+                let safeRange = utf16.rangeOfComposedCharacterSequences(for: found)
+                attributed.addAttributes([
+                    .backgroundColor: Theme.accentSoft,
+                    .font: font,
+                    .foregroundColor: Theme.ink
+                ], range: safeRange)
+                let nextStart = NSMaxRange(found)
+                guard nextStart < utf16.length else { break }
+                searchRange = NSRange(location: nextStart, length: utf16.length - nextStart)
+            }
+        }
     }
 
     private static func stripLeadingTitle(from snippet: String, title: String) -> String {
@@ -1343,6 +1837,24 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
             searchField.stringValue = newValue
             updateResults()
         }
+    }
+
+    func displayedTitle(atRow row: Int) -> String? {
+        guard hits.indices.contains(row) else { return nil }
+        table.layoutSubtreeIfNeeded()
+        return (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? SearchHitCell)?.displayedTitle
+    }
+
+    func displayedPath(atRow row: Int) -> String? {
+        guard hits.indices.contains(row) else { return nil }
+        table.layoutSubtreeIfNeeded()
+        return (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? SearchHitCell)?.displayedPath
+    }
+
+    func displayedSnippet(atRow row: Int) -> String? {
+        guard hits.indices.contains(row) else { return nil }
+        table.layoutSubtreeIfNeeded()
+        return (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? SearchHitCell)?.displayedSnippet
     }
 
     override init(frame frameRect: NSRect) {
@@ -1703,7 +2215,7 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         cell.onTogglePin = hit.source.kind == .note ? { [weak self] in
             _ = self?.togglePin(for: noteURL)
         } : nil
-        cell.show(hit, modifiedAt: modifiedDates[hit.source.url])
+        cell.show(hit, modifiedAt: modifiedDates[hit.source.url], activeQuery: searchField.stringValue)
         return cell
     }
 }
