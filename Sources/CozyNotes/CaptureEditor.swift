@@ -231,6 +231,8 @@ import CozyCore
     private var hasCaretOrigin = false
     private var caretAnimationSequence: UInt64 = 0
     private var isHandlingTypingInput = false
+    private var activeKeyDownModifiers: NSEvent.ModifierFlags?
+    private var wasComposingMarkedTextOnKeyDown = false
     private var isCaretTypingTransaction = false
     private var animatesNextCaretUpdate = false
     private let caretAccessibilityCenter = NSWorkspace.shared.notificationCenter
@@ -1019,12 +1021,20 @@ import CozyCore
             return
         }
         let previous = isHandlingTypingInput
+        let previousModifiers = activeKeyDownModifiers
+        let previousComposing = wasComposingMarkedTextOnKeyDown
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let scalar = event.characters?.unicodeScalars.first?.value
+        activeKeyDownModifiers = modifiers.intersection([.shift, .control, .option, .command])
+        wasComposingMarkedTextOnKeyDown = hasMarkedText()
         isHandlingTypingInput = !modifiers.contains(.command) && !modifiers.contains(.control)
             && scalar != nil && scalar != 9 && scalar != 27
             && !(0xF700...0xF8FF).contains(scalar ?? 0)
-        defer { isHandlingTypingInput = previous }
+        defer {
+            isHandlingTypingInput = previous
+            activeKeyDownModifiers = previousModifiers
+            wasComposingMarkedTextOnKeyDown = previousComposing
+        }
         super.keyDown(with: event)
     }
 
@@ -1690,6 +1700,258 @@ import CozyCore
             return
         }
         super.insertBacktab(sender)
+    }
+
+    override func insertNewline(_ sender: Any?) {
+        if let handler = onWikiAutocompleteCommand, handler(#selector(NSResponder.insertNewline(_:))) {
+            return
+        }
+        if handleListContinuationOnNewline() {
+            return
+        }
+        super.insertNewline(sender)
+    }
+
+    private func handleListContinuationOnNewline() -> Bool {
+        guard isEditable,
+              !hasMarkedText(),
+              !wasComposingMarkedTextOnKeyDown,
+              (activeKeyDownModifiers ?? []).isEmpty,
+              let ns = textStorage?.mutableString else {
+            return false
+        }
+        let sel = selectedRange()
+        guard sel.length == 0, sel.location >= 0, sel.location <= ns.length else {
+            return false
+        }
+
+        var lineStart = 0
+        var lineEnd = 0
+        var contentEnd = 0
+        ns.getLineStart(&lineStart, end: &lineEnd, contentsEnd: &contentEnd, for: NSRange(location: sel.location, length: 0))
+        guard contentEnd > lineStart, sel.location == contentEnd else {
+            return false
+        }
+
+        if CaptureEditor.isHorizontalRuleLine(ns, lineStart: lineStart, contentEnd: contentEnd) {
+            return false
+        }
+
+        var p = lineStart
+        while p < contentEnd {
+            let ch = ns.character(at: p)
+            if ch == 0x20 || ch == 0x09 {
+                p += 1
+            } else {
+                break
+            }
+        }
+        guard p < contentEnd else { return false }
+
+        let indentRange = NSRange(location: lineStart, length: p - lineStart)
+        let markerStart = p
+        let markerEnd: Int
+        let nextMarker: String
+        let mc = ns.character(at: markerStart)
+        if mc == 0x2D {
+            markerEnd = markerStart + 1
+            nextMarker = "-"
+        } else if mc == 0x2A {
+            markerEnd = markerStart + 1
+            nextMarker = "*"
+        } else if mc == 0x2B {
+            markerEnd = markerStart + 1
+            nextMarker = "+"
+        } else if mc >= 0x30 && mc <= 0x39 {
+            var dEnd = markerStart
+            while dEnd < contentEnd {
+                let d = ns.character(at: dEnd)
+                if d >= 0x30 && d <= 0x39 {
+                    dEnd += 1
+                } else {
+                    break
+                }
+            }
+            guard dEnd > markerStart, dEnd < contentEnd, ns.character(at: dEnd) == 0x2E else {
+                return false
+            }
+            markerEnd = dEnd + 1
+            let digits = ns.substring(with: NSRange(location: markerStart, length: dEnd - markerStart))
+            nextMarker = Self.incrementDecimalDigits(digits) + "."
+        } else {
+            return false
+        }
+
+        guard markerEnd < contentEnd, ns.character(at: markerEnd) == 0x20 else {
+            return false
+        }
+
+        // Exclude task / checklist items (`- [ ]`, `- [x]`, `- [X]`, `1. [ ]`, etc.).
+        var wsAfterMarker = markerEnd
+        while wsAfterMarker < contentEnd {
+            let ch = ns.character(at: wsAfterMarker)
+            if ch == 0x20 || ch == 0x09 {
+                wsAfterMarker += 1
+            } else {
+                break
+            }
+        }
+        if wsAfterMarker > markerEnd, wsAfterMarker + 3 <= contentEnd,
+           ns.character(at: wsAfterMarker) == 0x5B,
+           ns.character(at: wsAfterMarker + 2) == 0x5D {
+            let boxChar = ns.character(at: wsAfterMarker + 1)
+            let afterBox = wsAfterMarker + 3
+            if (boxChar == 0x20 || boxChar == 0x78 || boxChar == 0x58),
+               (afterBox == contentEnd || ns.character(at: afterBox) == 0x20 || ns.character(at: afterBox) == 0x09) {
+                return false
+            }
+        }
+
+        if isLineInsideFencedCode(ns, lineStart: lineStart)
+            || tableBlocks.contains(where: { lineStart >= $0.fullRange.location && lineStart < NSMaxRange($0.fullRange) }) {
+            return false
+        }
+
+        var hasBodyContent = false
+        var bIdx = markerEnd + 1
+        while bIdx < contentEnd {
+            let ch = ns.character(at: bIdx)
+            if ch != 0x20 && ch != 0x09 {
+                hasBodyContent = true
+                break
+            }
+            bIdx += 1
+        }
+
+        if !hasBodyContent {
+            let removeRange = NSRange(location: markerStart, length: contentEnd - markerStart)
+            applyUndoableReplacement(
+                in: removeRange,
+                with: "",
+                selectedRangeAfter: NSRange(location: markerStart, length: 0)
+            )
+            return true
+        }
+
+        let newline: String
+        if lineEnd - contentEnd >= 2,
+           ns.character(at: contentEnd) == 13,
+           ns.character(at: contentEnd + 1) == 10 {
+            newline = "\r\n"
+        } else if lineEnd == contentEnd,
+                  lineStart >= 2,
+                  ns.character(at: lineStart - 2) == 13,
+                  ns.character(at: lineStart - 1) == 10 {
+            newline = "\r\n"
+        } else {
+            newline = "\n"
+        }
+
+        let indent = indentRange.length > 0 ? ns.substring(with: indentRange) : ""
+        let insertion = newline + indent + nextMarker + " "
+        let nextCaret = NSRange(location: sel.location + (insertion as NSString).length, length: 0)
+        applyUndoableReplacement(
+            in: NSRange(location: sel.location, length: 0),
+            with: insertion,
+            selectedRangeAfter: nextCaret
+        )
+        return true
+    }
+
+    private func isLineInsideFencedCode(_ ns: NSString, lineStart: Int) -> Bool {
+        if fencedBlocks.contains(where: { lineStart >= $0.fullRange.location && lineStart < NSMaxRange($0.fullRange) }) {
+            return true
+        }
+        guard lineStart > 0 else { return false }
+        let prefixRange = NSRange(location: 0, length: lineStart)
+        if ns.range(of: "```", options: .literal, range: prefixRange).location == NSNotFound,
+           ns.range(of: "~~~", options: .literal, range: prefixRange).location == NSNotFound {
+            return false
+        }
+        var openChar: unichar = 0
+        var openLen = 0
+        var pos = 0
+        while pos < lineStart {
+            var lStart = 0
+            var lEnd = 0
+            var cEnd = 0
+            ns.getLineStart(&lStart, end: &lEnd, contentsEnd: &cEnd, for: NSRange(location: pos, length: 0))
+            pos = max(pos + 1, lEnd)
+            var leadSpaces = 0
+            var fp = lStart
+            while fp < cEnd, ns.character(at: fp) == 0x20 {
+                leadSpaces += 1
+                if leadSpaces > 3 { break }
+                fp += 1
+            }
+            guard leadSpaces <= 3, fp < cEnd else { continue }
+            let fc = ns.character(at: fp)
+            guard fc == 0x60 || fc == 0x7E else { continue }
+            var runEnd = fp
+            while runEnd < cEnd, ns.character(at: runEnd) == fc {
+                runEnd += 1
+            }
+            let runLen = runEnd - fp
+            guard runLen >= 3 else { continue }
+            if openChar == 0 {
+                if fc == 0x60 {
+                    var hasBacktickInInfo = false
+                    var k = runEnd
+                    while k < cEnd {
+                        if ns.character(at: k) == 0x60 {
+                            hasBacktickInInfo = true
+                            break
+                        }
+                        k += 1
+                    }
+                    if hasBacktickInInfo { continue }
+                }
+                openChar = fc
+                openLen = runLen
+            } else if openChar == fc, runLen >= openLen {
+                var onlyTrailingWS = true
+                var k = runEnd
+                while k < cEnd {
+                    let ch = ns.character(at: k)
+                    if ch != 0x20 && ch != 0x09 {
+                        onlyTrailingWS = false
+                        break
+                    }
+                    k += 1
+                }
+                if onlyTrailingWS {
+                    openChar = 0
+                    openLen = 0
+                }
+            }
+        }
+        return openChar != 0
+    }
+
+    private static func incrementDecimalDigits(_ digits: String) -> String {
+        if let value = UInt64(digits), value < UInt64.max {
+            return String(value + 1)
+        }
+        var bytes = Array(digits.utf8).drop(while: { $0 == 0x30 })
+        if bytes.isEmpty {
+            return "1"
+        }
+        var idx = bytes.endIndex
+        var carry = true
+        while idx > bytes.startIndex, carry {
+            bytes.formIndex(before: &idx)
+            if bytes[idx] < 0x39 {
+                bytes[idx] += 1
+                carry = false
+            } else {
+                bytes[idx] = 0x30
+            }
+        }
+        var result = String(decoding: bytes, as: UTF8.self)
+        if carry {
+            result = "1" + result
+        }
+        return result
     }
 
 
@@ -2685,7 +2947,8 @@ import CozyCore
         in range: NSRange,
         with replacement: String,
         selectedRangeAfter: NSRange? = nil,
-        preserveViewport: Bool = false
+        preserveViewport: Bool = false,
+        redoSelectionOverride: NSRange? = nil
     ) {
         autoreleasepool {
             guard let storage = textStorage else { return }
@@ -2713,6 +2976,7 @@ import CozyCore
             }
 
             let repLen = (replacement as NSString).length
+            let nextSelection = selectedRangeAfter ?? NSRange(location: safeRange.location + repLen, length: 0)
             if safeRange.length > 256_000 || repLen > 256_000 {
                 editorUndoManager.levelsOfUndo = 2
             }
@@ -2726,13 +2990,15 @@ import CozyCore
                 )
             if !absorbedByVimInsert {
                 let inverseRange = NSRange(location: safeRange.location, length: repLen)
-                let restoreSelection = selectedRangeAfter != nil ? previousSelection : nil
+                let restoreSelection = redoSelectionOverride ?? (selectedRangeAfter != nil ? previousSelection : nil)
+                let nextRedoOverride = selectedRangeAfter != nil ? nextSelection : nil
                 editorUndoManager.registerUndo(withTarget: self) { target in
                     target.applyUndoableReplacement(
                         in: inverseRange,
                         with: previousString,
                         selectedRangeAfter: restoreSelection,
-                        preserveViewport: preserveViewport
+                        preserveViewport: preserveViewport,
+                        redoSelectionOverride: nextRedoOverride
                     )
                 }
             }
@@ -2754,7 +3020,6 @@ import CozyCore
                 clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: savedOriginY))
             }
 
-            let nextSelection = selectedRangeAfter ?? NSRange(location: safeRange.location + repLen, length: 0)
             setSelectedRange(nextSelection)
             let prevSuppress = suppressCaretUpdates
             if preserveViewport {

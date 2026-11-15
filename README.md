@@ -50,6 +50,7 @@ Pre-built GitHub releases are packaged as [`Cozy-Notes-v0.1.0-macOS-14.0-arm64.z
 - **Three Atmospheres & Five Writing Voices:** Switch between **Obsidian & Ivory**, **Midnight Ink & Porcelain**, and **Neo-Acid & Plaster** (`⌘⇧T`), and cycle **Avenir Next + New York**, **Charter Book Serif**, **Iowan Old Style**, **SF Mono Typewriter**, and **Unbounded + Avenir Neo-Acid Display** (`⌘⇧Y`). Toggle Light/Dark mode with `⌘⇧D`.
 - **Rich Live Markdown:**
   - **Org-mode Heading Folding:** Click an `H1`–`H3` gutter badge or press `Tab` on a heading to fold its section; press `⇧Tab` (`⌃⌘[`) to cycle Overview → Headings Only → Show All.
+  - **Automatic List Continuation:** Press `Return` at the end of `-`, `*`, `+`, or `1.` list items to continue at the same indentation (incrementing ordered markers such as `9. → 10.`), or press `Return` on an empty list item to remove its marker and exit the list.
   - **Interactive Checklists & Tables:** Click `- [ ]` / `- [x]` checkboxes directly without jumping the viewport, and write aligned pipe tables and CommonMark horizontal rules.
   - **Inline `#tags` & `[[WikiLinks]]`:** Type `#` for tag autocomplete or `[[` to link/create notes. `⌘`-Click any `#tag` to filter the sidebar, or `⌘`-Click / `⌥⌘Return` a `[[WikiLink]]` to navigate.
   - **Attachments:** Paste images, drop files, or click **Attach** to copy files into `Attachments/<note-uuid>/` with interactive preview pills.
@@ -110,7 +111,7 @@ Open **Cozy Notes** on Android, choose a local folder via the system picker, and
 
 ## Verification
 
-`swift test` executes all three automated test targets (**66 tests across 14 suites**) on both full Xcode (`XCTest`) and standalone Apple Command Line Tools (`swift-testing`), and runs on every push and pull request via [GitHub Actions CI](.github/workflows/ci.yml):
+`swift test` executes all three automated test targets (**68 tests across 15 suites**) on both full Xcode (`XCTest`) and standalone Apple Command Line Tools (`swift-testing`), and runs on every push and pull request via [GitHub Actions CI](.github/workflows/ci.yml):
 
 ```sh
 # Run the complete test suite (CozyCoreTests, CozySearchTests, and CozyNotesTests)

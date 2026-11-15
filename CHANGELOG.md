@@ -4,6 +4,11 @@ All notable changes to Cozy Notes are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [Unreleased]
+
+### Added
+- Automatic plain-list continuation and empty-item exit on `Return` across the workspace, standalone note windows, and Quick Capture (`MarkdownTextView`), preserving indentation and `-`/`*`/`+` markers, incrementing dot-delimited ordered numbers (`1. → 2.`, `9. → 10.`), and recording single-step Undo/Redo and Vim Insert-session edits.
+
 ## [0.1.0] - 2026-11-15
 
 ### Added

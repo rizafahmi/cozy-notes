@@ -187,6 +187,25 @@ private func verifyHorizontalRuleParsingIncrementalAndRendering() throws {
             textView.horizontalRuleRanges.count == 1,
             "Typing '___' incrementally should register horizontal rule, got \(textView.horizontalRuleRanges)"
         )
+
+        // Spaced horizontal rules ('- - -' and '* * *') must insert an ordinary newline on Return, never list continuation.
+        for rule in ["- - -", "* * *"] {
+            workspace.editor.text = rule
+            textView.setSelectedRange(NSRange(location: workspace.editor.nsText.length, length: 0))
+            textView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            try hrCheck(
+                workspace.editor.text == "\(rule)\n",
+                "Return at end of horizontal rule '\(rule)' must insert plain newline without bullet prefix, got \(workspace.editor.text.debugDescription)"
+            )
+            try hrCheck(
+                textView.selectedRange() == NSRange(location: (rule as NSString).length + 1, length: 0),
+                "Caret after Return on '\(rule)' must be right after newline, got \(textView.selectedRange())"
+            )
+            try hrCheck(
+                textView.bulletItems.isEmpty,
+                "Horizontal rule '\(rule)' must not register any bullet items, got \(textView.bulletItems)"
+            )
+        }
     }
 
     // 3. Rendered bitmap proof: verify drawBackground paints visible horizontal rule pixels when syntax is hidden.

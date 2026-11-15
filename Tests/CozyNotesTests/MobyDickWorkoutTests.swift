@@ -554,6 +554,21 @@ struct MobyDickWorkoutSuite {
         editor.textView.outdentListLevel(nil)
         #expect(editor.text == "- Adjustable point")
         #expect(editor.textView.bulletItems.first?.level == 0)
+
+        // Verify Return preserves nested indentation & marker, and Return on empty nested item stops the list while keeping indentation
+        editor.textView.indentListLevel(nil)
+        editor.textView.indentListLevel(nil)
+        #expect(editor.text == "    - Adjustable point")
+        editor.textView.setSelectedRange(NSRange(location: editor.nsText.length, length: 0))
+        editor.textView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        #expect(editor.text == "    - Adjustable point\n    - ")
+        #expect(editor.textView.selectedRange() == NSRange(location: editor.nsText.length, length: 0))
+        #expect(editor.textView.bulletItems.map(\.level) == [2, 2])
+
+        editor.textView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        #expect(editor.text == "    - Adjustable point\n    ")
+        #expect(editor.textView.selectedRange() == NSRange(location: editor.nsText.length, length: 0))
+        #expect(editor.textView.bulletItems.map(\.level) == [2])
     }
 
     @Test("Quick Capture deduplicates repeated URLs within one attachment batch before copying files")
