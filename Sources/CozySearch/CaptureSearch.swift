@@ -9,6 +9,16 @@ import CozyCore
 public enum SearchSourceKind: String, Sendable { case note, text, pdf, image, unsupported }
 public enum SearchReadiness: String, Sendable { case ready, pending, partial, unreadable, unsupported }
 
+public struct TagCount: Equatable, Sendable {
+    public let name: String
+    public let count: Int
+
+    public init(name: String, count: Int) {
+        self.name = name
+        self.count = count
+    }
+}
+
 public struct SearchSource: Sendable {
     public let url: URL
     public let relativePath: String
@@ -17,6 +27,7 @@ public struct SearchSource: Sendable {
     public let state: SearchReadiness
     public let detail: String
     public let isPinned: Bool
+    public let tags: [String]
 
     public init(
         url: URL,
@@ -25,7 +36,8 @@ public struct SearchSource: Sendable {
         kind: SearchSourceKind,
         state: SearchReadiness,
         detail: String,
-        isPinned: Bool = false
+        isPinned: Bool = false,
+        tags: [String] = []
     ) {
         self.url = url
         self.relativePath = relativePath
@@ -34,6 +46,7 @@ public struct SearchSource: Sendable {
         self.state = state
         self.detail = detail
         self.isPinned = isPinned
+        self.tags = tags
     }
 }
 
@@ -56,6 +69,7 @@ private struct SearchEntry: Sendable {
 
 public struct SearchSnapshot: Sendable {
     public let sources: [SearchSource]
+    public let tagCounts: [TagCount]
     public var readyCount: Int { sources.reduce(0) { $0 + ($1.state == .ready ? 1 : 0) } }
     public var pendingCount: Int { sources.reduce(0) { $0 + ($1.state == .pending ? 1 : 0) } }
     public var issueCount: Int { sources.reduce(0) { $0 + ([.partial, .unreadable, .unsupported].contains($1.state) ? 1 : 0) } }
@@ -63,7 +77,40 @@ public struct SearchSnapshot: Sendable {
 
     fileprivate init(entries: [SearchEntry]) {
         self.entries = entries
-        self.sources = entries.map(\.source)
+        let allSources = entries.map(\.source)
+        self.sources = allSources
+        self.tagCounts = Self.computeTagCounts(from: allSources)
+    }
+
+    private static func computeTagCounts(from sources: [SearchSource]) -> [TagCount] {
+        var countsByLower: [String: (display: String, count: Int)] = [:]
+        for source in sources where !source.tags.isEmpty {
+            var seenInSource: Set<String> = []
+            for rawTag in source.tags {
+                let lower = rawTag.lowercased()
+                guard seenInSource.insert(lower).inserted else { continue }
+                if let existing = countsByLower[lower] {
+                    countsByLower[lower] = (existing.display, existing.count + 1)
+                } else {
+                    countsByLower[lower] = (rawTag, 1)
+                }
+            }
+        }
+        return countsByLower.values
+            .map { TagCount(name: $0.display, count: $0.count) }
+            .sorted { a, b in
+                if a.count != b.count { return a.count > b.count }
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            }
+    }
+
+    public static func matchesTag(_ sourceTags: [String], filter rawFilter: String) -> Bool {
+        let clean = String(rawFilter.trimmingCharacters(in: .whitespacesAndNewlines).drop(while: { $0 == "#" })).lowercased()
+        guard !clean.isEmpty else { return true }
+        return sourceTags.contains { tag in
+            let low = tag.lowercased()
+            return low == clean || low.hasPrefix(clean + "/")
+        }
     }
 
     public func updatingPinnedPaths(_ pinnedPaths: Set<String>) -> SearchSnapshot {
@@ -78,22 +125,52 @@ public struct SearchSnapshot: Sendable {
                     kind: item.source.kind,
                     state: item.source.state,
                     detail: item.source.detail,
-                    isPinned: shouldPin
+                    isPinned: shouldPin,
+                    tags: item.source.tags
                 ),
                 pages: item.pages
             )
         })
     }
 
-    public func search(_ query: String) -> [SearchHit] {
+    public func search(_ query: String, tagFilter: String? = nil) -> [SearchHit] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let terms = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let rawTokens = trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+
+        var requiredTags: [String] = []
+        if let tagFilter, !tagFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            requiredTags.append(tagFilter)
+        }
+        var terms: [String] = []
+        var highlightTerms: [String] = []
+        for token in rawTokens {
+            if token.hasPrefix("#"),
+               let parsed = Vault.tags(in: token).first,
+               parsed.fullRange.location == 0,
+               parsed.fullRange.length == (token as NSString).length {
+                requiredTags.append(parsed.name)
+                highlightTerms.append("#" + parsed.name)
+            } else {
+                terms.append(token)
+                highlightTerms.append(token)
+            }
+        }
+
+        let filteredEntries: [SearchEntry]
+        if requiredTags.isEmpty {
+            filteredEntries = entries
+        } else {
+            filteredEntries = entries.filter { entry in
+                requiredTags.allSatisfy { Self.matchesTag(entry.source.tags, filter: $0) }
+            }
+        }
+
         if terms.isEmpty {
             var hits: [SearchHit] = []
-            hits.reserveCapacity(entries.count)
-            for entry in entries {
+            hits.reserveCapacity(filteredEntries.count)
+            for entry in filteredEntries {
                 let page = entry.pages.first
-                let snippet = Self.snippet(page?.text ?? entry.source.detail, terms: [])
+                let snippet = Self.snippet(page?.text ?? entry.source.detail, terms: highlightTerms)
                 hits.append(SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page?.number))
             }
             if hits.contains(where: \.source.isPinned) {
@@ -108,19 +185,20 @@ public struct SearchSnapshot: Sendable {
             return hits
         }
 
+        let cleanQuery = terms.joined(separator: " ")
         var scored: [(score: Int, order: Int, hit: SearchHit)] = []
-        for entry in entries {
-            let score = Self.titleScore(for: entry.source, query: trimmed, terms: terms)
+        for entry in filteredEntries {
+            let score = Self.titleScore(for: entry.source, query: cleanQuery, terms: terms)
             var matched = false
             for page in entry.pages where Self.matches(page.text, terms: terms) {
-                let snippet = Self.snippet(page.text, terms: terms)
+                let snippet = Self.snippet(page.text, terms: highlightTerms)
                 let hit = SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: page.number)
                 scored.append((score, scored.count, hit))
                 matched = true
             }
             if !matched && (Self.matches(entry.source.title, terms: terms) || Self.matches(entry.source.relativePath, terms: terms)) {
                 let targetText = Self.matches(entry.source.title, terms: terms) ? entry.source.title : entry.source.relativePath
-                let snippet = Self.snippet(targetText, terms: terms)
+                let snippet = Self.snippet(targetText, terms: highlightTerms)
                 let hit = SearchHit(source: entry.source, snippet: snippet.0, highlights: snippet.1, page: nil)
                 scored.append((score, scored.count, hit))
             }
@@ -333,14 +411,16 @@ public final class CaptureSearch: @unchecked Sendable {
 
     private func entry(_ url: URL, kind: SearchSourceKind, state: SearchReadiness, detail: String, pages: [SearchPage] = [], isPinned: Bool = false) -> SearchEntry {
         var title = url.deletingPathExtension().lastPathComponent
+        var tags: [String] = []
         if kind == .note, let text = pages.first?.text {
             text.enumerateLines { line, stop in
                 guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return }
                 title = Vault.title(from: String(line.prefix(160)))
                 stop = true
             }
+            tags = Vault.extractTagNames(from: text)
         }
-        return SearchEntry(source: SearchSource(url: url, relativePath: relativePath(url), title: title, kind: kind, state: state, detail: detail, isPinned: isPinned), pages: pages)
+        return SearchEntry(source: SearchSource(url: url, relativePath: relativePath(url), title: title, kind: kind, state: state, detail: detail, isPinned: isPinned, tags: tags), pages: pages)
     }
 
     private func relativePath(_ url: URL) -> String { String(url.path.dropFirst(vault.root.path.count + 1)) }

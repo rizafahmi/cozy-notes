@@ -212,6 +212,49 @@ final class CaptureSearchTests: XCTestCase {
         XCTAssertEqual(swapped.search("").map(\.source.title), ["Newer Note", "Older Note"])
         XCTAssertEqual(swapped.search("").map(\.source.isPinned), [true, false])
     }
+
+    func testTagAggregationHierarchicalFilteringAndQueryTagTokens() throws {
+        let fixture = try Fixture(); defer { fixture.cleanup() }
+        _ = try fixture.vault.capture(text: "# Q2 Roadmap\nShipping native tags #work #work/q2 and polish")
+        _ = try fixture.vault.capture(text: "# Design Sync\nColor tokens #work #design")
+        _ = try fixture.vault.capture(text: "# Weekend Reading\nBook notes #reading")
+
+        let snapshot = try CaptureSearch(vault: fixture.vault).scan()
+        XCTAssertEqual(
+            snapshot.tagCounts,
+            [
+                TagCount(name: "work", count: 2),
+                TagCount(name: "design", count: 1),
+                TagCount(name: "reading", count: 1),
+                TagCount(name: "work/q2", count: 1),
+            ]
+        )
+
+        // Direct sidebar tagFilter (hierarchical: "work" matches both #work and #work/q2)
+        XCTAssertEqual(
+            Set(snapshot.search("", tagFilter: "work").map(\.source.title)),
+            Set(["Q2 Roadmap", "Design Sync"])
+        )
+        XCTAssertEqual(
+            snapshot.search("", tagFilter: "work/q2").map(\.source.title),
+            ["Q2 Roadmap"]
+        )
+        XCTAssertEqual(
+            snapshot.search("", tagFilter: "reading").map(\.source.title),
+            ["Weekend Reading"]
+        )
+
+        // Query #tag tokens in Global Search combined with free-text keywords
+        XCTAssertEqual(
+            snapshot.search("#work tokens").map(\.source.title),
+            ["Design Sync"]
+        )
+        XCTAssertEqual(
+            snapshot.search("#work/q2").map(\.source.title),
+            ["Q2 Roadmap"]
+        )
+        XCTAssertTrue(snapshot.search("#nonexistent").isEmpty)
+    }
 }
 
 #if canImport(Testing)
@@ -262,6 +305,11 @@ struct CaptureSearchSuite {
     @Test("Pinned notes sort first, hide pins manifest, and update immutably")
     func pinnedNotesSearchOrderingAndImmutableUpdate() throws {
         try CaptureSearchTests().testPinnedNotesSortFirstHidePinsManifestAndUpdateImmutably()
+    }
+
+    @Test("Tag aggregation, hierarchical tag filtering, and #tag query tokens")
+    func tagAggregationAndFiltering() throws {
+        try CaptureSearchTests().testTagAggregationHierarchicalFilteringAndQueryTagTokens()
     }
 }
 #endif
