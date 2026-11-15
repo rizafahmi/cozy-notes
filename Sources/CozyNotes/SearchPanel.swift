@@ -37,12 +37,15 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
     var isSidebarFocused: Bool { window?.firstResponder === table }
     var visibleHits: [SearchHit] { hits }
+    private(set) var activeTagFilter: String?
+    var availableTags: [TagCount] { snapshot?.tagCounts ?? [] }
 
     private let vault: Vault
     private let engine: CaptureSearch
     private let queue = DispatchQueue(label: "CozyNotes.capture-search", qos: .userInitiated)
     private let lifetime = SearchCancellation()
     private let table = SearchResultsTable()
+    private let tagFilterBar = TagFilterBar()
     private let status = Theme.label("LOADING…", size: 10.5, color: Theme.subtle)
     private let empty = Theme.label("Loading…", size: 12.5, color: Theme.muted)
     private let progress = NSProgressIndicator()
@@ -71,6 +74,10 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         self.vault = vault
         engine = CaptureSearch(vault: vault)
         super.init(frame: .zero)
+        tagFilterBar.onSelectTag = { [weak self] tag in
+            self?.setTagFilter(tag)
+        }
+        tagFilterBar.isHidden = true
 
         let folderLabel = vault.root.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
         let sectionStamp = Theme.label((folderLabel.isEmpty ? "INDEX" : folderLabel).uppercased(), size: 10, color: Theme.subtle)
@@ -128,7 +135,8 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         Theme.fill(processingRow, in: processingNotice, inset: 8)
         processingNotice.isHidden = true
 
-        let top = Theme.stack([processingNotice], orientation: .vertical, spacing: 8)
+        let top = Theme.stack([tagFilterBar, processingNotice], orientation: .vertical, spacing: 6)
+        tagFilterBar.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
         processingNotice.widthAnchor.constraint(equalTo: top.widthAnchor).isActive = true
         progress.style = .spinning
         progress.controlSize = .small
@@ -506,6 +514,19 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         setStatus("Stopping…")
     }
 
+    func setTagFilter(_ rawTag: String?) {
+        guard !closed else { return }
+        let cleaned = rawTag
+            .map { String($0.trimmingCharacters(in: .whitespacesAndNewlines).drop(while: { $0 == "#" })) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        if let current = activeTagFilter, let next = cleaned, current.caseInsensitiveCompare(next) == .orderedSame {
+            activeTagFilter = nil
+        } else {
+            activeTagFilter = cleaned
+        }
+        render()
+    }
+
     private func render() {
         guard !closed else { return }
         syncOrderedSelectionFromTable()
@@ -514,7 +535,9 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let targetURL = selectedHit?.source.url ?? activeNoteURL
         let targetPage = selectedHit?.page
         let previousOffset = table.enclosingScrollView?.contentView.bounds.origin ?? .zero
-        hits = snapshot?.search("") ?? []
+        let allTagCounts = snapshot?.tagCounts ?? []
+        tagFilterBar.update(tags: allTagCounts, activeTag: activeTagFilter)
+        hits = snapshot?.search("", tagFilter: activeTagFilter) ?? []
         hits.sort {
             if $0.source.isPinned != $1.source.isPinned {
                 return $0.source.isPinned && !$1.source.isPinned
@@ -557,6 +580,8 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let pending = snapshot?.pendingCount ?? 0
         if snapshot == nil {
             empty.stringValue = busy ? "Loading notes…" : "Folder could not be loaded."
+        } else if let activeTagFilter, hits.isEmpty {
+            empty.stringValue = "No notes tagged #\(activeTagFilter)."
         } else if snapshot?.sources.isEmpty == true {
             empty.stringValue = "No notes yet.\nStart writing on the right."
         } else {
@@ -573,6 +598,7 @@ final class SearchPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let noun = count == 1 ? "ENTRY" : "ENTRIES"
         let pinnedCount = hits.reduce(0) { $0 + ($1.source.isPinned ? 1 : 0) }
         var summary = "\(count) \(noun)"
+        if let activeTagFilter { summary += " · #\(activeTagFilter.uppercased())" }
         if selectedCount >= 2 { summary += " · \(selectedCount) SELECTED" }
         if pinnedCount > 0 { summary += " · \(pinnedCount) PINNED" }
         if snapshot.pendingCount > 0 { summary += " · \(snapshot.pendingCount) PENDING" }
@@ -1646,5 +1672,268 @@ final class QuickSwitcherOverlay: NSView, NSSearchFieldDelegate, NSTableViewData
         } : nil
         cell.show(hit, modifiedAt: modifiedDates[hit.source.url])
         return cell
+    }
+}
+
+@MainActor
+final class TagFilterBar: NSView {
+    var onSelectTag: ((String?) -> Void)?
+    private let row = NSStackView()
+    private var tags: [TagCount] = []
+    private var activeTag: String?
+    private var lastPackedWidth: CGFloat = 0
+    private(set) var visibleTagNames: [String] = []
+    private(set) var overflowTagCount: Int = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 4
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 24),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
+
+    override func layout() {
+        super.layout()
+        let w = bounds.width
+        if w > 40, abs(w - lastPackedWidth) > 8 {
+            rebuildChips(forWidth: w)
+        }
+    }
+
+    func update(tags: [TagCount], activeTag: String?) {
+        self.tags = tags
+        self.activeTag = activeTag
+        let shouldHide = tags.isEmpty && activeTag == nil
+        isHidden = shouldHide
+        guard !shouldHide else {
+            for sub in row.arrangedSubviews {
+                row.removeArrangedSubview(sub)
+                sub.removeFromSuperview()
+            }
+            visibleTagNames = []
+            overflowTagCount = 0
+            return
+        }
+        let targetWidth = bounds.width > 40 ? bounds.width : 260
+        rebuildChips(forWidth: targetWidth)
+    }
+
+    private func rebuildChips(forWidth availableWidth: CGFloat) {
+        lastPackedWidth = availableWidth
+        for sub in row.arrangedSubviews {
+            row.removeArrangedSubview(sub)
+            sub.removeFromSuperview()
+        }
+        visibleTagNames = []
+        overflowTagCount = 0
+
+        let allBtn = TagChipButton(title: "All", count: nil, isSelected: activeTag == nil)
+        allBtn.target = self
+        allBtn.action = #selector(allTapped)
+        allBtn.toolTip = "Show all notes"
+        allBtn.setAccessibilityLabel("All notes")
+        row.addArrangedSubview(allBtn)
+
+        var orderedTags = tags
+        if let activeTag {
+            if let existingIdx = orderedTags.firstIndex(where: { $0.name.caseInsensitiveCompare(activeTag) == .orderedSame }) {
+                if existingIdx > 0 {
+                    let item = orderedTags.remove(at: existingIdx)
+                    orderedTags.insert(item, at: 0)
+                }
+            } else {
+                orderedTags.insert(TagCount(name: activeTag, count: 0), at: 0)
+            }
+        }
+
+        var usedWidth = allBtn.intrinsicContentSize.width
+        let spacing = row.spacing
+        let overflowReserve: CGFloat = orderedTags.count > 1 ? 42 : 0
+
+        for (index, item) in orderedTags.enumerated() {
+            let isSelected = activeTag.map { $0.caseInsensitiveCompare(item.name) == .orderedSame } ?? false
+            let chip = TagChipButton(title: "#\(item.name)", count: item.count > 0 ? item.count : nil, isSelected: isSelected)
+            let chipWidth = chip.intrinsicContentSize.width
+            let remainingHasMore = index + 1 < orderedTags.count
+            let budget = availableWidth - (remainingHasMore ? overflowReserve : 0)
+            if index == 0 || (usedWidth + spacing + chipWidth <= budget && visibleTagNames.count < 4) {
+                chip.representedTagName = item.name
+                chip.target = self
+                chip.action = #selector(tagChipTapped(_:))
+                chip.toolTip = "Filter by #\(item.name) (\(item.count))"
+                chip.setAccessibilityLabel("Tag #\(item.name)")
+                row.addArrangedSubview(chip)
+                visibleTagNames.append(item.name)
+                usedWidth += spacing + chipWidth
+            } else {
+                overflowTagCount = orderedTags.count - visibleTagNames.count
+                break
+            }
+        }
+
+        if overflowTagCount > 0 {
+            let moreChip = TagChipButton(title: "+\(overflowTagCount) ▾", count: nil, isSelected: false)
+            moreChip.target = self
+            moreChip.action = #selector(showOverflowMenu(_:))
+            moreChip.toolTip = "All tags (\(orderedTags.count))"
+            moreChip.setAccessibilityLabel("More tags")
+            row.addArrangedSubview(moreChip)
+        }
+    }
+
+    @objc private func allTapped() {
+        onSelectTag?(nil)
+    }
+
+    @objc private func tagChipTapped(_ sender: TagChipButton) {
+        guard let tag = sender.representedTagName else { return }
+        onSelectTag?(tag)
+    }
+
+    @objc private func showOverflowMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        let allItem = NSMenuItem(title: "All Notes", action: #selector(menuAllSelected), keyEquivalent: "")
+        allItem.target = self
+        allItem.state = activeTag == nil ? .on : .off
+        menu.addItem(allItem)
+        if !tags.isEmpty {
+            menu.addItem(.separator())
+            for item in tags {
+                let menuItem = NSMenuItem(
+                    title: "#\(item.name)  (\(item.count))",
+                    action: #selector(menuTagSelected(_:)),
+                    keyEquivalent: ""
+                )
+                menuItem.target = self
+                menuItem.representedObject = item.name
+                if let activeTag, activeTag.caseInsensitiveCompare(item.name) == .orderedSame {
+                    menuItem.state = .on
+                }
+                menu.addItem(menuItem)
+            }
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func menuAllSelected() {
+        onSelectTag?(nil)
+    }
+
+    @objc private func menuTagSelected(_ sender: NSMenuItem) {
+        guard let tag = sender.representedObject as? String else { return }
+        onSelectTag?(tag)
+    }
+}
+
+@MainActor
+private final class TagChipButton: NSButton {
+    var representedTagName: String?
+    private let chipTitle: String
+    private let chipCount: Int?
+    private let isSelectedChip: Bool
+    private var hoverArea: NSTrackingArea?
+    private var isHovered = false
+
+    init(title: String, count: Int?, isSelected: Bool) {
+        self.chipTitle = title
+        self.chipCount = count
+        self.isSelectedChip = isSelected
+        super.init(frame: .zero)
+        isBordered = false
+        bezelStyle = .inline
+        setButtonType(.momentaryChange)
+        TitleConfig.apply(to: self, title: title, count: count, isSelected: isSelected)
+    }
+
+    required init?(coder: NSCoder) { fatalError("Use init(title:count:isSelected:)") }
+
+    @MainActor
+    private enum TitleConfig {
+        static func apply(to button: NSButton, title: String, count: Int?, isSelected: Bool) {
+            let font = Theme.monoFont(10.5, weight: isSelected ? .semibold : .medium)
+            let primaryColor = isSelected ? Theme.accent : Theme.ink.withAlphaComponent(0.84)
+            let result = NSMutableAttributedString(
+                string: title,
+                attributes: [.font: font, .foregroundColor: primaryColor]
+            )
+            if let count {
+                result.append(NSAttributedString(
+                    string: " \(count)",
+                    attributes: [
+                        .font: Theme.monoFont(9.5, weight: .regular),
+                        .foregroundColor: isSelected ? Theme.accent.withAlphaComponent(0.8) : Theme.subtle
+                    ]
+                ))
+            }
+            button.attributedTitle = result
+        }
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let base = attributedTitle.size()
+        return NSSize(width: min(132, ceil(base.width) + 14), height: 20)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        TitleConfig.apply(to: self, title: chipTitle, count: chipCount, isSelected: isSelectedChip)
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+        if isSelectedChip {
+            Theme.accentSoft.setFill()
+            path.fill()
+            Theme.accent.withAlphaComponent(0.45).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        } else {
+            let fillAlpha: CGFloat = isHovered ? 0.92 : 0.55
+            Theme.elevated.withAlphaComponent(fillAlpha).setFill()
+            path.fill()
+            Theme.border.withAlphaComponent(isHovered ? 0.95 : 0.65).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+        let textSize = attributedTitle.size()
+        let drawRect = NSRect(
+            x: rect.minX + 6.5,
+            y: rect.midY - textSize.height / 2,
+            width: max(0, rect.width - 13),
+            height: textSize.height
+        )
+        attributedTitle.draw(with: drawRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 }
