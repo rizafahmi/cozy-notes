@@ -825,15 +825,14 @@ import CozyCore
     }
 
     private func refreshLinkHoverCursor(at windowPoint: NSPoint?, modifierFlags: NSEvent.ModifierFlags) {
-        if wikiLinkItems.isEmpty && markdownLinkItems.isEmpty {
+        if wikiLinkItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
             if isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = false
                 NSCursor.iBeam.set()
             }
             return
         }
-        let cmdHeld = modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
-        guard let windowPoint, (cmdHeld || !isEditable) else {
+        guard let windowPoint else {
             if isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = false
                 NSCursor.iBeam.set()
@@ -841,8 +840,17 @@ import CozyCore
             return
         }
         let pt = convert(windowPoint, from: nil)
-        let overLink = bounds.contains(pt) && (markdownLink(atPoint: pt) != nil || wikiLink(atPoint: pt) != nil)
-        if overLink {
+        guard bounds.contains(pt) else {
+            if isShowingLinkPointerCursor {
+                isShowingLinkPointerCursor = false
+                NSCursor.iBeam.set()
+            }
+            return
+        }
+        let overTaskCheckbox = isEditable && taskCheckbox(atPoint: pt) != nil
+        let cmdHeld = modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+        let overLink = (cmdHeld || !isEditable) && (markdownLink(atPoint: pt) != nil || wikiLink(atPoint: pt) != nil)
+        if overTaskCheckbox || overLink {
             if !isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = true
             }
@@ -854,17 +862,12 @@ import CozyCore
     }
 
     override func mouseMoved(with event: NSEvent) {
-        if wikiLinkItems.isEmpty && markdownLinkItems.isEmpty {
+        if wikiLinkItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
             super.mouseMoved(with: event)
             return
         }
-        let cmdHeld = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
-        if cmdHeld || !isEditable {
-            refreshLinkHoverCursor(at: event.locationInWindow, modifierFlags: event.modifierFlags)
-            if isShowingLinkPointerCursor { return }
-        } else if isShowingLinkPointerCursor {
-            isShowingLinkPointerCursor = false
-        }
+        refreshLinkHoverCursor(at: event.locationInWindow, modifierFlags: event.modifierFlags)
+        if isShowingLinkPointerCursor { return }
         super.mouseMoved(with: event)
     }
 
@@ -1360,6 +1363,13 @@ import CozyCore
             return
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if isEditable, !flags.contains(.control), let taskItem = taskCheckbox(atPoint: pt) {
+            onDismissLinkActionBar?()
+            if toggleTaskCompletion(in: taskItem.markerRange, preserveViewport: true) {
+                vim.clampSelectionIfNeeded()
+                return
+            }
+        }
         if flags.contains(.command) {
             if let link = wikiLink(atPoint: pt) {
                 onDismissLinkActionBar?()
@@ -1424,6 +1434,38 @@ import CozyCore
         guard let link = contextMenuMarkdownLink else { return }
         contextMenuMarkdownLink = nil
         onCopyMarkdownLink?(link)
+    }
+
+    func taskCheckbox(atPoint pt: NSPoint) -> BulletItem? {
+        guard !bulletItems.isEmpty,
+              let layoutManager = layoutManager,
+              let textContainer = textContainer,
+              let storage = textStorage else { return nil }
+        let totalLength = storage.length
+        let origin = textContainerOrigin
+        let containerPt = NSPoint(x: pt.x - origin.x, y: pt.y - origin.y)
+        for item in bulletItems {
+            guard case .task = item.kind else { continue }
+            if isCharacterFolded(item.lineRange.location) { continue }
+            guard item.markerRange.length > 0, NSMaxRange(item.markerRange) <= totalLength else { continue }
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: item.markerRange, actualCharacterRange: nil)
+            guard glyphRange.length > 0 else { continue }
+            var matched = false
+            layoutManager.enumerateEnclosingRects(
+                forGlyphRange: glyphRange,
+                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                in: textContainer
+            ) { rect, stop in
+                if rect.insetBy(dx: -4, dy: -3).contains(containerPt) {
+                    matched = true
+                    stop.pointee = true
+                }
+            }
+            if matched {
+                return item
+            }
+        }
+        return nil
     }
 
     func wikiLink(atPoint pt: NSPoint) -> WikiLink? {
@@ -2486,7 +2528,7 @@ import CozyCore
     )
 
     @discardableResult
-    func toggleTaskCompletion(in range: NSRange) -> Bool {
+    func toggleTaskCompletion(in range: NSRange, preserveViewport: Bool = false) -> Bool {
         guard isEditable, let ns = textStorage?.mutableString, ns.length > 0 else { return false }
         let safeLoc = min(max(0, range.location), ns.length)
         let safeRange = NSRange(location: safeLoc, length: min(range.length, ns.length - safeLoc))
@@ -2514,7 +2556,8 @@ import CozyCore
         applyUndoableReplacement(
             in: lineSpan,
             with: updated,
-            selectedRangeAfter: NSRange(location: preservedLoc, length: 0)
+            selectedRangeAfter: NSRange(location: preservedLoc, length: 0),
+            preserveViewport: preserveViewport
         )
         return true
     }
@@ -2540,7 +2583,12 @@ import CozyCore
         }
     }
 
-    func applyUndoableReplacement(in range: NSRange, with replacement: String, selectedRangeAfter: NSRange? = nil) {
+    func applyUndoableReplacement(
+        in range: NSRange,
+        with replacement: String,
+        selectedRangeAfter: NSRange? = nil,
+        preserveViewport: Bool = false
+    ) {
         autoreleasepool {
             guard let storage = textStorage else { return }
             breakUndoCoalescing()
@@ -2582,7 +2630,12 @@ import CozyCore
                 let inverseRange = NSRange(location: safeRange.location, length: repLen)
                 let restoreSelection = selectedRangeAfter != nil ? previousSelection : nil
                 editorUndoManager.registerUndo(withTarget: self) { target in
-                    target.applyUndoableReplacement(in: inverseRange, with: previousString, selectedRangeAfter: restoreSelection)
+                    target.applyUndoableReplacement(
+                        in: inverseRange,
+                        with: previousString,
+                        selectedRangeAfter: restoreSelection,
+                        preserveViewport: preserveViewport
+                    )
                 }
             }
 
@@ -2605,7 +2658,19 @@ import CozyCore
 
             let nextSelection = selectedRangeAfter ?? NSRange(location: safeRange.location + repLen, length: 0)
             setSelectedRange(nextSelection)
+            let prevSuppress = suppressCaretUpdates
+            if preserveViewport {
+                suppressCaretUpdates = true
+            }
             didChangeText()
+            if preserveViewport {
+                suppressCaretUpdates = prevSuppress
+                if let clipView, let savedOriginY, abs(clipView.bounds.origin.y - savedOriginY) > 0.01 {
+                    clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: savedOriginY))
+                    enclosingScrollView?.reflectScrolledClipView(clipView)
+                }
+                updateCaret(animateForTyping: false)
+            }
         }
     }
 
@@ -7618,16 +7683,23 @@ import CozyCore
                     }
 
                     let kind: MarkdownTextView.BulletItem.Kind
+                    let bulletMarkerRange: NSRange
                     if isTask {
                         kind = .task(completed: completed)
+                        bulletMarkerRange = NSRange(
+                            location: symbolRange.location,
+                            length: max(symbolRange.length, NSMaxRange(markerRange) - symbolRange.location)
+                        )
                     } else if isUnordered {
                         kind = .unordered
+                        bulletMarkerRange = symbolRange
                     } else {
                         kind = .ordered
+                        bulletMarkerRange = symbolRange
                     }
                     bullets.append(MarkdownTextView.BulletItem(
                         lineRange: fullMatchRange,
-                        markerRange: symbolRange,
+                        markerRange: bulletMarkerRange,
                         level: level,
                         kind: kind
                     ))
