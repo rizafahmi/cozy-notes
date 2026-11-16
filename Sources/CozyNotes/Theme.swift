@@ -734,6 +734,22 @@ import AppKit
     private var tracking: NSTrackingArea?
     private(set) var symbolName: String?
     var tint: NSColor = Theme.muted { didSet { contentTintColor = tint; needsDisplay = true } }
+    var hoverCursor: NSCursor? {
+        didSet {
+            guard hoverCursor !== oldValue else { return }
+            updateTrackingAreas()
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    var onHoverCursorExit: ((NSEvent) -> Void)?
+
+    override var isEnabled: Bool {
+        didSet {
+            guard isEnabled != oldValue else { return }
+            window?.invalidateCursorRects(for: self)
+            needsDisplay = true
+        }
+    }
 
     convenience init(title: String = "", symbol: String? = nil, target: AnyObject? = nil, action: Selector? = nil) {
         self.init(frame: .zero)
@@ -775,12 +791,47 @@ import AppKit
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+        var options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect]
+        if hoverCursor != nil {
+            options.insert(.cursorUpdate)
+        }
+        let area = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
         addTrackingArea(area)
         tracking = area
     }
-    override func mouseEntered(with event: NSEvent) { hovered = true }
-    override func mouseExited(with event: NSEvent) { hovered = false }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled, let hoverCursor {
+            addCursorRect(bounds, cursor: hoverCursor)
+        }
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        if let hoverCursor {
+            (isEnabled ? hoverCursor : .arrow).set()
+        } else {
+            super.cursorUpdate(with: event)
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        if isEnabled, let hoverCursor {
+            hoverCursor.set()
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        if hoverCursor != nil {
+            if let onHoverCursorExit {
+                onHoverCursorExit(event)
+            } else {
+                NSCursor.arrow.set()
+            }
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         let pressed = cell?.isHighlighted == true
