@@ -232,6 +232,134 @@ private func verifyMarkdownLinkParsingIncrementalAndInteractions() throws {
             )
         }
 
+        // 3a-cursor. Pointer cursor transitions across LinkActionBarView (pill chrome -> Open -> divider -> Copy -> exit/dismiss)
+        //            and resists underlying NSTextView mouseMoved / cursorUpdate clobbering.
+        do {
+            let winNum = workspace.window?.windowNumber ?? 0
+            func makeMoveEvent(at winPt: NSPoint, flags: NSEvent.ModifierFlags = []) throws -> NSEvent {
+                guard let ev = NSEvent.mouseEvent(
+                    with: .mouseMoved,
+                    location: winPt,
+                    modifierFlags: flags,
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: winNum,
+                    context: nil,
+                    eventNumber: 20,
+                    clickCount: 0,
+                    pressure: 0
+                ) else {
+                    throw NSError(domain: "LinkInteractionTests", code: 30, userInfo: nil)
+                }
+                return ev
+            }
+            func makeEnterExitEvent(_ type: NSEvent.EventType, at winPt: NSPoint, flags: NSEvent.ModifierFlags = []) throws -> NSEvent {
+                guard let ev = NSEvent.enterExitEvent(
+                    with: type,
+                    location: winPt,
+                    modifierFlags: flags,
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: winNum,
+                    context: nil,
+                    eventNumber: 21,
+                    trackingNumber: 0,
+                    userData: nil
+                ) else {
+                    throw NSError(domain: "LinkInteractionTests", code: 31, userInfo: nil)
+                }
+                return ev
+            }
+
+            let bar = editor.linkActionBar
+            let labelMidInBar = NSPoint(x: bar.urlLabel.frame.midX, y: bar.urlLabel.frame.midY)
+            let openMidInBar = NSPoint(x: bar.openButton.frame.midX, y: bar.openButton.frame.midY)
+            let dividerMidInBar = NSPoint(
+                x: (bar.openButton.frame.maxX + bar.copyButton.frame.minX) * 0.5,
+                y: bar.bounds.midY
+            )
+            let copyMidInBar = NSPoint(x: bar.copyButton.frame.midX, y: bar.copyButton.frame.midY)
+
+            let labelWinPt = bar.convert(labelMidInBar, to: nil)
+            let openWinPt = bar.convert(openMidInBar, to: nil)
+            let dividerWinPt = bar.convert(dividerMidInBar, to: nil)
+            let copyWinPt = bar.convert(copyMidInBar, to: nil)
+            let proseWinPt = try glyphMidpointInWindow(for: NSRange(location: 2, length: 4), in: textView)
+
+            NSCursor.iBeam.set()
+
+            // Entering URL label / non-button pill chrome sets arrow cursor, not iBeam.
+            bar.mouseEntered(with: try makeEnterExitEvent(.mouseEntered, at: labelWinPt))
+            textView.mouseMoved(with: try makeMoveEvent(at: labelWinPt))
+            textView.cursorUpdate(with: try makeEnterExitEvent(.cursorUpdate, at: labelWinPt))
+            try linkCheck(
+                NSCursor.current === NSCursor.arrow,
+                "Hovering LinkActionBarView URL label / chrome should show arrow cursor, not iBeam"
+            )
+
+            // Moving onto Open button sets pointingHand and resists NSTextView mouseMoved / cursorUpdate.
+            bar.openButton.mouseEntered(with: try makeEnterExitEvent(.mouseEntered, at: openWinPt))
+            bar.mouseMoved(with: try makeMoveEvent(at: openWinPt))
+            textView.mouseMoved(with: try makeMoveEvent(at: openWinPt))
+            textView.cursorUpdate(with: try makeEnterExitEvent(.cursorUpdate, at: openWinPt))
+            try linkCheck(
+                NSCursor.current === NSCursor.pointingHand,
+                "Hovering LinkActionBarView Open button must show pointingHand cursor"
+            )
+
+            // Crossing the divider gap between Open and Copy reverts to arrow without leaking iBeam.
+            bar.openButton.mouseExited(with: try makeEnterExitEvent(.mouseExited, at: dividerWinPt))
+            bar.mouseMoved(with: try makeMoveEvent(at: dividerWinPt))
+            textView.mouseMoved(with: try makeMoveEvent(at: dividerWinPt))
+            try linkCheck(
+                NSCursor.current === NSCursor.arrow,
+                "Crossing divider between Open and Copy buttons should show arrow cursor"
+            )
+
+            // Moving onto Copy button (via cursorUpdate and mouseMoved) sets pointingHand and resists NSTextView tracking.
+            bar.copyButton.cursorUpdate(with: try makeEnterExitEvent(.cursorUpdate, at: copyWinPt))
+            bar.copyButton.mouseEntered(with: try makeEnterExitEvent(.mouseEntered, at: copyWinPt))
+            bar.mouseMoved(with: try makeMoveEvent(at: copyWinPt))
+            textView.mouseMoved(with: try makeMoveEvent(at: copyWinPt))
+            textView.cursorUpdate(with: try makeEnterExitEvent(.cursorUpdate, at: copyWinPt))
+            try linkCheck(
+                NSCursor.current === NSCursor.pointingHand,
+                "Hovering LinkActionBarView Copy button must show pointingHand cursor"
+            )
+
+            // Exiting Copy button and LinkActionBarView directly onto plain prose restores iBeam immediately.
+            bar.copyButton.mouseExited(with: try makeEnterExitEvent(.mouseExited, at: proseWinPt))
+            bar.mouseExited(with: try makeEnterExitEvent(.mouseExited, at: proseWinPt))
+            try linkCheck(
+                NSCursor.current === NSCursor.iBeam,
+                "Exiting LinkActionBarView onto editor prose must restore iBeam cursor"
+            )
+
+            // Exiting LinkActionBarView onto a Markdown link while holding ⌘ restores pointingHand.
+            bar.mouseEntered(with: try makeEnterExitEvent(.mouseEntered, at: labelWinPt, flags: [.command]))
+            try linkCheck(
+                NSCursor.current === NSCursor.arrow,
+                "⌘-hovering over LinkActionBarView URL label should keep arrow cursor"
+            )
+            bar.mouseExited(with: try makeEnterExitEvent(.mouseExited, at: clickWinPt, flags: [.command]))
+            try linkCheck(
+                NSCursor.current === NSCursor.pointingHand,
+                "Exiting LinkActionBarView onto ⌘-hovered link should show pointingHand cursor"
+            )
+
+            // Animated dismissal immediately releases occlusion and restores underlying editor cursor.
+            bar.openButton.mouseEntered(with: try makeEnterExitEvent(.mouseEntered, at: openWinPt))
+            try linkCheck(NSCursor.current === NSCursor.pointingHand, "Precondition: pointingHand over Open button")
+            editor.hideLinkActionBar(animated: true)
+            editor.syncCursor(atWindowPoint: openWinPt, modifierFlags: [])
+            try linkCheck(
+                !textView.isOccludedBySiblingOverlay(at: openWinPt) && NSCursor.current === NSCursor.iBeam,
+                "Dismissing LinkActionBarView must immediately release overlay occlusion and restore iBeam cursor"
+            )
+
+            // Re-open LinkActionBarView via plain click for subsequent 3b Copy / 3c Open checks.
+            textView.mouseDown(with: plainClick)
+            try linkCheck(editor.isLinkActionBarVisible && !editor.linkActionBar.isHidden, "Re-clicking link restores LinkActionBarView")
+        }
+
         // 3b. Clicking Copy copies URL to pasteboard, updates pill to "Copied" with zero width shift, and keeps textView focused.
         let barWidthBeforeCopy = editor.linkActionBar.bounds.width
         let copyBtnWidthBeforeCopy = editor.linkActionBar.copyButton.frame.width

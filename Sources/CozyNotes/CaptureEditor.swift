@@ -866,11 +866,49 @@ import CozyCore
         linkHoverTracking = area
     }
 
+    func clearLinkPointerCursorState() {
+        isShowingLinkPointerCursor = false
+    }
+
+    func isOccludedBySiblingOverlay(at windowPoint: NSPoint) -> Bool {
+        guard let rootView = window?.contentView else { return false }
+        let pointInRootSuperview = rootView.superview.map { $0.convert(windowPoint, from: nil) }
+            ?? rootView.convert(windowPoint, from: nil)
+        guard let hitView = rootView.hitTest(pointInRootSuperview) else { return false }
+        return hitView !== self && !hitView.isDescendant(of: self)
+    }
+
+    func resolvedEditorCursor(at windowPoint: NSPoint, modifierFlags: NSEvent.ModifierFlags) -> NSCursor {
+        let pt = convert(windowPoint, from: nil)
+        guard bounds.contains(pt) else { return .arrow }
+        if !wikiLinkItems.isEmpty || !tagItems.isEmpty || !markdownLinkItems.isEmpty || !bulletItems.isEmpty {
+            let overTaskCheckbox = isEditable && taskCheckbox(atPoint: pt) != nil
+            let cmdHeld = modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+            let overLink = (cmdHeld || !isEditable) && (markdownLink(atPoint: pt) != nil || wikiLink(atPoint: pt) != nil || noteTag(atPoint: pt) != nil)
+            if overTaskCheckbox || overLink {
+                return .pointingHand
+            }
+        }
+        return .iBeam
+    }
+
+    func applyEditorCursor(at windowPoint: NSPoint, modifierFlags: NSEvent.ModifierFlags) {
+        guard !isOccludedBySiblingOverlay(at: windowPoint) else {
+            isShowingLinkPointerCursor = false
+            return
+        }
+        let cursor = resolvedEditorCursor(at: windowPoint, modifierFlags: modifierFlags)
+        isShowingLinkPointerCursor = (cursor === NSCursor.pointingHand)
+        cursor.set()
+    }
+
     private func refreshLinkHoverCursor(at windowPoint: NSPoint?, modifierFlags: NSEvent.ModifierFlags) {
         if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
             if isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = false
-                NSCursor.iBeam.set()
+                if let windowPoint, !isOccludedBySiblingOverlay(at: windowPoint) {
+                    NSCursor.iBeam.set()
+                }
             }
             return
         }
@@ -879,6 +917,10 @@ import CozyCore
                 isShowingLinkPointerCursor = false
                 NSCursor.iBeam.set()
             }
+            return
+        }
+        if isOccludedBySiblingOverlay(at: windowPoint) {
+            isShowingLinkPointerCursor = false
             return
         }
         let pt = convert(windowPoint, from: nil)
@@ -904,6 +946,10 @@ import CozyCore
     }
 
     override func mouseMoved(with event: NSEvent) {
+        if isOccludedBySiblingOverlay(at: event.locationInWindow) {
+            isShowingLinkPointerCursor = false
+            return
+        }
         if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
             super.mouseMoved(with: event)
             return
@@ -911,6 +957,16 @@ import CozyCore
         refreshLinkHoverCursor(at: event.locationInWindow, modifierFlags: event.modifierFlags)
         if isShowingLinkPointerCursor { return }
         super.mouseMoved(with: event)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        if isOccludedBySiblingOverlay(at: event.locationInWindow) {
+            isShowingLinkPointerCursor = false
+            return
+        }
+        refreshLinkHoverCursor(at: event.locationInWindow, modifierFlags: event.modifierFlags)
+        if isShowingLinkPointerCursor { return }
+        super.cursorUpdate(with: event)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -3894,9 +3950,12 @@ import CozyCore
 
     var onOpen: (() -> Void)?
     var onCopy: (() -> Void)?
+    var onCursorExit: ((NSEvent) -> Void)?
+    var isInteractive = true
 
     private(set) var isShowingCopied = false
     private var fixedCopyButtonWidth: CGFloat = 78
+    private var cursorTracking: NSTrackingArea?
 
     override var acceptsFirstResponder: Bool { false }
 
@@ -3918,18 +3977,26 @@ import CozyCore
         urlLabel.drawsBackground = false
 
         openButton.tint = Theme.accent
+        openButton.hoverCursor = .pointingHand
         openButton.refusesFirstResponder = true
         openButton.target = self
         openButton.action = #selector(handleOpen)
         openButton.toolTip = "Open link in browser (⌘-Click)"
         openButton.setAccessibilityLabel("Open link")
+        openButton.onHoverCursorExit = { [weak self] event in
+            self?.handleChildButtonCursorExit(event)
+        }
 
         copyButton.tint = Theme.headingInk
+        copyButton.hoverCursor = .pointingHand
         copyButton.refusesFirstResponder = true
         copyButton.target = self
         copyButton.action = #selector(handleCopy)
         copyButton.toolTip = "Copy link URL to clipboard"
         copyButton.setAccessibilityLabel("Copy link")
+        copyButton.onHoverCursorExit = { [weak self] event in
+            self?.handleChildButtonCursorExit(event)
+        }
 
         let copyNormalWidth = ceil(copyButton.intrinsicContentSize.width)
         copyButton.title = "Copied"
@@ -3946,8 +4013,110 @@ import CozyCore
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isInteractive else { return nil }
+        return super.hitTest(point)
+    }
+
     // Absorb clicks on pill chrome so they neither drag the window nor pass through to the editor.
     override func mouseDown(with event: NSEvent) {}
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let cursorTracking {
+            removeTrackingArea(cursorTracking)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .cursorUpdate, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        cursorTracking = area
+    }
+
+    func resolvedCursor(at localPoint: NSPoint) -> NSCursor {
+        if openButton.isEnabled && !openButton.isHidden && openButton.frame.contains(localPoint) {
+            return openButton.hoverCursor ?? .pointingHand
+        }
+        if copyButton.isEnabled && !copyButton.isHidden && copyButton.frame.contains(localPoint) {
+            return copyButton.hoverCursor ?? .pointingHand
+        }
+        return .arrow
+    }
+
+    @discardableResult
+    func applyCursor(forWindowPoint windowPoint: NSPoint) -> Bool {
+        guard isInteractive && !isHidden else { return false }
+        let localPoint = convert(windowPoint, from: nil)
+        guard bounds.contains(localPoint) else { return false }
+        resolvedCursor(at: localPoint).set()
+        return true
+    }
+
+    private func handleChildButtonCursorExit(_ event: NSEvent) {
+        if !applyCursor(forWindowPoint: event.locationInWindow) {
+            onCursorExit?(event)
+        }
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        _ = applyCursor(forWindowPoint: event.locationInWindow)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        _ = applyCursor(forWindowPoint: event.locationInWindow)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        _ = applyCursor(forWindowPoint: event.locationInWindow)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if !applyCursor(forWindowPoint: event.locationInWindow) {
+            onCursorExit?(event)
+        }
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard isInteractive && !isHidden, bounds.width > 0, bounds.height > 0 else { return }
+        let openRect = openButton.frame.intersection(bounds)
+        let copyRect = copyButton.frame.intersection(bounds)
+        let sortedButtons = [openRect, copyRect]
+            .filter { !$0.isNull && !$0.isEmpty }
+            .sorted { $0.minX < $1.minX }
+
+        var currentX = bounds.minX
+        for btnRect in sortedButtons {
+            if btnRect.minX > currentX {
+                addCursorRect(
+                    NSRect(x: currentX, y: bounds.minY, width: btnRect.minX - currentX, height: bounds.height),
+                    cursor: .arrow
+                )
+            }
+            if btnRect.minY > bounds.minY {
+                addCursorRect(
+                    NSRect(x: btnRect.minX, y: bounds.minY, width: btnRect.width, height: btnRect.minY - bounds.minY),
+                    cursor: .arrow
+                )
+            }
+            if btnRect.maxY < bounds.maxY {
+                addCursorRect(
+                    NSRect(x: btnRect.minX, y: btnRect.maxY, width: btnRect.width, height: bounds.maxY - btnRect.maxY),
+                    cursor: .arrow
+                )
+            }
+            currentX = max(currentX, btnRect.maxX)
+        }
+        if currentX < bounds.maxX {
+            addCursorRect(
+                NSRect(x: currentX, y: bounds.minY, width: bounds.maxX - currentX, height: bounds.height),
+                cursor: .arrow
+            )
+        }
+    }
 
     @objc private func handleOpen() {
         onOpen?()
@@ -4009,6 +4178,7 @@ import CozyCore
         urlLabel.frame = NSRect(x: labelX, y: labelY, width: labelW, height: labelH)
         openButton.frame = NSRect(x: openX, y: buttonY, width: openW, height: buttonHeight)
         copyButton.frame = NSRect(x: copyX, y: buttonY, width: fixedCopyButtonWidth, height: buttonHeight)
+        window?.invalidateCursorRects(for: self)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -4710,6 +4880,9 @@ import CozyCore
             guard let self, let link = self.activeLinkActionItem else { return }
             self.copyMarkdownLink(link, fromActionBar: true)
         }
+        linkActionBar.onCursorExit = { [weak self] event in
+            self?.syncCursor(atWindowPoint: event.locationInWindow, modifierFlags: event.modifierFlags)
+        }
         scroll.verticalScroller = CozyScroller()
         scroll.documentView = textView
         scroll.scrollerStyle = .overlay
@@ -5383,18 +5556,45 @@ import CozyCore
         }
     }
 
+    func syncCursor(atWindowPoint windowPoint: NSPoint?, modifierFlags: NSEvent.ModifierFlags = NSEvent.modifierFlags) {
+        guard let windowPoint else { return }
+        if isLinkActionBarVisible && !linkActionBar.isHidden,
+           linkActionBar.applyCursor(forWindowPoint: windowPoint) {
+            textView.clearLinkPointerCursorState()
+            return
+        }
+        guard let rootView = window?.contentView else { return }
+        let pointInRootSuperview = rootView.superview.map { $0.convert(windowPoint, from: nil) }
+            ?? rootView.convert(windowPoint, from: nil)
+        guard let hitView = rootView.hitTest(pointInRootSuperview) else { return }
+        if hitView === textView || hitView.isDescendant(of: textView) {
+            textView.applyEditorCursor(at: windowPoint, modifierFlags: modifierFlags)
+        } else if let button = hitView as? QuietButton, button.isEnabled, let hoverCursor = button.hoverCursor {
+            textView.clearLinkPointerCursorState()
+            hoverCursor.set()
+        } else {
+            textView.clearLinkPointerCursorState()
+            NSCursor.arrow.set()
+        }
+    }
+
     func showLinkActionBar(for link: MarkdownTextView.MarkdownLink, preferredPoint: NSPoint? = nil) {
         hideWikiAutocomplete()
         linkActionGeneration &+= 1
         activeLinkActionItem = link
         activeLinkPreferredPoint = preferredPoint
         isLinkActionBarVisible = true
+        linkActionBar.isInteractive = true
         linkActionBar.layer?.removeAnimation(forKey: "feedback.opacity")
         linkActionBar.configure(url: link.resolvedURL, copied: false)
         positionLinkActionBar()
         guard isLinkActionBarVisible else { return }
         linkActionBar.isHidden = false
         linkActionBar.layoutSubtreeIfNeeded()
+        window?.invalidateCursorRects(for: linkActionBar)
+        if window?.isVisible == true {
+            syncCursor(atWindowPoint: window?.mouseLocationOutsideOfEventStream)
+        }
         if window?.isVisible == true, let layer = linkActionBar.layer {
             Theme.fade(layer, to: 1, duration: 0.12, from: 0)
         } else {
@@ -5407,6 +5607,7 @@ import CozyCore
         let gen = linkActionGeneration
         let wasVisible = isLinkActionBarVisible || !linkActionBar.isHidden
         isLinkActionBarVisible = false
+        linkActionBar.isInteractive = false
         activeLinkActionItem = nil
         activeLinkPreferredPoint = nil
         guard wasVisible else { return }
@@ -5420,6 +5621,11 @@ import CozyCore
             linkActionBar.layer?.removeAnimation(forKey: "feedback.opacity")
             linkActionBar.layer?.opacity = 1
             linkActionBar.isHidden = true
+        }
+        window?.invalidateCursorRects(for: linkActionBar)
+        window?.invalidateCursorRects(for: textView)
+        if window?.isVisible == true {
+            syncCursor(atWindowPoint: window?.mouseLocationOutsideOfEventStream)
         }
     }
 
