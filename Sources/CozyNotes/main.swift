@@ -287,6 +287,17 @@ import CozyCore
             workspace?.showWindow(nil)
         }
     }
+    @objc private func toggleSemanticConnections() {
+        if let noteWin = workspace?.activeNoteWindowController {
+            noteWin.toggleSemanticConnections()
+        } else {
+            workspace?.toggleSemanticConnections()
+            workspace?.showWindow(nil)
+        }
+    }
+    @objc private func semanticModelManager() {
+        workspace?.showSemanticModelManager()
+    }
     @objc private func toggleAppearance() { workspace?.toggleAppearance(); workspace?.showWindow(nil) }
     @objc private func cycleAtmosphere() { workspace?.cycleAtmosphere(); workspace?.showWindow(nil) }
     @objc private func cycleVoice() { workspace?.cycleVoice(); workspace?.showWindow(nil) }
@@ -348,6 +359,7 @@ import CozyCore
         add("Open Notes Folder", action: #selector(openFolder), key: "", to: file)
         add("Recovery…", action: #selector(recovery), key: "", to: file)
         add("Make Searchable", action: #selector(makeSearchable), key: "", to: file)
+        add("Semantic Connections Model…", action: #selector(semanticModelManager), key: "", to: file)
         let editItem = NSMenuItem()
         editItem.title = "Edit"
         let edit = NSMenu(title: "Edit")
@@ -404,6 +416,7 @@ import CozyCore
         bar.addItem(viewItem)
         add("Toggle Sidebar", action: #selector(toggleSidebar), key: "\\", to: view)
         add("Toggle Document Outline", action: #selector(toggleOutline), key: "\\", modifiers: [.command, .option], to: view)
+        add("Toggle Semantic Connections", action: #selector(toggleSemanticConnections), key: "\\", modifiers: [.command, .control], to: view)
         add("Toggle Light / Dark Mode", action: #selector(toggleAppearance), key: "d", modifiers: [.command, .shift], to: view)
         add("Switch Atmosphere (Obsidian / Midnight / Neo-Acid)", action: #selector(cycleAtmosphere), key: "t", modifiers: [.command, .shift], to: view)
         add("Cycle Writing Font (Avenir / Charter / Iowan / Mono / Unbounded)", action: #selector(cycleVoice), key: "y", modifiers: [.command, .shift], to: view)
@@ -470,6 +483,14 @@ import CozyCore
             let count = workspace.selectedNotesForMerge.count
             menuItem.title = count >= 2 ? "Merge \(count) Notes…" : "Merge Notes…"
             return workspace.canMergeNotes
+        }
+        if menuItem.action == #selector(toggleSemanticConnections) {
+            if let noteWin = workspace?.activeNoteWindowController {
+                menuItem.state = noteWin.editor.isSemanticConnectionsVisible ? .on : .off
+            } else {
+                menuItem.state = (workspace?.editor.isSemanticConnectionsVisible == true) ? .on : .off
+            }
+            return true
         }
         if menuItem.action == #selector(toggleVimMode) {
             menuItem.state = Theme.vimModeEnabled ? .on : .off

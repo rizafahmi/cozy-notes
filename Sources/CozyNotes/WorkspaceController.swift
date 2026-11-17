@@ -1,5 +1,6 @@
 import AppKit
 import CozyCore
+import CozySearch
 
 @MainActor final class ExternalEditReviewBanner: NSView {
     let messageLabel = Theme.label("Modified on disk by external process", size: 11.5, color: Theme.ink)
@@ -120,6 +121,7 @@ import CozyCore
     let vault: Vault
     let editor = CaptureEditor(frame: .zero)
     let searchPanel: SearchPanel
+    let semanticCoordinator: WorkspaceSemanticCoordinator
     let quickSwitcher = QuickSwitcherOverlay(frame: .zero)
     private let sidebarContainer = NSView()
     private let folioSurface = FolioPageSurface()
@@ -129,6 +131,7 @@ import CozyCore
     private let voiceButton = QuietButton(title: "AVENIR", symbol: "textformat", target: nil, action: nil)
     private let atmosphereButton = QuietButton(title: "OBSIDIAN", symbol: "sparkles", target: nil, action: nil)
     let pinButton = QuietButton(symbol: "pin", target: nil, action: nil)
+    let connectionsButton = QuietButton(symbol: "point.3.connected.trianglepath.dotted", target: nil, action: nil)
     let outlineButton = QuietButton(symbol: "list.bullet.indent", target: nil, action: nil)
     let openInNewWindowButton = QuietButton(symbol: "rectangle.on.rectangle", target: nil, action: nil)
     let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
@@ -195,9 +198,18 @@ import CozyCore
         f.setLocalizedDateFormatFromTemplate("EEE, MMM d, yyyy · HH:mm")
         return f
     }()
-    init(vault: Vault) {
+    init(
+        vault: Vault,
+        semanticModelStore: SemanticModelStore = SemanticModelStore(),
+        semanticCacheDirectory: URL? = nil
+    ) {
         self.vault = vault
         self.searchPanel = SearchPanel(vault: vault)
+        self.semanticCoordinator = WorkspaceSemanticCoordinator(
+            vault: vault,
+            modelStore: semanticModelStore,
+            cacheDirectory: semanticCacheDirectory
+        )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1060, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -270,6 +282,10 @@ import CozyCore
         pinButton.action = #selector(togglePinCurrentNote)
         pinButton.toolTip = "Pin note to top (⇧⌘P)"
         pinButton.setAccessibilityLabel("Pin note")
+        connectionsButton.target = self
+        connectionsButton.action = #selector(toggleSemanticConnections)
+        connectionsButton.toolTip = "Toggle Semantic Connections — #tags & EN↔ID notes (⌃⌘\\)"
+        connectionsButton.setAccessibilityLabel("Toggle Semantic Connections")
         outlineButton.target = self
         outlineButton.action = #selector(toggleOutline)
         outlineButton.toolTip = "Toggle Document Outline (⌥⌘\\)"
@@ -299,7 +315,7 @@ import CozyCore
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, pinButton, outlineButton, openInNewWindowButton, revealButton, deleteButton], spacing: 6)
+        let editorHeader = Theme.stack([collapsedControls, sealDot, contextLabel, spacer, conflictSaveButton, voiceButton, atmosphereButton, pinButton, connectionsButton, outlineButton, openInNewWindowButton, revealButton, deleteButton], spacing: 6)
 
         for view in [editorHeader, headerRule, reviewBanner, editor] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -398,6 +414,19 @@ import CozyCore
         editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
         editor.onQuickSwitcher = { [weak self] in self?.toggleQuickSwitcher() }
         editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
+        editor.onSemanticVisibilityChange = { [weak self] _ in
+            guard let self else { return }
+            self.updateEditorChrome()
+            self.semanticCoordinator.editorVisibilityDidChange(self.editor)
+        }
+        semanticCoordinator.registerEditor(editor) { [weak self] record, inNewWindow in
+            guard let self else { return }
+            if inNewWindow {
+                _ = self.openNoteInNewWindow(record.url)
+            } else {
+                self.openNote(record.url)
+            }
+        }
         quickSwitcher.onOpenNote = { [weak self] url in self?.openNote(url) }
         quickSwitcher.onOpenNoteWithQuery = { [weak self] url, query in
             self?.openNoteFromQuickSwitcher(url, query: query, inNewWindow: false)
@@ -445,6 +474,17 @@ import CozyCore
             bannerLeadingConstraint?.constant = inset
             bannerTrailingConstraint?.constant = -inset
         }
+    }
+
+    @objc func toggleSemanticConnections() {
+        editor.toggleSemanticConnections()
+        updateEditorChrome()
+    }
+
+    @objc func showSemanticModelManager() {
+        editor.setSemanticConnectionsVisible(true)
+        updateEditorChrome()
+        showAndFocus()
     }
 
     @objc func toggleOutline() {
@@ -624,6 +664,7 @@ import CozyCore
             win.refreshNoteIfClean()
             win.editor.invalidateNoteRecordsCache()
         }
+        semanticCoordinator.vaultDidRefresh()
     }
 
     private func editorDidChange() {
@@ -646,6 +687,9 @@ import CozyCore
             noteDirty = editor.hasContent
         }
         updateEditorChrome()
+        if editor.isSemanticConnectionsVisible {
+            semanticCoordinator.scheduleSuggestionUpdate(for: editor, immediate: false)
+        }
         guard noteDirty, !noteConflicted, !hasExternalDiskChange else { return }
         if editor.status.stringValue != "Editing…" {
             editor.status.stringValue = "Editing…"
@@ -735,6 +779,7 @@ import CozyCore
                 syncSavedNoteToCompanions(existingURL, content: noteBaseline)
                 updateEditorChrome()
                 searchPanel.refresh()
+                semanticCoordinator.noteDidSave(url: existingURL, content: savedText)
                 return true
             } catch {
                 noteConflicted = true
@@ -766,6 +811,7 @@ import CozyCore
                 updateEditorChrome()
                 searchPanel.selectNote(record.url)
                 searchPanel.refresh()
+                semanticCoordinator.noteDidSave(url: record.url, content: saved)
                 return true
             } catch {
                 showError(error, in: window)
@@ -804,6 +850,7 @@ import CozyCore
             syncSavedNoteToCompanions(existingURL, content: diskText)
             updateEditorChrome()
             searchPanel.refresh()
+            semanticCoordinator.noteDidSave(url: existingURL, content: diskText)
             editor.focus()
         } catch {
             showError(error, in: window)
@@ -832,6 +879,7 @@ import CozyCore
             syncSavedNoteToCompanions(existingURL, content: savedText)
             updateEditorChrome()
             searchPanel.refresh()
+            semanticCoordinator.noteDidSave(url: existingURL, content: savedText)
             editor.focus()
         } catch VaultError.conflict {
             pendingExternalDiskText = try? vault.read(existingURL)
@@ -864,6 +912,7 @@ import CozyCore
             updateEditorChrome()
             searchPanel.selectNote(note.url)
             searchPanel.refresh()
+            semanticCoordinator.noteDidSave(url: note.url, content: saved)
             editor.focus()
         } catch { showError(error, in: window) }
     }
@@ -880,6 +929,9 @@ import CozyCore
         editor.reset()
         searchPanel.selectNote(nil)
         updateEditorChrome()
+        if editor.isSemanticConnectionsVisible {
+            semanticCoordinator.scheduleSuggestionUpdate(for: editor, immediate: true)
+        }
         editor.focus()
     }
 
@@ -1073,6 +1125,26 @@ import CozyCore
         controller.onWillClose = { [weak self] closed in
             self?.noteWindows.removeAll { $0 === closed }
         }
+        controller.onDidChangeEditorText = { [weak self, weak controller] in
+            guard let self, let controller, controller.editor.isSemanticConnectionsVisible else { return }
+            self.semanticCoordinator.scheduleSuggestionUpdate(for: controller.editor, immediate: false)
+        }
+        controller.onDidOpenNote = { [weak self, weak controller] in
+            guard let self, let controller, controller.editor.isSemanticConnectionsVisible else { return }
+            self.semanticCoordinator.scheduleSuggestionUpdate(for: controller.editor, immediate: true)
+        }
+        controller.onSemanticVisibilityDidChange = { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            self.semanticCoordinator.editorVisibilityDidChange(controller.editor)
+        }
+        semanticCoordinator.registerEditor(controller.editor) { [weak self, weak controller] record, inNewWindow in
+            guard let self else { return }
+            if inNewWindow {
+                _ = self.openNoteInNewWindow(record.url)
+            } else {
+                controller?.openNote(record.url)
+            }
+        }
         noteWindows.append(controller)
         if noteURL == url && !noteConflicted {
             controller.openNote(url, initialText: noteBaseline, initialLinkedAttachments: editor.linkedAttachments)
@@ -1167,6 +1239,7 @@ import CozyCore
         editor.invalidateNoteRecordsCache()
         for win in noteWindows { win.editor.invalidateNoteRecordsCache() }
         searchPanel.refresh()
+        semanticCoordinator.noteDidSave(url: url, content: content)
     }
 
     @discardableResult
@@ -1203,6 +1276,9 @@ import CozyCore
             editor.status.stringValue = ""
             searchPanel.selectNote(url)
             updateEditorChrome()
+            if editor.isSemanticConnectionsVisible {
+                semanticCoordinator.scheduleSuggestionUpdate(for: editor, immediate: true)
+            }
             editor.focus()
         } catch { showError(error, in: window) }
     }
@@ -1253,6 +1329,8 @@ import CozyCore
             bannerHeightConstraint?.constant = showBanner ? 38 : 0
         }
         if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
+        let desiredConnectionsTint = editor.isSemanticConnectionsVisible ? Theme.accent : Theme.muted
+        if connectionsButton.tint != desiredConnectionsTint { connectionsButton.tint = desiredConnectionsTint }
         let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted
         if outlineButton.tint != desiredOutlineTint { outlineButton.tint = desiredOutlineTint }
         let hideNoteActions = noteURL == nil
@@ -1434,6 +1512,7 @@ import CozyCore
             }
             editor.invalidateNoteRecordsCache()
             searchPanel.refresh()
+            semanticCoordinator.noteDidDelete(url: url)
             return true
         } catch {
             showError(error, in: window)
@@ -1642,6 +1721,7 @@ import CozyCore
                     }
                     self.searchPanel.applyPinnedPaths(self.vault.pinnedRelativePaths())
                     self.searchPanel.refresh()
+                    self.semanticCoordinator.vaultDidRefresh()
                     self.editor.focus()
                 } catch { showError(error, in: self.window) }
             }
@@ -1662,6 +1742,7 @@ import CozyCore
             win.window?.orderOut(nil)
         }
         noteWindows.removeAll()
+        semanticCoordinator.shutdown()
         searchPanel.shutdown()
     }
 
@@ -1694,6 +1775,7 @@ import CozyCore
     private let sealDot = PaperSurface(cornerRadius: 3.5, color: Theme.sage, bordered: false)
     private let contextLabel = Theme.label("", size: 10.5, color: Theme.muted)
     let pinButton = QuietButton(symbol: "pin", target: nil, action: nil)
+    let connectionsButton = QuietButton(symbol: "point.3.connected.trianglepath.dotted", target: nil, action: nil)
     let outlineButton = QuietButton(symbol: "list.bullet.indent", target: nil, action: nil)
     let focusInWorkspaceButton = QuietButton(symbol: "sidebar.left", target: nil, action: nil)
     let revealButton = QuietButton(symbol: "doc.viewfinder", target: nil, action: nil)
@@ -1746,6 +1828,9 @@ import CozyCore
     var onQuickSwitcher: (() -> Void)?
     var onRequestDeleteNote: ((URL, NSWindow?) -> Void)?
     var onWillClose: ((NoteWindowController) -> Void)?
+    var onDidChangeEditorText: (() -> Void)?
+    var onDidOpenNote: (() -> Void)?
+    var onSemanticVisibilityDidChange: (() -> Void)?
 
     private static let headerDateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -1796,6 +1881,11 @@ import CozyCore
         pinButton.toolTip = "Pin note to top (⇧⌘P)"
         pinButton.setAccessibilityLabel("Pin note")
 
+        connectionsButton.target = self
+        connectionsButton.action = #selector(toggleSemanticConnections)
+        connectionsButton.toolTip = "Toggle Semantic Connections — #tags & EN↔ID notes (⌃⌘\\)"
+        connectionsButton.setAccessibilityLabel("Toggle Semantic Connections")
+
         outlineButton.target = self
         outlineButton.action = #selector(toggleOutline)
         outlineButton.toolTip = "Toggle Document Outline (⌥⌘\\)"
@@ -1828,7 +1918,7 @@ import CozyCore
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let editorHeader = Theme.stack([sealDot, contextLabel, spacer, conflictSaveButton, pinButton, outlineButton, focusInWorkspaceButton, revealButton, deleteButton], spacing: 6)
+        let editorHeader = Theme.stack([sealDot, contextLabel, spacer, conflictSaveButton, pinButton, connectionsButton, outlineButton, focusInWorkspaceButton, revealButton, deleteButton], spacing: 6)
 
         for view in [editorHeader, headerRule, reviewBanner, editor] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -1890,6 +1980,10 @@ import CozyCore
         editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
         editor.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
         editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
+        editor.onSemanticVisibilityChange = { [weak self] _ in
+            self?.updateEditorChrome()
+            self?.onSemanticVisibilityDidChange?()
+        }
     }
 
     var isCurrentNotePinned: Bool {
@@ -1924,6 +2018,11 @@ import CozyCore
         } else {
             cachedNotePinned = nil
         }
+        updateEditorChrome()
+    }
+
+    @objc func toggleSemanticConnections() {
+        editor.toggleSemanticConnections()
         updateEditorChrome()
     }
 
@@ -1977,6 +2076,7 @@ import CozyCore
             editor.linkedAttachments = initialLinkedAttachments ?? vault.linkedAttachments(inNSString: editor.nsText, relativeTo: url)
             editor.status.stringValue = ""
             updateEditorChrome()
+            onDidOpenNote?()
             editor.focus()
         } catch {
             showError(error, in: window)
@@ -2025,6 +2125,7 @@ import CozyCore
             noteDirty = editor.hasContent
         }
         updateEditorChrome()
+        onDidChangeEditorText?()
         guard noteDirty, !noteConflicted, !hasExternalDiskChange else { return }
         if editor.status.stringValue != "Editing…" {
             editor.status.stringValue = "Editing…"
@@ -2262,6 +2363,7 @@ import CozyCore
         editor.text = reloaded
         editor.linkedAttachments = vault.linkedAttachments(in: reloaded, relativeTo: activeURL)
         updateEditorChrome()
+        onDidOpenNote?()
     }
 
     func refreshTypography() {
@@ -2287,6 +2389,8 @@ import CozyCore
             bannerHeightConstraint?.constant = showBanner ? 38 : 0
         }
         if conflictSaveButton.isHidden == noteConflicted { conflictSaveButton.isHidden = !noteConflicted }
+        let desiredConnectionsTint = editor.isSemanticConnectionsVisible ? Theme.accent : Theme.muted
+        if connectionsButton.tint != desiredConnectionsTint { connectionsButton.tint = desiredConnectionsTint }
         let desiredOutlineTint = editor.isOutlineVisible ? Theme.accent : Theme.muted
         if outlineButton.tint != desiredOutlineTint { outlineButton.tint = desiredOutlineTint }
         let hideNoteActions = noteURL == nil
