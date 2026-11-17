@@ -104,9 +104,9 @@ private func makeFoldWindow(markdown: String) -> (window: NSWindow, editor: Capt
     return (window, editor)
 }
 
-/// Folds `## Target Audience`, then moves the caret to the H1. That selection change runs
-/// `refreshCursorDependentLines`, which takes the full `formatMarkdown()` path because the
-/// document contains a fence. The folded body must stay collapsed after that reformat.
+/// Folds `## Target Audience`, moves the caret to the H1 via `⌘↑` (exercising incremental
+/// `refreshCursorDependentLines`), and then moves onto a ` ```swift ` fence header so the full
+/// `formatMarkdown()` path runs too. The folded body must stay collapsed across both passes.
 @MainActor
 private func foldedLayoutFailures(markdown: String, label: String) -> [String] {
     var failures: [String] = []
@@ -130,7 +130,7 @@ private func foldedLayoutFailures(markdown: String, label: String) -> [String] {
         return ["\(label): fold was not created"]
     }
 
-    // Tab folded the heading; ⌘↑ must move the caret off it and run the full reformat.
+    // Tab folded the heading; ⌘↑ moves the caret off it, then selecting a fence header forces full formatMarkdown().
     if !window.makeFirstResponder(textView) {
         failures.append("\(label): could not focus the editor")
     }
@@ -144,6 +144,15 @@ private func foldedLayoutFailures(markdown: String, label: String) -> [String] {
         failures.append(
             "\(label): ⌘↑ did not leave the folded heading line (selection \(textView.selectedRange()))"
         )
+    }
+    let fenceRange = editor.nsText.range(of: "```swift")
+    if fenceRange.location == NSNotFound {
+        failures.append("\(label): missing fenced block in fixture")
+    } else {
+        textView.setSelectedRange(NSRange(location: fenceRange.location + 3, length: 0))
+        window.contentView?.layoutSubtreeIfNeeded()
+        lm.ensureLayout(for: tc)
+        window.displayIfNeeded()
     }
 
     if textView.foldedSections.count != 1 {

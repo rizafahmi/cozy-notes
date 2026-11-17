@@ -199,12 +199,14 @@ import CozyCore
         let needsFullWordCount: Bool
         let requiresFullFormat: Bool
         let mayHaveLink: Bool
+        let preSelectionLineLocation: Int
     }
     var pendingEdit: EditRecord?
     var isEditingText = false
     var cachedFullText: String = ""
     var cachedFullTextLength: Int = 0
     var cachedFullTextSig: Int = 0
+    var pasteboard: NSPasteboard = .general
     private var lastClipboardChangeCount: Int = -1
     private var lastClipboardString: String = ""
     private var lastClipboardLength: Int = -1
@@ -244,18 +246,130 @@ import CozyCore
     private var caretBlinkOn = true
     private var lastEditWasLarge = false
     private var minimumOverscrollHeight: CGFloat = 0
+    private var viewportPreservationDepth = 0
+    private var preservedViewportMinHeight: CGFloat = 0
+    private var isApplyingMarkedText = false
+    private var textChangeGeneration: UInt64 = 0
     private var windowFocusObservers: [NSObjectProtocol] = []
     var suppressCaretUpdates = false
+    var isPreservingViewport: Bool { viewportPreservationDepth > 0 }
+    private var shouldSuppressImplicitTextScroll: Bool {
+        viewportPreservationDepth > 0 || isEditingText || suppressCaretUpdates || isApplyingMarkedText
+    }
     override func setFrameSize(_ newSize: NSSize) {
         if newSize != frame.size { removeCaretTravelAnimations() }
-        if minimumOverscrollHeight > 0 {
+        if minimumOverscrollHeight > 0 && viewportPreservationDepth == 0 && !isApplyingMarkedText {
             let maxOverscroll = newSize.height + (enclosingScrollView?.contentView.bounds.height ?? 0) * 0.4
             if minimumOverscrollHeight > maxOverscroll {
                 minimumOverscrollHeight = maxOverscroll
             }
         }
-        let clampedHeight = max(newSize.height, minimumOverscrollHeight)
+        let clampedHeight = max(newSize.height, minimumOverscrollHeight, preservedViewportMinHeight)
         super.setFrameSize(NSSize(width: newSize.width, height: clampedHeight))
+    }
+
+    /// Runs an attribute-formatting or in-place storage pass without allowing TextKit 1's
+    /// non-contiguous layout height estimate to collapse the document view or scroll the clip view.
+    func preservingViewport<T>(_ body: () -> T) -> T {
+        guard let scrollView = enclosingScrollView,
+              let lm = layoutManager,
+              let tc = textContainer,
+              let storage = textStorage else {
+            return body()
+        }
+        if viewportPreservationDepth > 0 {
+            viewportPreservationDepth += 1
+            defer { viewportPreservationDepth -= 1 }
+            return body()
+        }
+
+        let clipView = scrollView.contentView
+        let savedOrigin = clipView.bounds.origin
+        let visHeight = clipView.bounds.height
+        var preVisibleChars: NSRange?
+        var anchorChar: Int?
+        var anchorViewportOffsetY: CGFloat?
+
+        if savedOrigin.y > 0, storage.length > 0 {
+            let preVisRect = clipView.documentVisibleRect.offsetBy(
+                dx: -textContainerOrigin.x,
+                dy: -textContainerOrigin.y
+            )
+            let glyphs = lm.glyphRange(forBoundingRectWithoutAdditionalLayout: preVisRect, in: tc)
+            if glyphs.length > 0 {
+                preVisibleChars = lm.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+                let firstGlyph = glyphs.location
+                anchorChar = lm.characterIndexForGlyph(at: firstGlyph)
+                let frag = lm.lineFragmentRect(forGlyphAt: firstGlyph, effectiveRange: nil)
+                if frag.height > 0 {
+                    anchorViewportOffsetY = (frag.minY + textContainerOrigin.y) - savedOrigin.y
+                }
+            }
+        }
+
+        viewportPreservationDepth = 1
+        preservedViewportMinHeight = (savedOrigin.y > 0 && storage.length > 0)
+            ? max(frame.height, savedOrigin.y + visHeight)
+            : 0
+        defer {
+            preservedViewportMinHeight = 0
+            viewportPreservationDepth = 0
+        }
+
+        let result = body()
+
+        let postLen = storage.length
+        if postLen == 0 {
+            preservedViewportMinHeight = 0
+            if savedOrigin.y > 0 {
+                clipView.setBoundsOrigin(NSPoint(x: savedOrigin.x, y: 0))
+                scrollView.reflectScrolledClipView(clipView)
+            }
+            return result
+        }
+
+        if savedOrigin.y > 0 {
+            let ns = storage.mutableString
+            var desiredY = savedOrigin.y
+            if postLen <= 100_000 {
+                let selEnd = min(postLen, NSMaxRange(selectedRange()))
+                let targetEnd = min(postLen, max(preVisibleChars.map(NSMaxRange) ?? 0, selEnd) + 512)
+                if targetEnd > 0 {
+                    let lineSpan = ns.lineRange(for: NSRange(location: 0, length: targetEnd))
+                    lm.ensureLayout(forCharacterRange: lineSpan)
+                }
+            } else if let preVisibleChars {
+                let start = min(max(0, preVisibleChars.location - 1024), postLen)
+                let end = min(postLen, max(start, NSMaxRange(preVisibleChars) + 2048))
+                if end > start {
+                    let lineSpan = ns.lineRange(for: NSRange(location: start, length: end - start))
+                    lm.ensureLayout(forCharacterRange: lineSpan)
+                }
+                if let anchorChar, anchorChar < postLen, let anchorViewportOffsetY, lm.numberOfGlyphs > 0 {
+                    let postGlyph = min(lm.glyphIndexForCharacter(at: anchorChar), lm.numberOfGlyphs - 1)
+                    let postFrag = lm.lineFragmentRect(forGlyphAt: postGlyph, effectiveRange: nil)
+                    if postFrag.height > 0 {
+                        desiredY = max(0, (postFrag.minY + textContainerOrigin.y) - anchorViewportOffsetY)
+                    }
+                }
+            }
+            preservedViewportMinHeight = 0
+            let postVisRect = NSRect(
+                x: savedOrigin.x - textContainerOrigin.x,
+                y: desiredY - textContainerOrigin.y,
+                width: clipView.bounds.width,
+                height: visHeight
+            )
+            lm.ensureLayout(forBoundingRect: postVisRect, in: tc)
+            _ = lm.usedRect(for: tc)
+            let maxOriginY = max(0, max(frame.height, minimumOverscrollHeight) - visHeight)
+            let clampedY = min(desiredY, maxOriginY)
+            if abs(clipView.bounds.origin.y - clampedY) > 0.01 || abs(clipView.bounds.origin.x - savedOrigin.x) > 0.01 {
+                clipView.setBoundsOrigin(NSPoint(x: savedOrigin.x, y: clampedY))
+                scrollView.reflectScrolledClipView(clipView)
+            }
+        }
+        return result
     }
 
     private(set) var lastInvalidatedRect: NSRect = .zero
@@ -1006,42 +1120,68 @@ import CozyCore
         return ok
     }
 
-    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
-        let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
-        guard ok, let ns = textStorage?.mutableString else { return ok }
+    func expandedLineWindow(for range: NSRange, in ns: NSString) -> NSRange {
+        let totalLen = ns.length
+        guard totalLen > 0 else { return NSRange(location: 0, length: 0) }
+        let clampedStart = min(max(0, range.location), totalLen)
+        let clampedEnd = min(totalLen, max(clampedStart, NSMaxRange(range)))
+        let firstLine = ns.lineRange(for: NSRange(location: clampedStart > 0 ? clampedStart - 1 : 0, length: 0))
+        let prevLineStart = firstLine.location > 0
+            ? ns.lineRange(for: NSRange(location: firstLine.location - 1, length: 0)).location
+            : 0
+        let endProbe = min(clampedEnd, totalLen - 1)
+        let lastLine = ns.lineRange(for: NSRange(location: endProbe, length: 0))
+        let nextLineEnd = NSMaxRange(lastLine) < totalLen
+            ? NSMaxRange(ns.lineRange(for: NSRange(location: NSMaxRange(lastLine), length: 0)))
+            : totalLen
+        return NSRange(location: prevLineStart, length: max(0, nextLineEnd - prevLineStart))
+    }
+
+    func rangeTouchesFenceOrTable(_ window: NSRange) -> Bool {
+        guard window.location != NSNotFound else { return false }
+        let wEnd = NSMaxRange(window)
+        return fencedBlocks.contains(where: { window.location <= NSMaxRange($0.fullRange) && $0.fullRange.location <= wEnd })
+            || tableBlocks.contains(where: { window.location <= NSMaxRange($0.fullRange) && $0.fullRange.location <= wEnd })
+    }
+
+    private func preparePendingEdit(in affectedCharRange: NSRange, replacementString: String?) {
+        guard let ns = textStorage?.mutableString else { return }
         isEditingText = true
         if !foldedSections.isEmpty {
             unfoldSectionsIntersecting(affectedCharRange)
         }
         let oldLen = ns.length
+        let safeLoc = min(max(0, affectedCharRange.location), oldLen)
+        let safeRange = NSRange(location: safeLoc, length: min(max(0, affectedCharRange.length), oldLen - safeLoc))
+        let preSelLoc = min(selectedRange().location, oldLen)
+        let preSelLineLoc = oldLen > 0 ? ns.lineRange(for: NSRange(location: preSelLoc, length: 0)).location : 0
         let repNS = (replacementString ?? "") as NSString
         let repLen = repNS.length
-        let delta = repLen - affectedCharRange.length
+        let delta = repLen - safeRange.length
         animatesNextCaretUpdate = isCaretTypingTransaction
-            && affectedCharRange.length <= 16 && repLen <= 64
+            && safeRange.length <= 16 && repLen <= 64
             && !editorUndoManager.isUndoing && !editorUndoManager.isRedoing
-        let isLargeEdit = affectedCharRange.length > 4096 || repLen > 4096
+        let isLargeEdit = safeRange.length > 4096 || repLen > 4096
         lastEditWasLarge = isLargeEdit
-        var requiresFullFormat = isLargeEdit || !fencedBlocks.isEmpty || !tableBlocks.isEmpty
-        if !requiresFullFormat {
-            if affectedCharRange.length > 0 {
-                let checkRange = ns.lineRange(for: affectedCharRange)
-                if ns.range(of: "```", options: .literal, range: checkRange).location != NSNotFound
-                    || ns.range(of: "|", options: .literal, range: checkRange).location != NSNotFound {
-                    requiresFullFormat = true
-                }
+        var requiresFullFormat = isLargeEdit
+        if !requiresFullFormat && oldLen > 0 {
+            let checkRange = expandedLineWindow(for: safeRange, in: ns)
+            if rangeTouchesFenceOrTable(checkRange)
+                || ns.range(of: "```", options: .literal, range: checkRange).location != NSNotFound
+                || ns.range(of: "|", options: .literal, range: checkRange).location != NSNotFound {
+                requiresFullFormat = true
             }
-            if !requiresFullFormat && repLen >= 1 {
-                if (repLen >= 3 && repNS.range(of: "```", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound)
-                    || repNS.range(of: "|", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound {
-                    requiresFullFormat = true
-                }
+        }
+        if !requiresFullFormat && repLen >= 1 {
+            if (repLen >= 3 && repNS.range(of: "```", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound)
+                || repNS.range(of: "|", options: .literal, range: NSRange(location: 0, length: repLen)).location != NSNotFound {
+                requiresFullFormat = true
             }
         }
         let mayHaveLink = repLen > 0 && (repNS.range(of: "](", options: .literal).location != NSNotFound || repNS.range(of: ")", options: .literal).location != NSNotFound)
         if isLargeEdit {
             pendingEdit = EditRecord(
-                affectedRange: affectedCharRange,
+                affectedRange: safeRange,
                 replacementLength: repLen,
                 delta: delta,
                 oldTotalLength: oldLen,
@@ -1050,14 +1190,15 @@ import CozyCore
                 oldWindowWords: 0,
                 needsFullWordCount: true,
                 requiresFullFormat: true,
-                mayHaveLink: false
+                mayHaveLink: false,
+                preSelectionLineLocation: preSelLineLoc
             )
         } else {
-            let wStart = max(0, affectedCharRange.location - 1)
-            let wEnd = min(oldLen, NSMaxRange(affectedCharRange) + 1)
+            let wStart = max(0, safeRange.location - 1)
+            let wEnd = min(oldLen, NSMaxRange(safeRange) + 1)
             let oldWords = CaptureEditor.countWords(in: ns, range: NSRange(location: wStart, length: max(0, wEnd - wStart)))
             pendingEdit = EditRecord(
-                affectedRange: affectedCharRange,
+                affectedRange: safeRange,
                 replacementLength: repLen,
                 delta: delta,
                 oldTotalLength: oldLen,
@@ -1066,9 +1207,16 @@ import CozyCore
                 oldWindowWords: oldWords,
                 needsFullWordCount: false,
                 requiresFullFormat: requiresFullFormat,
-                mayHaveLink: mayHaveLink
+                mayHaveLink: mayHaveLink,
+                preSelectionLineLocation: preSelLineLoc
             )
         }
+    }
+
+    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+        guard ok else { return ok }
+        preparePendingEdit(in: affectedCharRange, replacementString: replacementString)
         return ok
     }
 
@@ -1103,7 +1251,19 @@ import CozyCore
         } else {
             str = String(describing: string)
         }
-        let targetRange = replacementRange.location == NSNotFound ? selectedRange() : replacementRange
+        let hadMarked = hasMarkedText()
+        let currentMarked = hadMarked ? markedRange() : NSRange(location: NSNotFound, length: 0)
+        let targetRange: NSRange
+        if replacementRange.location != NSNotFound {
+            targetRange = replacementRange
+        } else if hadMarked, currentMarked.location != NSNotFound {
+            targetRange = currentMarked
+        } else {
+            targetRange = selectedRange()
+        }
+        if hadMarked {
+            unmarkText()
+        }
         let previous = isCaretTypingTransaction
         isCaretTypingTransaction = previous || (isHandlingTypingInput && selectedRange().length == 0
             && targetRange == selectedRange())
@@ -1428,7 +1588,7 @@ import CozyCore
         autoreleasepool {
             let sel = selectedRange()
             guard sel.length > 0, let ns = textStorage?.mutableString, NSMaxRange(sel) <= ns.length else { return }
-            let pb = NSPasteboard.general
+            let pb = self.pasteboard
             let sig = CaptureEditor.sampleSignature(of: ns, range: sel)
             if sel.length > 4096 && pb.changeCount == lastClipboardChangeCount && sel.length == lastClipboardLength && sig == lastClipboardSig {
                 return
@@ -1458,9 +1618,63 @@ import CozyCore
     }
 
     override func scrollRangeToVisible(_ range: NSRange) {
+        guard !shouldSuppressImplicitTextScroll else { return }
         autoreleasepool {
             super.scrollRangeToVisible(range)
         }
+    }
+
+    override func scroll(_ point: NSPoint) {
+        guard !shouldSuppressImplicitTextScroll else { return }
+        super.scroll(point)
+    }
+
+    override func scrollToVisible(_ rect: NSRect) -> Bool {
+        guard !shouldSuppressImplicitTextScroll else { return false }
+        return super.scrollToVisible(rect)
+    }
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        let str: String
+        if let s = string as? String {
+            str = s
+        } else if let attr = string as? NSAttributedString {
+            str = attr.string
+        } else {
+            str = String(describing: string)
+        }
+        let targetRange: NSRange
+        if replacementRange.location != NSNotFound {
+            targetRange = replacementRange
+        } else if hasMarkedText(), markedRange().location != NSNotFound {
+            targetRange = markedRange()
+        } else {
+            targetRange = self.selectedRange()
+        }
+        let preGen = textChangeGeneration
+        let prevApplying = isApplyingMarkedText
+        let prevMinHeight = preservedViewportMinHeight
+        isApplyingMarkedText = true
+        if let clipView = enclosingScrollView?.contentView, clipView.bounds.origin.y > 0 {
+            let floorH = max(frame.height, clipView.bounds.origin.y + clipView.bounds.height)
+            if floorH > preservedViewportMinHeight {
+                preservedViewportMinHeight = floorH
+            }
+        }
+        preparePendingEdit(in: targetRange, replacementString: str)
+        defer {
+            isApplyingMarkedText = prevApplying
+            if viewportPreservationDepth == 0 {
+                preservedViewportMinHeight = prevMinHeight
+            }
+            if textChangeGeneration == preGen {
+                pendingEdit = nil
+                isEditingText = false
+                lastEditWasLarge = false
+                animatesNextCaretUpdate = false
+            }
+        }
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
     }
 
     override func selectAll(_ sender: Any?) {
@@ -2444,11 +2658,17 @@ import CozyCore
                     scrollView.reflectScrolledClipView(clipView)
                 }
             }
-            lm.ensureLayout(forBoundingRect: clipView.bounds, in: tc)
+            let visInContainer = clipView.documentVisibleRect.offsetBy(
+                dx: -textContainerOrigin.x,
+                dy: -textContainerOrigin.y
+            )
+            lm.ensureLayout(forBoundingRect: visInContainer, in: tc)
         } else {
             lm.ensureLayout(for: tc)
         }
-        minimumOverscrollHeight = 0
+        if scrollCaretIntoView {
+            minimumOverscrollHeight = 0
+        }
         updateCaret()
         setNeedsDisplay(bounds, avoidAdditionalLayout: true)
     }
@@ -2634,7 +2854,7 @@ import CozyCore
                 )
                 return
             }
-            let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let clip = self.pasteboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let urlStr = (clip.hasPrefix("http://") || clip.hasPrefix("https://")) ? clip : "https://"
             let urlLen = (urlStr as NSString).length
             let replacement = "[\(selected)](\(urlStr))"
@@ -3059,43 +3279,69 @@ import CozyCore
                 }
             }
 
-            let clipView = enclosingScrollView?.contentView
-            let savedOriginY = clipView?.bounds.origin.y
+            let performReplacement = {
+                let clipView = self.enclosingScrollView?.contentView
+                let savedOriginY = clipView?.bounds.origin.y
+                let savedVisHeight = clipView?.bounds.height ?? 0
+                let savedMinHeight = (savedOriginY ?? 0) > 0
+                    ? max(self.frame.height, (savedOriginY ?? 0) + savedVisHeight)
+                    : 0
 
-            let wasEmpty = storage.length == 0
-            editorUndoManager.disableUndoRegistration()
-            storage.beginEditing()
-            storage.replaceCharacters(in: safeRange, with: replacement)
-            if wasEmpty && repLen > 0 && !typingAttributes.isEmpty {
-                storage.setAttributes(typingAttributes, range: NSRange(location: 0, length: repLen))
-            }
-            storage.endEditing()
-            editorUndoManager.enableUndoRegistration()
+                let wasEmpty = storage.length == 0
+                self.editorUndoManager.disableUndoRegistration()
+                self.viewportPreservationDepth += 1
+                if savedMinHeight > self.preservedViewportMinHeight {
+                    self.preservedViewportMinHeight = savedMinHeight
+                }
+                storage.beginEditing()
+                storage.replaceCharacters(in: safeRange, with: replacement)
+                if wasEmpty && repLen > 0 && !self.typingAttributes.isEmpty {
+                    storage.setAttributes(self.typingAttributes, range: NSRange(location: 0, length: repLen))
+                }
+                storage.endEditing()
+                self.viewportPreservationDepth -= 1
+                if self.viewportPreservationDepth == 0 {
+                    self.preservedViewportMinHeight = 0
+                }
+                self.editorUndoManager.enableUndoRegistration()
 
-            if let clipView, let savedOriginY, abs(clipView.bounds.origin.y - savedOriginY) > 0.01 {
-                clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: savedOriginY))
-            }
-
-            setSelectedRange(nextSelection)
-            let prevSuppress = suppressCaretUpdates
-            if preserveViewport {
-                suppressCaretUpdates = true
-            }
-            didChangeText()
-            if preserveViewport {
-                suppressCaretUpdates = prevSuppress
                 if let clipView, let savedOriginY, abs(clipView.bounds.origin.y - savedOriginY) > 0.01 {
                     clipView.setBoundsOrigin(NSPoint(x: clipView.bounds.origin.x, y: savedOriginY))
-                    enclosingScrollView?.reflectScrolledClipView(clipView)
                 }
+
+                self.setSelectedRange(nextSelection)
+                let prevSuppress = self.suppressCaretUpdates
+                if preserveViewport {
+                    self.suppressCaretUpdates = true
+                }
+                self.didChangeText()
+                if preserveViewport {
+                    self.suppressCaretUpdates = prevSuppress
+                }
+            }
+
+            if preserveViewport {
+                preservingViewport(performReplacement)
                 updateCaret(animateForTyping: false)
+            } else {
+                performReplacement()
             }
         }
     }
 
+    private func currentSelectedLineRange() -> NSRange {
+        guard let ns = textStorage?.mutableString, ns.length > 0 else {
+            return NSRange(location: 0, length: 0)
+        }
+        let loc = min(selectedRange().location, ns.length)
+        return ns.lineRange(for: NSRange(location: loc, length: 0))
+    }
+
     override func didChangeText() {
+        textChangeGeneration &+= 1
         let wasLarge = lastEditWasLarge
         let editLocation = pendingEdit?.affectedRange.location
+        let preSelLineLocation = pendingEdit?.preSelectionLineLocation
         let animateCaret = animatesNextCaretUpdate
         animatesNextCaretUpdate = false
         lastEditWasLarge = false
@@ -3107,16 +3353,26 @@ import CozyCore
             caretLayer.isHidden = true
             hasCaretOrigin = false
         } else {
+            if isApplyingMarkedText && viewportPreservationDepth == 0 {
+                preservedViewportMinHeight = 0
+            }
             updateCaret(animateForTyping: animateCaret)
             if !wasLarge && !suppressCaretUpdates {
                 // Same-line edits must not recenter a caret already visible near a viewport edge.
                 let useTypewriterStep: Bool
-                if let editLocation, let ns = textStorage?.mutableString {
-                    let editLine = ns.lineRange(for: NSRange(location: min(editLocation, ns.length), length: 0))
+                if let ns = textStorage?.mutableString {
                     let caretLine = ns.lineRange(for: NSRange(location: min(selectedRange().location, ns.length), length: 0))
-                    useTypewriterStep = editLine.location != caretLine.location
+                    if let editLocation {
+                        let editLine = ns.lineRange(for: NSRange(location: min(editLocation, ns.length), length: 0))
+                        useTypewriterStep = editLine.location != caretLine.location
+                            || (preSelLineLocation != nil && preSelLineLocation != caretLine.location)
+                    } else if let preSelLineLocation {
+                        useTypewriterStep = preSelLineLocation != caretLine.location
+                    } else {
+                        useTypewriterStep = false
+                    }
                 } else {
-                    useTypewriterStep = true
+                    useTypewriterStep = false
                 }
                 ensureCaretVisible(useTypewriterStep: useTypewriterStep)
             }
@@ -3133,6 +3389,8 @@ import CozyCore
         if let handler = onWikiAutocompleteCommand, handler(selector) {
             return
         }
+        let preGen = textChangeGeneration
+        let preLine = currentSelectedLineRange()
         let previous = isCaretTypingTransaction
         isCaretTypingTransaction = isHandlingTypingInput && selectedRange().length == 0
             && (selector == #selector(NSResponder.insertNewline(_:))
@@ -3142,6 +3400,7 @@ import CozyCore
         super.doCommand(by: selector)
         guard !suppressCaretUpdates && !isEditingText,
               window?.firstResponder === self else { return }
+        var didAdjustForFold = false
         if !foldedSections.isEmpty, selectedRange().length == 0 {
             let loc = selectedRange().location
             if let fold = foldedSections.first(where: { NSLocationInRange(loc, $0.foldedCharRange) }) {
@@ -3154,10 +3413,12 @@ import CozyCore
                     ? NSMaxRange(fold.headingRange)
                     : min(textStorage?.length ?? 0, NSMaxRange(fold.foldedCharRange))
                 setSelectedRange(NSRange(location: targetLoc, length: 0))
+                didAdjustForFold = true
             }
         }
-        if selectedRange().length == 0 {
-            ensureCaretVisible(useTypewriterStep: true)
+        if selectedRange().length == 0, (textChangeGeneration == preGen || didAdjustForFold) {
+            let postLine = currentSelectedLineRange()
+            ensureCaretVisible(useTypewriterStep: didAdjustForFold || preLine != postLine)
         }
     }
 
@@ -3692,7 +3953,7 @@ import CozyCore
     }
     override func paste(_ sender: Any?) {
         autoreleasepool {
-            let pb = NSPasteboard.general
+            let pb = self.pasteboard
             if pb.types?.contains(.fileURL) == true,
                let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
                 onFiles?(urls, CaptureEditor.isPointerAction)
@@ -4681,7 +4942,9 @@ import CozyCore
     var onOpenWikiLinkInNewWindow: ((WikiLink) -> Void)?
     var onClickTag: ((String) -> Void)?
     var urlOpener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
-    var pasteboard: NSPasteboard = .general
+    var pasteboard: NSPasteboard = .general {
+        didSet { textView.pasteboard = pasteboard }
+    }
     var onOpenCurrentNoteInNewWindow: (() -> Void)?
     var onTogglePinCurrentNote: (() -> Void)?
     var onQuickSwitcher: (() -> Void)?
@@ -5193,9 +5456,25 @@ import CozyCore
             textView.pendingEdit = nil
             let didTouchAttributes: Bool
             if let edit {
+                lastScanResult = nil
                 textView.shiftExternalChangeRanges(for: edit.affectedRange, delta: edit.delta)
             }
-            if let edit, !edit.requiresFullFormat {
+            var shouldFullFormat = edit?.requiresFullFormat ?? true
+            if !shouldFullFormat, let edit, let storage = textView.textStorage {
+                let ns = storage.mutableString as NSString
+                let startLoc = min(edit.affectedRange.location, ns.length)
+                let insertedRange = NSRange(
+                    location: startLoc,
+                    length: min(edit.replacementLength, max(0, ns.length - startLoc))
+                )
+                let postWindow = textView.expandedLineWindow(for: insertedRange, in: ns)
+                if postWindow.length > 0,
+                   ns.range(of: "```", options: .literal, range: postWindow).location != NSNotFound
+                    || ns.range(of: "|", options: .literal, range: postWindow).location != NSNotFound {
+                    shouldFullFormat = true
+                }
+            }
+            if let edit, !shouldFullFormat {
                 didTouchAttributes = formatIncrementalEdit(edit)
             } else {
                 if let edit, edit.delta != 0 {
@@ -5203,6 +5482,17 @@ import CozyCore
                 }
                 formatMarkdown()
                 didTouchAttributes = true
+            }
+            if didTouchAttributes, textView.hasMarkedText(), let storage = textView.textStorage {
+                let mRange = textView.markedRange()
+                if mRange.location != NSNotFound, mRange.length > 0, NSMaxRange(mRange) <= storage.length {
+                    let attrs = textView.markedTextAttributes ?? [.underlineStyle: NSUnderlineStyle.single.rawValue]
+                    textView.preservingViewport {
+                        textView.undoManager?.disableUndoRegistration()
+                        storage.addAttributes(attrs, range: mRange)
+                        textView.undoManager?.enableUndoRegistration()
+                    }
+                }
             }
             if let edit, !edit.needsFullWordCount, let storage = textView.textStorage {
                 let ns = storage.mutableString as NSString
@@ -6729,39 +7019,45 @@ import CozyCore
         let oldNeeds = lineHasCursorSensitiveSyntax(ns, lineRange: oldLine)
         let newNeeds = lineHasCursorSensitiveSyntax(ns, lineRange: newLine)
         guard oldNeeds || newNeeds else { return }
-        if !textView.fencedBlocks.isEmpty || !textView.tableBlocks.isEmpty {
+        let touchesBlock = (oldNeeds && textView.rangeTouchesFenceOrTable(oldLine))
+            || (newNeeds && textView.rangeTouchesFenceOrTable(newLine))
+        if touchesBlock {
             formatMarkdown()
             textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             return
         }
         isFormatting = true
         defer { isFormatting = false }
-        let cursor = textView.selectedRange()
-        storage.beginEditing()
-        if oldNeeds, NSMaxRange(oldLine) <= ns.length {
-            var q: [NSRange] = []
-            var hr: [NSRange] = []
-            var h: [MarkdownTextView.HeadingGutter] = []
-            var c: [NSRange] = []
-            var w: [WikiLink] = []
-            var t: [NoteTag] = []
-            var m: [MarkdownTextView.MarkdownLink] = []
-            var b: [MarkdownTextView.BulletItem] = []
-            formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
+        textView.preservingViewport {
+            let cursor = textView.selectedRange()
+            textView.undoManager?.disableUndoRegistration()
+            storage.beginEditing()
+            if oldNeeds, NSMaxRange(oldLine) <= ns.length {
+                var q: [NSRange] = []
+                var hr: [NSRange] = []
+                var h: [MarkdownTextView.HeadingGutter] = []
+                var c: [NSRange] = []
+                var w: [WikiLink] = []
+                var t: [NoteTag] = []
+                var m: [MarkdownTextView.MarkdownLink] = []
+                var b: [MarkdownTextView.BulletItem] = []
+                formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
+            }
+            if newNeeds, newLine != oldLine, NSMaxRange(newLine) <= ns.length {
+                var q: [NSRange] = []
+                var hr: [NSRange] = []
+                var h: [MarkdownTextView.HeadingGutter] = []
+                var c: [NSRange] = []
+                var w: [WikiLink] = []
+                var t: [NoteTag] = []
+                var m: [MarkdownTextView.MarkdownLink] = []
+                var b: [MarkdownTextView.BulletItem] = []
+                formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
+            }
+            storage.endEditing()
+            textView.undoManager?.enableUndoRegistration()
+            applyEditorChromeAttributes()
         }
-        if newNeeds, newLine != oldLine, NSMaxRange(newLine) <= ns.length {
-            var q: [NSRange] = []
-            var hr: [NSRange] = []
-            var h: [MarkdownTextView.HeadingGutter] = []
-            var c: [NSRange] = []
-            var w: [WikiLink] = []
-            var t: [NoteTag] = []
-            var m: [MarkdownTextView.MarkdownLink] = []
-            var b: [MarkdownTextView.BulletItem] = []
-            formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
-        }
-        storage.endEditing()
-        applyEditorChromeAttributes()
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
@@ -6870,6 +7166,12 @@ import CozyCore
                         kind: item.kind
                     )
                 }
+                for i in textView.fencedBlocks.indices where textView.fencedBlocks[i].fullRange.location >= shiftStart {
+                    textView.fencedBlocks[i] = Self.shiftFencedBlock(textView.fencedBlocks[i], by: delta)
+                }
+                for i in textView.tableBlocks.indices where textView.tableBlocks[i].fullRange.location >= shiftStart {
+                    textView.tableBlocks[i] = Self.shiftTableBlock(textView.tableBlocks[i], by: delta)
+                }
                 textView.shiftFoldedSections(from: shiftStart, by: delta)
             }
             lastCursorLine = ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, newLen), length: 0))
@@ -6886,11 +7188,13 @@ import CozyCore
         var newBullets: [MarkdownTextView.BulletItem] = []
         let cursor = textView.selectedRange()
 
-        textView.undoManager?.disableUndoRegistration()
-        storage.beginEditing()
-        formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, horizontalRules: &newHorizontalRules, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, tags: &newTags, markdownLinks: &newMarkdownLinks, bullets: &newBullets)
-        storage.endEditing()
-        textView.undoManager?.enableUndoRegistration()
+        textView.preservingViewport {
+            textView.undoManager?.disableUndoRegistration()
+            storage.beginEditing()
+            formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, horizontalRules: &newHorizontalRules, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, tags: &newTags, markdownLinks: &newMarkdownLinks, bullets: &newBullets)
+            storage.endEditing()
+            textView.undoManager?.enableUndoRegistration()
+        }
 
         let oldEnd = NSMaxRange(oldLineRange)
         var updatedHeadings: [MarkdownTextView.HeadingGutter] = []
@@ -7032,12 +7336,48 @@ import CozyCore
         if !insertedBullets { updatedBullets.append(contentsOf: newBullets) }
         textView.bulletItems = updatedBullets
         if delta != 0 {
+            for i in textView.fencedBlocks.indices where textView.fencedBlocks[i].fullRange.location >= oldEnd {
+                textView.fencedBlocks[i] = Self.shiftFencedBlock(textView.fencedBlocks[i], by: delta)
+            }
+            for i in textView.tableBlocks.indices where textView.tableBlocks[i].fullRange.location >= oldEnd {
+                textView.tableBlocks[i] = Self.shiftTableBlock(textView.tableBlocks[i], by: delta)
+            }
             textView.shiftFoldedSections(from: oldEnd, by: delta)
         }
         applyEditorChromeAttributes()
 
         lastCursorLine = ns.lineRange(for: NSRange(location: min(cursor.location, newLen), length: 0))
         return true
+    }
+
+    private static func shiftRange(_ range: NSRange, by delta: Int) -> NSRange {
+        guard range.location != NSNotFound else { return range }
+        return NSRange(location: max(0, range.location + delta), length: range.length)
+    }
+
+    private static func shiftFencedBlock(_ block: MarkdownTextView.FencedBlock, by delta: Int) -> MarkdownTextView.FencedBlock {
+        MarkdownTextView.FencedBlock(
+            fullRange: shiftRange(block.fullRange, by: delta),
+            headerRange: shiftRange(block.headerRange, by: delta),
+            bodyRange: shiftRange(block.bodyRange, by: delta)
+        )
+    }
+
+    private static func shiftTableBlock(_ table: MarkdownTextView.TableBlock, by delta: Int) -> MarkdownTextView.TableBlock {
+        MarkdownTextView.TableBlock(
+            fullRange: shiftRange(table.fullRange, by: delta),
+            headerRange: shiftRange(table.headerRange, by: delta),
+            delimiterRange: shiftRange(table.delimiterRange, by: delta),
+            rows: table.rows.map { row in
+                MarkdownTextView.TableRowItem(
+                    lineRange: shiftRange(row.lineRange, by: delta),
+                    fullLineRange: shiftRange(row.fullLineRange, by: delta),
+                    isHeader: row.isHeader,
+                    isDelimiter: row.isDelimiter
+                )
+            },
+            columnDividerOffsets: table.columnDividerOffsets
+        )
     }
 
     private func applyEditorChromeAttributes() {
@@ -7066,14 +7406,16 @@ import CozyCore
         guard !isFormatting, let storage = textView.textStorage else { return }
         isFormatting = true
         defer { isFormatting = false }
-        let cursor = textView.selectedRange()
-        textView.undoManager?.disableUndoRegistration()
-        storage.beginEditing()
-        applyFullMarkdownAttributes(to: storage, cursor: cursor, scanHint: nil)
-        storage.endEditing()
-        textView.undoManager?.enableUndoRegistration()
-        applyEditorChromeAttributes()
-        textView.refreshFoldLayoutAfterFullFormat()
+        textView.preservingViewport {
+            let cursor = textView.selectedRange()
+            textView.undoManager?.disableUndoRegistration()
+            storage.beginEditing()
+            applyFullMarkdownAttributes(to: storage, cursor: cursor, scanHint: nil)
+            storage.endEditing()
+            textView.undoManager?.enableUndoRegistration()
+            applyEditorChromeAttributes()
+            textView.refreshFoldLayoutAfterFullFormat()
+        }
     }
 
     private func applyFullMarkdownAttributes(to storage: NSTextStorage, cursor: NSRange, scanHint: DocumentScanResult?) {
