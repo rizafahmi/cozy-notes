@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 import ImageIO
 import QuartzCore
 import CozyCore
+import CozySearch
 
 @MainActor private final class CozyUndoManager: UndoManager {
     var onWillUndoOrRedo: (() -> Void)?
@@ -102,6 +103,7 @@ import CozyCore
     var onFindNextInNote: (() -> Void)?
     var onFindPreviousInNote: (() -> Void)?
     var onToggleOutline: (() -> Void)?
+    var onToggleSemanticConnections: (() -> Void)?
     var placeholder = "Begin a note, paste a clipping, or drop a file…" { didSet { needsDisplay = true } }
     struct MarkdownLink: Equatable {
         let fullRange: NSRange
@@ -1545,6 +1547,9 @@ import CozyCore
                 return true
             case "]":
                 unfoldAllHeadings(self)
+                return true
+            case "\\":
+                onToggleSemanticConnections?()
                 return true
             default:
                 break
@@ -4949,6 +4954,7 @@ import CozyCore
     var onTogglePinCurrentNote: (() -> Void)?
     var onQuickSwitcher: (() -> Void)?
     var onOutlineVisibilityChange: ((Bool) -> Void)?
+    var onSemanticVisibilityChange: ((Bool) -> Void)?
     var noteRecordsProvider: (() -> [NoteRecord])?
     var currentNoteURLProvider: (() -> URL?)?
     var compactLayout = false { didSet { needsLayout = true } }
@@ -4971,12 +4977,16 @@ import CozyCore
     private var attachmentButton: QuietButton?
     private let chips = NSStackView()
     private let attachmentScroll = NSScrollView()
+    let semanticView = SemanticConnectionsView(frame: .zero)
     private let footerRule = HairlineView()
     private let footer = NSStackView()
     private var attachmentLeading: NSLayoutConstraint?
     private var attachmentTrailing: NSLayoutConstraint?
     private var attachmentHeight: NSLayoutConstraint?
     private var attachmentBottom: NSLayoutConstraint?
+    private var semanticHeight: NSLayoutConstraint?
+    private var semanticBottom: NSLayoutConstraint?
+    private(set) var isSemanticConnectionsVisible = false
     private var footerLeading: NSLayoutConstraint?
     private var footerTrailing: NSLayoutConstraint?
     private var previews: [URL: NSImage] = [:]
@@ -5101,6 +5111,7 @@ import CozyCore
         textView.onFindNextInNote = { [weak self] in self?.findNextInNote() }
         textView.onFindPreviousInNote = { [weak self] in self?.findPreviousInNote() }
         textView.onToggleOutline = { [weak self] in self?.toggleOutline() }
+        textView.onToggleSemanticConnections = { [weak self] in self?.toggleSemanticConnections() }
         inNoteFindBar.isHidden = true
         inNoteFindBar.onQueryChange = { [weak self] _ in
             self?.vimSearchWholeWord = false
@@ -5146,6 +5157,11 @@ import CozyCore
         linkActionBar.onCursorExit = { [weak self] event in
             self?.syncCursor(atWindowPoint: event.locationInWindow, modifierFlags: event.modifierFlags)
         }
+        semanticView.isHidden = true
+        semanticView.wantsLayer = true
+        semanticView.onPreferredHeightChange = { [weak self] in
+            self?.syncSemanticStripHeight()
+        }
         scroll.verticalScroller = CozyScroller()
         scroll.documentView = textView
         scroll.scrollerStyle = .overlay
@@ -5188,7 +5204,7 @@ import CozyCore
         footer.spacing = 10
         for item in [add, status, spacer, vimPendingLabel, vimModePill, wordCount] { footer.addArrangedSubview(item) }
 
-        for view in [scroll, outlineDivider, outlineView, attachmentScroll, footerRule, footer, inNoteFindBar] {
+        for view in [scroll, outlineDivider, outlineView, attachmentScroll, semanticView, footerRule, footer, inNoteFindBar] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
@@ -5199,13 +5215,17 @@ import CozyCore
         let footLead = footer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 36)
         let footTrail = footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -36)
         let attachHeight = attachmentScroll.heightAnchor.constraint(equalToConstant: 0)
-        let attachBottom = attachmentScroll.bottomAnchor.constraint(equalTo: footerRule.topAnchor, constant: 0)
+        let attachBottom = attachmentScroll.bottomAnchor.constraint(equalTo: semanticView.topAnchor, constant: 0)
+        let semHeight = semanticView.heightAnchor.constraint(equalToConstant: 0)
+        let semBottom = semanticView.bottomAnchor.constraint(equalTo: footerRule.topAnchor, constant: 0)
         let scrollTrailEditor = scroll.trailingAnchor.constraint(equalTo: trailingAnchor)
         let scrollTrailOutline = scroll.trailingAnchor.constraint(equalTo: outlineDivider.leadingAnchor)
         attachmentLeading = attachLead
         attachmentTrailing = attachTrail
         attachmentHeight = attachHeight
         attachmentBottom = attachBottom
+        semanticHeight = semHeight
+        semanticBottom = semBottom
         footerLeading = footLead
         footerTrailing = footTrail
         scrollTrailingToEditorConstraint = scrollTrailEditor
@@ -5217,17 +5237,21 @@ import CozyCore
             scroll.topAnchor.constraint(equalTo: topAnchor),
             scroll.bottomAnchor.constraint(equalTo: attachmentScroll.topAnchor, constant: -4),
             outlineDivider.topAnchor.constraint(equalTo: topAnchor),
-            outlineDivider.bottomAnchor.constraint(equalTo: footerRule.topAnchor),
+            outlineDivider.bottomAnchor.constraint(equalTo: semanticView.topAnchor),
             outlineDivider.widthAnchor.constraint(equalToConstant: 1),
             outlineDivider.trailingAnchor.constraint(equalTo: outlineView.leadingAnchor),
             outlineView.topAnchor.constraint(equalTo: topAnchor),
-            outlineView.bottomAnchor.constraint(equalTo: footerRule.topAnchor),
+            outlineView.bottomAnchor.constraint(equalTo: semanticView.topAnchor),
             outlineView.trailingAnchor.constraint(equalTo: trailingAnchor),
             outlineView.widthAnchor.constraint(equalToConstant: DocumentOutlineView.railWidth),
             attachLead,
             attachTrail,
             attachHeight,
             attachBottom,
+            semanticView.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
+            semanticView.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            semHeight,
+            semBottom,
             footerRule.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
             footerRule.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
             footerRule.heightAnchor.constraint(equalToConstant: 1),
@@ -5807,6 +5831,7 @@ import CozyCore
     func refreshTypography() {
         formatMarkdown()
         vimModePill.needsDisplay = true
+        semanticView.refreshTypography()
         textView.refreshCaretAppearance()
         textView.updateCaret()
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
@@ -5970,6 +5995,150 @@ import CozyCore
         needsLayout = true
         layoutSubtreeIfNeeded()
         onOutlineVisibilityChange?(visible)
+    }
+
+    @objc func toggleSemanticConnections() {
+        setSemanticConnectionsVisible(!isSemanticConnectionsVisible)
+    }
+
+    func setSemanticConnectionsVisible(_ visible: Bool) {
+        guard isSemanticConnectionsVisible != visible else { return }
+        isSemanticConnectionsVisible = visible
+        preserveReadingPosition {
+            semanticView.isHidden = !visible
+            semanticHeight?.constant = visible ? semanticView.preferredHeight : 0
+            semanticBottom?.constant = visible ? -8 : 0
+            needsLayout = true
+            layoutSubtreeIfNeeded()
+        }
+        if visible, window?.isVisible == true, let layer = semanticView.layer {
+            Theme.fade(layer, to: 1, duration: 0.15, from: 0)
+        } else {
+            semanticView.layer?.removeAnimation(forKey: "feedback.opacity")
+        }
+        onSemanticVisibilityChange?(visible)
+    }
+
+    private func syncSemanticStripHeight() {
+        guard isSemanticConnectionsVisible else { return }
+        let desired = semanticView.preferredHeight
+        guard semanticHeight?.constant != desired else { return }
+        preserveReadingPosition {
+            semanticHeight?.constant = desired
+            needsLayout = true
+            layoutSubtreeIfNeeded()
+        }
+    }
+
+    @discardableResult
+    func insertSuggestedTag(_ rawTag: String) -> Bool {
+        guard textView.isEditable else { return false }
+        let clean = rawTag.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard SemanticIndex.isValidCozyTagName(clean) else { return false }
+
+        let ns = nsText
+        let existingTags = Vault.tags(inNSString: ns)
+        if existingTags.contains(where: { $0.name.lowercased() == clean }) {
+            return false
+        }
+
+        let prevSel = textView.selectedRange()
+        if let lastTag = existingTags.last {
+            let insertLoc = NSMaxRange(lastTag.fullRange)
+            let insertion = " #\(clean)"
+            let insLen = (insertion as NSString).length
+            let nextSel: NSRange
+            if prevSel.location >= insertLoc {
+                nextSel = NSRange(location: prevSel.location + insLen, length: prevSel.length)
+            } else {
+                nextSel = prevSel
+            }
+            textView.applyUndoableReplacement(
+                in: NSRange(location: insertLoc, length: 0),
+                with: insertion,
+                selectedRangeAfter: nextSel,
+                preserveViewport: true
+            )
+            return true
+        }
+
+        if ns.length == 0 {
+            let insertion = "#\(clean) "
+            textView.applyUndoableReplacement(
+                in: NSRange(location: 0, length: 0),
+                with: insertion,
+                preserveViewport: true
+            )
+            return true
+        }
+
+        let insertion: String
+        if ns.length >= 2 && ns.character(at: ns.length - 1) == 0x0A && ns.character(at: ns.length - 2) == 0x0A {
+            insertion = "#\(clean)"
+        } else if ns.character(at: ns.length - 1) == 0x0A {
+            insertion = "\n#\(clean)"
+        } else {
+            insertion = "\n\n#\(clean)"
+        }
+        textView.applyUndoableReplacement(
+            in: NSRange(location: ns.length, length: 0),
+            with: insertion,
+            selectedRangeAfter: prevSel,
+            preserveViewport: true
+        )
+        return true
+    }
+
+    @discardableResult
+    func insertWikiLinkToRelatedNote(_ wikiTarget: String) -> Bool {
+        guard textView.isEditable else { return false }
+        let cleaned = wikiTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return false }
+
+        let ns = nsText
+        let existingLinks = Vault.wikiLinks(inNSString: ns)
+        if existingLinks.contains(where: { $0.target.caseInsensitiveCompare(cleaned) == .orderedSame }) {
+            return false
+        }
+
+        let token = "[[\(cleaned)]]"
+        if ns.length == 0 {
+            textView.applyUndoableReplacement(
+                in: NSRange(location: 0, length: 0),
+                with: token,
+                preserveViewport: true
+            )
+            return true
+        }
+
+        let sel = textView.selectedRange()
+        if sel.length == 0 && sel.location > 0 && sel.location < ns.length {
+            let prevCh = ns.character(at: sel.location - 1)
+            let needsLeadingSpace = (prevCh != 0x20 && prevCh != 0x09 && prevCh != 0x0A && prevCh != 0x0D)
+            let insertion = (needsLeadingSpace ? " " : "") + token
+            textView.applyUndoableReplacement(
+                in: sel,
+                with: insertion,
+                preserveViewport: true
+            )
+            return true
+        }
+
+        let insertion: String
+        if ns.length >= 2 && ns.character(at: ns.length - 1) == 0x0A && ns.character(at: ns.length - 2) == 0x0A {
+            insertion = token
+        } else if ns.character(at: ns.length - 1) == 0x0A {
+            insertion = "\n\(token)"
+        } else {
+            insertion = "\n\n\(token)"
+        }
+        textView.applyUndoableReplacement(
+            in: NSRange(location: ns.length, length: 0),
+            with: insertion,
+            selectedRangeAfter: sel,
+            preserveViewport: true
+        )
+        return true
     }
 
     func refreshOutline() {
