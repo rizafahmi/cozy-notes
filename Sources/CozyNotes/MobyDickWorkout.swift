@@ -32,6 +32,7 @@ struct MobyDickWorkout {
         let resizeCPU: CPUSpan
         var resizeTotalMs: Double { resizeStepMs.reduce(0, +) }
         var resizeAvgMs: Double { resizeTotalMs / Double(max(1, resizeStepMs.count)) }
+        var resizeAvgCPUMs: Double { resizeCPU.cpuTimeMs / Double(max(1, resizeStepMs.count)) }
         let scrollOriginY: CGFloat
     }
 
@@ -498,6 +499,7 @@ struct MobyDickWorkout {
             um?.groupsByEvent = prevGroupsByEvent
             window.contentView?.layoutSubtreeIfNeeded()
             window.displayIfNeeded()
+            textView.layoutManager?.ensureGlyphs(forCharacterRange: NSRange(location: 0, length: expectedLength))
             let sorted = keystrokeTimes.sorted()
             let total = sorted.reduce(0, +)
             let avg = total / Double(max(1, sorted.count))

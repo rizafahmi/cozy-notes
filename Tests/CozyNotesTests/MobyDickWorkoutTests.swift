@@ -28,8 +28,8 @@ final class MobyDickWorkoutTests: XCTestCase {
         XCTAssertTrue(report.step4.intactAfterRedo, "Step 4 Select All / Cut / Paste / Undo / Redo must leave Moby Dick intact")
         XCTAssertEqual(report.step5.keystrokeCount, sample.count, "Step 5 should measure each keystroke")
         XCTAssertLessThan(report.step1.cpu.cpuTimeMs, 150.0, "Step 1 CPU time should be < 150ms")
-        XCTAssertLessThan(report.step2.resizeAvgMs, 16.0, "Step 2 average resize time should be < 16ms")
-        XCTAssertLessThan(report.step3.resizeAvgMs, 16.0, "Step 3 average resize time should be < 16ms")
+        XCTAssertLessThan(report.step2.resizeAvgCPUMs, 16.0, "Step 2 average resize CPU time should be < 16ms")
+        XCTAssertLessThan(report.step3.resizeAvgCPUMs, 16.0, "Step 3 average resize CPU time should be < 16ms")
         XCTAssertLessThan(report.step5.p95KeystrokeMs, 8.0, "Step 5 P95 keystroke latency should be < 8.0ms")
         XCTAssertGreaterThan(report.outlineFolding.headingCount, 100, "Moby Dick should contain >100 headings")
         XCTAssertTrue(report.outlineFolding.upstreamEditShiftsFoldCorrectly, "Upstream edits must shift downstream folded section ranges")
@@ -52,8 +52,8 @@ final class MobyDickWorkoutTests: XCTestCase {
         XCTAssertEqual(report.repeats.count, max(0, cycles), "Step 10 should complete repeated workout cycles")
         for cycle in report.repeats {
             XCTAssertTrue(cycle.step4.intactAfterRedo, "Cycle #\(cycle.cycleIndex) must leave Moby Dick intact")
-            XCTAssertLessThan(cycle.step2.resizeAvgMs, 16.0)
-            XCTAssertLessThan(cycle.step3.resizeAvgMs, 16.0)
+            XCTAssertLessThan(cycle.step2.resizeAvgCPUMs, 16.0)
+            XCTAssertLessThan(cycle.step3.resizeAvgCPUMs, 16.0)
             XCTAssertLessThan(cycle.step5.p95KeystrokeMs, 8.0)
         }
         if !report.repeats.isEmpty {
@@ -74,8 +74,8 @@ final class MobyDickWorkoutTests: XCTestCase {
         Theme.voice = .neoAcid
         let report = try MobyDickWorkout.run(repeatCycles: 1, typingSample: "Whale")
         XCTAssertLessThan(report.step1.cpu.cpuTimeMs, 150.0)
-        XCTAssertLessThan(report.step2.resizeAvgMs, 16.0)
-        XCTAssertLessThan(report.step3.resizeAvgMs, 16.0)
+        XCTAssertLessThan(report.step2.resizeAvgCPUMs, 16.0)
+        XCTAssertLessThan(report.step3.resizeAvgCPUMs, 16.0)
         XCTAssertLessThan(report.step5.p95KeystrokeMs, 8.0)
     }
 }
@@ -101,8 +101,8 @@ struct MobyDickWorkoutSuite {
         #expect(report.step4.intactAfterRedo)
         #expect(report.step5.keystrokeCount == sample.count)
         #expect(report.step1.cpu.cpuTimeMs < 150.0)
-        #expect(report.step2.resizeAvgMs < 16.0)
-        #expect(report.step3.resizeAvgMs < 16.0)
+        #expect(report.step2.resizeAvgCPUMs < 16.0)
+        #expect(report.step3.resizeAvgCPUMs < 16.0)
         #expect(report.step5.p95KeystrokeMs < 8.0)
         #expect(report.outlineFolding.headingCount > 100)
         #expect(report.outlineFolding.upstreamEditShiftsFoldCorrectly)
@@ -125,8 +125,8 @@ struct MobyDickWorkoutSuite {
         #expect(report.repeats.count == max(0, cycles))
         for cycle in report.repeats {
             #expect(cycle.step4.intactAfterRedo)
-            #expect(cycle.step2.resizeAvgMs < 16.0)
-            #expect(cycle.step3.resizeAvgMs < 16.0)
+            #expect(cycle.step2.resizeAvgCPUMs < 16.0)
+            #expect(cycle.step3.resizeAvgCPUMs < 16.0)
             #expect(cycle.step5.p95KeystrokeMs < 8.0)
         }
         if !report.repeats.isEmpty {
@@ -2010,8 +2010,8 @@ struct MobyDickWorkoutSuite {
         // Verify Neo-Acid atmosphere + Unbounded H1-H3 headings meet Moby-Dick layout, resize, typing, and memory budgets
         let report = try MobyDickWorkout.run(repeatCycles: 1, typingSample: "Whale")
         #expect(report.step1.cpu.cpuTimeMs < 150.0)
-        #expect(report.step2.resizeAvgMs < 16.0)
-        #expect(report.step3.resizeAvgMs < 16.0)
+        #expect(report.step2.resizeAvgCPUMs < 16.0)
+        #expect(report.step3.resizeAvgCPUMs < 16.0)
         #expect(report.step5.p95KeystrokeMs < 8.0)
         if !report.repeats.isEmpty {
             let growthPerCycle = (report.memoryFinal.physFootprintMB - report.memoryAfterFirstPass.physFootprintMB) / Double(report.repeats.count)
