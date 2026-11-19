@@ -20,32 +20,6 @@ struct IconGenerator {
         NSColor(srgbRed: r, green: g, blue: b, alpha: a)
     }
 
-    // Continuous Apple-style superellipse path matching the macOS icon grid silhouette.
-    static func squirclePath(in rect: NSRect, exponent n: CGFloat = 4.5, steps: Int = 180) -> NSBezierPath {
-        let path = NSBezierPath()
-        let cx = rect.midX
-        let cy = rect.midY
-        let rx = rect.width * 0.5
-        let ry = rect.height * 0.5
-        let invN = 2.0 / n
-
-        for i in 0...steps {
-            let theta = (CGFloat(i) / CGFloat(steps)) * .pi * 2.0
-            let c = cos(theta)
-            let s = sin(theta)
-            let x = cx + rx * (c >= 0 ? 1.0 : -1.0) * pow(abs(c), invN)
-            let y = cy + ry * (s >= 0 ? 1.0 : -1.0) * pow(abs(s), invN)
-            let pt = NSPoint(x: x, y: y)
-            if i == 0 {
-                path.move(to: pt)
-            } else {
-                path.line(to: pt)
-            }
-        }
-        path.close()
-        return path
-    }
-
     // Deterministic lightweight PRNG so tactile paper/linen grain is 100% reproducible across builds.
     struct SeededRNG {
         var state: UInt64
@@ -163,11 +137,14 @@ struct IconGenerator {
         let acidMain     = color(0.773, 0.973, 0.165)      // #C5F82A Theme.accent neoAcidDark
         let acidDeep     = color(0.675, 0.900, 0.075)      // #ACE613 lower depth
 
-        // 1. Apple macOS Icon Grid Squircle (824x824 centered at 100..924)
+        // 1. Apple macOS Icon Grid Squircle (824x824 centered at 100..924, r=185)
+        // Uses Apple's standard rounded-rect corner geometry so macOS 26/27 IconServices
+        // treats the icon as a native full-bleed squircle instead of shrinking it inside a gray box.
         let inset: CGFloat = isTiny ? 64.0 * s : 100.0 * s
         let boardSize: CGFloat = CGFloat(px) - inset * 2.0
         let boardRect = NSRect(x: inset, y: inset, width: boardSize, height: boardSize)
-        let boardPath = squirclePath(in: boardRect, exponent: 4.55)
+        let boardRadius: CGFloat = isTiny ? 150.0 * s : 185.0 * s
+        let boardPath = NSBezierPath(roundedRect: boardRect, xRadius: boardRadius, yRadius: boardRadius)
 
         // Subtle outer drop shadow under the hardcover board (skipped at 16px for crisp edges)
         if !isTiny {
@@ -222,7 +199,8 @@ struct IconGenerator {
         // 3. Raw Architectural Plaster Cover (inset cleanly inside top/right/bottom obsidian binding rim)
         let rimWidth: CGFloat = isTiny ? max(1.0, 20.0 * s) : (isSmall ? max(1.5, 16.0 * s) : 13.0 * s)
         let coverBoardRect = boardRect.insetBy(dx: rimWidth, dy: rimWidth)
-        let coverBoardPath = squirclePath(in: coverBoardRect, exponent: 4.55)
+        let coverRadius = max(8.0 * s, boardRadius - rimWidth)
+        let coverBoardPath = NSBezierPath(roundedRect: coverBoardRect, xRadius: coverRadius, yRadius: coverRadius)
 
         let coverClipRect = NSRect(
             x: spineRightX,
@@ -442,53 +420,28 @@ struct IconGenerator {
 
         NSGraphicsContext.restoreGraphicsState() // end plaster cover clip
 
-        // Subtle inner rim catch-light along the top edge of the outer obsidian board
-        if !isTiny {
-            color(1.0, 1.0, 1.0, 0.18).setStroke()
-            let innerRimPath = squirclePath(in: boardRect.insetBy(dx: 2.0 * s, dy: 2.0 * s), exponent: 4.55)
-            innerRimPath.lineWidth = max(1.0, 3.0 * s)
-            innerRimPath.stroke()
-        }
-
-        NSGraphicsContext.restoreGraphicsState() // end outer board clip
-
-        // 5. Sculptural Neo-Acid Bookmark Ribbon draping over the top-right edge of the book
+        // 5. Sculptural Neo-Acid Bookmark Ribbon flush with the top-right edge of the book
+        // Kept strictly inside boardPath (824x824) so macOS Tahoe/Liquid Glass IconServices
+        // recognizes the native squircle silhouette instead of shrinking it inside a gray box.
         let ribW: CGFloat = isTiny ? 154.0 * s : (isSmall ? 142.0 * s : 126.0 * s)
-        let ribTopOverhang: CGFloat = isTiny ? 0.0 : (isSmall ? 8.0 * s : 13.0 * s)
-        let ribH: CGFloat = isTiny ? 316.0 * s : (isSmall ? 304.0 * s : 288.0 * s)
+        let ribH: CGFloat = isTiny ? 316.0 * s : (isSmall ? 304.0 * s : 292.0 * s)
         let ribRightMargin: CGFloat = isTiny ? 132.0 * s : (isSmall ? 146.0 * s : 162.0 * s)
         let ribX: CGFloat = boardRect.maxX - ribRightMargin - ribW
-        let ribTopY: CGFloat = boardRect.maxY + ribTopOverhang
+        let ribTopY: CGFloat = boardRect.maxY
         let ribBotY: CGFloat = ribTopY - ribH
         let notchDepth: CGFloat = isTiny ? 56.0 * s : 48.0 * s
-        let ribTopR: CGFloat = isTiny ? 14.0 * s : 14.0 * s
 
         let ribbonPath = NSBezierPath()
         ribbonPath.move(to: NSPoint(x: ribX, y: ribBotY))
-        ribbonPath.line(to: NSPoint(x: ribX, y: ribTopY - ribTopR))
-        ribbonPath.appendArc(
-            withCenter: NSPoint(x: ribX + ribTopR, y: ribTopY - ribTopR),
-            radius: ribTopR,
-            startAngle: 180,
-            endAngle: 90,
-            clockwise: true
-        )
-        ribbonPath.line(to: NSPoint(x: ribX + ribW - ribTopR, y: ribTopY))
-        ribbonPath.appendArc(
-            withCenter: NSPoint(x: ribX + ribW - ribTopR, y: ribTopY - ribTopR),
-            radius: ribTopR,
-            startAngle: 90,
-            endAngle: 0,
-            clockwise: true
-        )
+        ribbonPath.line(to: NSPoint(x: ribX, y: ribTopY))
+        ribbonPath.line(to: NSPoint(x: ribX + ribW, y: ribTopY))
         ribbonPath.line(to: NSPoint(x: ribX + ribW, y: ribBotY))
         ribbonPath.line(to: NSPoint(x: ribX + ribW * 0.5, y: ribBotY + notchDepth))
         ribbonPath.close()
 
-        // Cast realistic ribbon shadow ONLY onto the book cover (clipped to boardPath)
+        // Cast realistic ribbon shadow onto the book cover
         if !isTiny {
             NSGraphicsContext.saveGraphicsState()
-            boardPath.addClip()
             let ribShadow = NSShadow()
             ribShadow.shadowColor = color(0.05, 0.07, 0.04, 0.28)
             ribShadow.shadowOffset = NSSize(width: 4 * s, height: -16 * s)
@@ -509,7 +462,7 @@ struct IconGenerator {
             acidMain,
             acidMain,
             acidDeep
-        ], atLocations: [0.0, 0.15, 0.72, 1.0], colorSpace: .sRGB)!
+        ], atLocations: [0.0, 0.16, 0.72, 1.0], colorSpace: .sRGB)!
         ribGrad.draw(in: ribRect, angle: -90)
 
         // Subtle rounded top-fold specular sheen where the ribbon wraps over the book's top edge
@@ -528,10 +481,20 @@ struct IconGenerator {
 
         NSGraphicsContext.restoreGraphicsState()
 
-        // Delicate luminous chartreuse border so the ribbon reads crisply against pale plaster without looking outlined
+        // Delicate luminous chartreuse border so the ribbon reads crisply against pale plaster
         color(0.54, 0.76, 0.04, isTiny ? 0.45 : 0.26).setStroke()
         ribbonPath.lineWidth = max(0.8, 2.0 * s)
         ribbonPath.stroke()
+
+        // Subtle inner rim catch-light along the top edge of the outer obsidian board
+        if !isTiny {
+            color(1.0, 1.0, 1.0, 0.18).setStroke()
+            let innerRimPath = NSBezierPath(roundedRect: boardRect.insetBy(dx: 2.0 * s, dy: 2.0 * s), xRadius: boardRadius, yRadius: boardRadius)
+            innerRimPath.lineWidth = max(1.0, 3.0 * s)
+            innerRimPath.stroke()
+        }
+
+        NSGraphicsContext.restoreGraphicsState() // end outer board clip
 
         NSGraphicsContext.restoreGraphicsState()
         return rep
