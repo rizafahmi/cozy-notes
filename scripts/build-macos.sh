@@ -65,7 +65,7 @@ done
 swift build -c "$configuration"
 bin="$(swift build -c "$configuration" --show-bin-path)"
 
-if [[ ! -f packaging/AppIcon.icns ]]; then
+if [[ ! -f packaging/AppIcon.icns || packaging/generate-icon.swift -nt packaging/AppIcon.icns ]]; then
     swift packaging/generate-icon.swift
 fi
 

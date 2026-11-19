@@ -20,6 +20,111 @@ struct IconGenerator {
         NSColor(srgbRed: r, green: g, blue: b, alpha: a)
     }
 
+    // Continuous Apple-style superellipse path matching the macOS icon grid silhouette.
+    static func squirclePath(in rect: NSRect, exponent n: CGFloat = 4.5, steps: Int = 180) -> NSBezierPath {
+        let path = NSBezierPath()
+        let cx = rect.midX
+        let cy = rect.midY
+        let rx = rect.width * 0.5
+        let ry = rect.height * 0.5
+        let invN = 2.0 / n
+
+        for i in 0...steps {
+            let theta = (CGFloat(i) / CGFloat(steps)) * .pi * 2.0
+            let c = cos(theta)
+            let s = sin(theta)
+            let x = cx + rx * (c >= 0 ? 1.0 : -1.0) * pow(abs(c), invN)
+            let y = cy + ry * (s >= 0 ? 1.0 : -1.0) * pow(abs(s), invN)
+            let pt = NSPoint(x: x, y: y)
+            if i == 0 {
+                path.move(to: pt)
+            } else {
+                path.line(to: pt)
+            }
+        }
+        path.close()
+        return path
+    }
+
+    // Deterministic lightweight PRNG so tactile paper/linen grain is 100% reproducible across builds.
+    struct SeededRNG {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state
+        }
+        mutating func unit() -> CGFloat {
+            CGFloat((next() >> 33) & 0x7FFFFFFF) / CGFloat(0x7FFFFFFF)
+        }
+    }
+
+    static func drawPaperGrain(in cg: CGContext, rect: CGRect, pixelSize: Int, intensity: CGFloat, seed: UInt64) {
+        guard pixelSize >= 128 else { return }
+        let texSize = min(512, pixelSize)
+        var bytes = [UInt8](repeating: 0, count: texSize * texSize * 4)
+        var rng = SeededRNG(state: seed)
+        for i in 0..<(texSize * texSize) {
+            let v = rng.unit()
+            let bright = v > 0.5
+            let mag = abs(v - 0.5) * 2.0
+            let alpha = UInt8(min(255, max(0, Int(mag * intensity * 255.0))))
+            let tone: UInt8 = bright ? 255 : 28
+            let idx = i * 4
+            bytes[idx] = tone
+            bytes[idx + 1] = tone
+            bytes[idx + 2] = tone
+            bytes[idx + 3] = alpha
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let cgImage = CGImage(
+                width: texSize,
+                height: texSize,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: texSize * 4,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: true,
+                intent: .defaultIntent
+              ) else { return }
+        cg.saveGState()
+        cg.interpolationQuality = .high
+        cg.draw(cgImage, in: rect)
+        cg.restoreGState()
+    }
+
+    static func drawLinenWeave(in cg: CGContext, rect: CGRect, s: CGFloat, pixelSize: Int) {
+        guard pixelSize >= 128 else { return }
+        cg.saveGState()
+        cg.clip(to: rect)
+        let step = max(2.0, 5.0 * s)
+        cg.setLineWidth(max(0.75, 1.2 * s))
+
+        // Fine vertical warp threads
+        cg.setStrokeColor(color(1.0, 1.0, 1.0, 0.030).cgColor)
+        var x = rect.minX
+        while x <= rect.maxX {
+            cg.move(to: CGPoint(x: x, y: rect.minY))
+            cg.addLine(to: CGPoint(x: x, y: rect.maxY))
+            x += step
+        }
+        cg.strokePath()
+
+        // Fine horizontal weft threads
+        cg.setStrokeColor(color(0.0, 0.0, 0.0, 0.085).cgColor)
+        var y = rect.minY
+        while y <= rect.maxY {
+            cg.move(to: CGPoint(x: rect.minX, y: y))
+            cg.addLine(to: CGPoint(x: rect.maxX, y: y))
+            y += step
+        }
+        cg.strokePath()
+        cg.restoreGState()
+    }
+
     static func render(px: Int) -> NSBitmapImageRep {
         let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -46,327 +151,389 @@ struct IconGenerator {
         let s = CGFloat(px) / 1024.0
         let isTiny = px <= 24       // 16px
         let isSmall = px <= 48      // 32px
-        let isMedium = px <= 96     // 64px
 
-        // 1. Apple macOS Icon Grid Squircle (824x824 centered at 100..924, r=185)
-        let deskInset: CGFloat = isTiny ? 64.0 * s : 100.0 * s
-        let deskSize: CGFloat = CGFloat(px) - deskInset * 2.0
-        let deskRect = NSRect(x: deskInset, y: deskInset, width: deskSize, height: deskSize)
-        let deskRadius: CGFloat = isTiny ? 150.0 * s : 185.0 * s
-        let deskPath = NSBezierPath(roundedRect: deskRect, xRadius: deskRadius, yRadius: deskRadius)
+        // Palette tokens anchored to Cozy Notes's Neo-Acid & Plaster theme (Theme.swift)
+        let obsidianDeep = color(0.071, 0.082, 0.098)      // #121519 Theme.canvas neoAcidDark
+        let obsidianMid  = color(0.114, 0.129, 0.153)      // #1D2127
+        let obsidianTop  = color(0.180, 0.198, 0.228)      // #2E323A subtle lit cloth edge
+        let plasterTop   = color(0.969, 0.969, 0.957)      // #F7F7F4 Theme.paper neoAcidLight
+        let plasterMid   = color(0.935, 0.935, 0.914)      // #EEEEEA
+        let plasterBot   = color(0.884, 0.884, 0.858)      // #E1E1DB
+        let acidBright   = color(0.850, 1.000, 0.340)      // #D9FF57 ribbon top catch-light
+        let acidMain     = color(0.773, 0.973, 0.165)      // #C5F82A Theme.accent neoAcidDark
+        let acidDeep     = color(0.675, 0.900, 0.075)      // #ACE613 lower depth
 
-        // Subtle drop shadow under the squircle for depth (skipped at 16px so edges stay crisp)
+        // 1. Apple macOS Icon Grid Squircle (824x824 centered at 100..924)
+        let inset: CGFloat = isTiny ? 64.0 * s : 100.0 * s
+        let boardSize: CGFloat = CGFloat(px) - inset * 2.0
+        let boardRect = NSRect(x: inset, y: inset, width: boardSize, height: boardSize)
+        let boardPath = squirclePath(in: boardRect, exponent: 4.55)
+
+        // Subtle outer drop shadow under the hardcover board (skipped at 16px for crisp edges)
         if !isTiny {
             NSGraphicsContext.saveGraphicsState()
             let outerShadow = NSShadow()
-            outerShadow.shadowColor = color(0.02, 0.03, 0.05, 0.38)
-            outerShadow.shadowOffset = NSSize(width: 0, height: -10 * s)
-            outerShadow.shadowBlurRadius = 24 * s
+            outerShadow.shadowColor = color(0.02, 0.03, 0.05, 0.40)
+            outerShadow.shadowOffset = NSSize(width: 0, height: -14 * s)
+            outerShadow.shadowBlurRadius = 26 * s
             outerShadow.set()
-            color(0.075, 0.078, 0.090).setFill()
-            deskPath.fill()
+            obsidianDeep.setFill()
+            boardPath.fill()
             NSGraphicsContext.restoreGraphicsState()
         }
 
-        // Clip inside desk squircle
+        // 2. Hardcover Obsidian Outer Binding Board (also forms the crisp protective rim around plaster)
         NSGraphicsContext.saveGraphicsState()
-        deskPath.addClip()
+        boardPath.addClip()
 
-        // Desk gradient: Obsidian (#131417 -> #1B1D22) blended with Midnight Ink undertone (#0E1218)
-        let deskGradient = NSGradient(colors: [
-            color(0.118, 0.128, 0.156), // top: elevated obsidian-midnight slate
-            color(0.075, 0.078, 0.090), // middle: Theme.canvas studyDark (#131417)
-            color(0.055, 0.070, 0.098)  // bottom: Theme.canvas botanicalDark (#0E1218)
-        ], atLocations: [0.0, 0.55, 1.0], colorSpace: .sRGB)!
-        deskGradient.draw(in: deskRect, angle: -90)
+        let spineGrad = NSGradient(colors: [
+            obsidianTop,
+            obsidianMid,
+            obsidianDeep
+        ], atLocations: [0.0, 0.42, 1.0], colorSpace: .sRGB)!
+        spineGrad.draw(in: boardRect, angle: -82)
 
-        // Subtle radial ambient glow behind folio
+        // Left cloth spine subtle cylindrical highlight along far left edge
+        let spineRatio: CGFloat = isTiny ? 0.27 : (isSmall ? 0.25 : 0.235)
+        let spineRightX = boardRect.minX + boardRect.width * spineRatio
+        let spineRect = NSRect(x: boardRect.minX, y: boardRect.minY, width: spineRightX - boardRect.minX, height: boardRect.height)
+
+        let spineRollGrad = NSGradient(colors: [
+            color(1.0, 1.0, 1.0, 0.11),
+            color(1.0, 1.0, 1.0, 0.02),
+            color(0.0, 0.0, 0.0, 0.16)
+        ], atLocations: [0.0, 0.45, 1.0], colorSpace: .sRGB)!
+        spineRollGrad.draw(in: spineRect, angle: 0)
+
+        drawLinenWeave(in: cg, rect: spineRect, s: s, pixelSize: px)
+
+        // Subtle debossed bookbinding hinge groove on the spine edge
         if !isTiny {
-            let glowColor = color(0.245, 0.420, 0.825, 0.10)
-            let glowGrad = NSGradient(starting: glowColor, ending: color(0.075, 0.078, 0.090, 0.0))!
-            glowGrad.draw(
-                fromCenter: NSPoint(x: 512 * s, y: 540 * s),
-                radius: 20 * s,
-                toCenter: NSPoint(x: 512 * s, y: 512 * s),
-                radius: 420 * s,
-                options: []
+            let grooveW = max(1.5, 9.0 * s)
+            let grooveX = spineRightX - grooveW - 14.0 * s
+            let grooveRect = NSRect(x: grooveX, y: boardRect.minY + 34 * s, width: grooveW, height: boardRect.height - 68 * s)
+            let groovePath = NSBezierPath(roundedRect: grooveRect, xRadius: grooveW * 0.5, yRadius: grooveW * 0.5)
+            color(0.0, 0.0, 0.0, 0.48).setFill()
+            groovePath.fill()
+            color(1.0, 1.0, 1.0, 0.10).setFill()
+            NSRect(x: grooveRect.maxX, y: grooveRect.minY + 6 * s, width: max(1.0, 2.5 * s), height: grooveRect.height - 12 * s).fill()
+        }
+
+        // 3. Raw Architectural Plaster Cover (inset cleanly inside top/right/bottom obsidian binding rim)
+        let rimWidth: CGFloat = isTiny ? max(1.0, 20.0 * s) : (isSmall ? max(1.5, 16.0 * s) : 13.0 * s)
+        let coverBoardRect = boardRect.insetBy(dx: rimWidth, dy: rimWidth)
+        let coverBoardPath = squirclePath(in: coverBoardRect, exponent: 4.55)
+
+        let coverClipRect = NSRect(
+            x: spineRightX,
+            y: coverBoardRect.minY,
+            width: coverBoardRect.maxX - spineRightX,
+            height: coverBoardRect.height
+        )
+
+        NSGraphicsContext.saveGraphicsState()
+        coverBoardPath.addClip()
+        NSBezierPath(rect: coverClipRect).addClip()
+
+        // Architectural plaster studio lighting gradient
+        let plasterGrad = NSGradient(colors: [
+            plasterTop,
+            plasterMid,
+            plasterBot
+        ], atLocations: [0.0, 0.58, 1.0], colorSpace: .sRGB)!
+        plasterGrad.draw(in: coverClipRect, angle: -96)
+
+        // Soft warm studio bounce light from upper-left onto the plaster surface
+        if !isTiny {
+            let glow = NSGradient(
+                starting: color(1.0, 1.0, 1.0, 0.45),
+                ending: color(1.0, 1.0, 1.0, 0.0)
+            )!
+            glow.draw(
+                fromCenter: NSPoint(x: coverClipRect.minX + coverClipRect.width * 0.28, y: coverClipRect.maxY - coverClipRect.height * 0.20),
+                radius: 0,
+                toCenter: NSPoint(x: coverClipRect.midX, y: coverClipRect.midY),
+                radius: coverClipRect.width * 0.90,
+                options: [.drawsBeforeStartingLocation]
             )
         }
 
-        // 2. Recessed Index Slip behind the main folio (links to the Commonplace Index / dump-first stack)
+        // Fine tactile cotton-plaster paper grain
+        drawPaperGrain(in: cg, rect: coverClipRect, pixelSize: px, intensity: 0.032, seed: 0xC027_AC1D)
+
+        // Crisp seam shadow where the obsidian spine meets the plaster cover
+        let seamGrad = NSGradient(colors: [
+            color(0.05, 0.06, 0.08, 0.22),
+            color(0.05, 0.06, 0.08, 0.0)
+        ])!
+        seamGrad.draw(in: NSRect(x: spineRightX, y: coverClipRect.minY, width: max(2.0, 18.0 * s), height: coverClipRect.height), angle: 0)
+
+        // Subtle inner top catch-light along the plaster cover edge
+        color(1.0, 1.0, 1.0, 0.72).setFill()
+        NSRect(x: spineRightX + max(1.0, 2.0 * s), y: coverClipRect.maxY - max(1.0, 3.0 * s), width: coverClipRect.width - 140 * s, height: max(1.0, 3.0 * s)).fill()
+
+        // 4. Debossed Pocket Slit & Tucked Obsidian Index Slip with Neo-Acid Folded Corner
+        let coverCenterX = (spineRightX + coverBoardRect.maxX) * 0.5
+        let slipW: CGFloat = isTiny ? coverClipRect.width * 0.68 : (isSmall ? coverClipRect.width * 0.64 : coverClipRect.width * 0.57)
+        let slipH: CGFloat = isTiny ? boardRect.height * 0.23 : (isSmall ? boardRect.height * 0.21 : boardRect.height * 0.195)
+        let slitY: CGFloat = boardRect.minY + (isTiny ? boardRect.height * 0.22 : boardRect.height * 0.245)
+        let slitH: CGFloat = isTiny ? max(1.5, 20.0 * s) : (isSmall ? max(2.0, 18.0 * s) : 14.0 * s)
+        let slitPadX: CGFloat = isTiny ? 16.0 * s : 28.0 * s
+        let slitRect = NSRect(
+            x: coverCenterX - slipW * 0.5 - slitPadX,
+            y: slitY - slitH * 0.5,
+            width: slipW + slitPadX * 2.0,
+            height: slitH
+        )
+
+        // Organic elliptical pillowed shadow directly beneath the pocket mouth (zero hard vertical edges)
         if !isTiny {
             NSGraphicsContext.saveGraphicsState()
-            let backX = 250 * s
-            let backY = 238 * s
-            let backW = 500 * s
-            let backH = 590 * s
-            let backRect = NSRect(x: backX, y: backY, width: backW, height: backH)
-            var transform = AffineTransform()
-            transform.translate(x: 512 * s, y: 512 * s)
-            transform.rotate(byDegrees: -4.2)
-            transform.translate(x: -512 * s, y: -512 * s)
-            (transform as NSAffineTransform).concat()
-
-            let backPath = NSBezierPath(roundedRect: backRect, xRadius: 56 * s, yRadius: 56 * s)
-            color(0.928, 0.938, 0.955, 0.22).setFill() // Porcelain translucent slip
-            backPath.fill()
-            color(0.835, 0.855, 0.890, 0.28).setStroke()
-            backPath.lineWidth = max(1.0, 4.0 * s)
-            backPath.stroke()
+            let pocketMouthClip = NSRect(x: coverClipRect.minX, y: coverClipRect.minY, width: coverClipRect.width, height: slitY - coverClipRect.minY)
+            NSBezierPath(rect: pocketMouthClip).addClip()
+            cg.saveGState()
+            cg.translateBy(x: coverCenterX, y: slitY - 4 * s)
+            cg.scaleBy(x: (slitRect.width * 0.56) / (68 * s), y: 1.0)
+            let bulgeColors = [color(0.10, 0.12, 0.14, 0.11).cgColor, color(0.10, 0.12, 0.14, 0.0).cgColor] as CFArray
+            if let radial = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!, colors: bulgeColors, locations: [0.0, 1.0]) {
+                cg.drawRadialGradient(
+                    radial,
+                    startCenter: .zero,
+                    startRadius: 0,
+                    endCenter: .zero,
+                    endRadius: 68 * s,
+                    options: []
+                )
+            }
+            cg.restoreGState()
             NSGraphicsContext.restoreGraphicsState()
         }
 
-        // 3. Main Inset Ivory Folio Sheet (Theme.paper studyLight #FAF9F6)
-        let folioX: CGFloat = isTiny ? 210 * s : 244 * s
-        let folioY: CGFloat = isTiny ? 175 * s : 196 * s
-        let folioW: CGFloat = isTiny ? 604 * s : 536 * s
-        let folioH: CGFloat = isTiny ? 674 * s : 632 * s
-        let folioRect = NSRect(x: folioX, y: folioY, width: folioW, height: folioH)
-        let folioRadius: CGFloat = isTiny ? 96 * s : 72 * s
-        let folioPath = NSBezierPath(roundedRect: folioRect, xRadius: folioRadius, yRadius: folioRadius)
-
-        // Folio shadow on the obsidian desk
-        NSGraphicsContext.saveGraphicsState()
-        let folioShadow = NSShadow()
-        folioShadow.shadowColor = color(0.0, 0.0, 0.0, isTiny ? 0.45 : 0.50)
-        folioShadow.shadowOffset = NSSize(width: 0, height: isTiny ? -16 * s : -20 * s)
-        folioShadow.shadowBlurRadius = isTiny ? 24 * s : 38 * s
-        folioShadow.set()
-        color(0.988, 0.985, 0.976).setFill()
-        folioPath.fill()
-        NSGraphicsContext.restoreGraphicsState()
-
-        // Clip to Folio Sheet
-        NSGraphicsContext.saveGraphicsState()
-        folioPath.addClip()
-
-        // Warm Ivory to Porcelain vertical paper gradient
-        let paperGradient = NSGradient(colors: [
-            color(0.994, 0.992, 0.986), // top catch-light ivory
-            color(0.988, 0.985, 0.976), // Theme.paper studyLight (#FAF9F6)
-            color(0.958, 0.954, 0.942)  // Theme.elevated studyLight (#F4F3F0)
-        ], atLocations: [0.0, 0.7, 1.0], colorSpace: .sRGB)!
-        paperGradient.draw(in: folioRect, angle: -90)
-
-        // 4. Scholarly Left Coral-Rose Margin Rule (signature of FolioPageSurface)
-        let marginX: CGFloat = isTiny ? (folioX + 148 * s) : (folioX + 118 * s)
-        let marginLineW: CGFloat = isTiny ? max(1.5, 48 * s) : (isSmall ? max(1.5, 30 * s) : max(2.0, 18 * s))
-        // Coral-Rose accent from Theme.accent studyLight (0.820, 0.310, 0.270)
-        let coralColor = color(0.845, 0.325, 0.280, isTiny ? 0.95 : 0.88)
-        coralColor.setFill()
-        NSRect(x: marginX - marginLineW / 2.0, y: folioRect.minY, width: marginLineW, height: folioRect.height).fill()
-
-        // 5. Top-Right Bookmark / Capture Tab (Coral-Rose & Sage dual motif)
+        // Recessed pocket slot
+        let slitPath = NSBezierPath(roundedRect: slitRect, xRadius: slitH * 0.5, yRadius: slitH * 0.5)
+        color(0.75, 0.75, 0.72, 0.96).setFill()
+        slitPath.fill()
         if !isTiny {
-            let tabW: CGFloat = (isSmall ? 76 : 64) * s
-            let tabH: CGFloat = (isSmall ? 124 : 112) * s
-            let tabX: CGFloat = folioRect.maxX - (isSmall ? 132 : 118) * s
-            let tabY: CGFloat = folioRect.maxY - tabH
-            let tabPath = NSBezierPath()
-            tabPath.move(to: NSPoint(x: tabX, y: folioRect.maxY))
-            tabPath.line(to: NSPoint(x: tabX + tabW, y: folioRect.maxY))
-            tabPath.line(to: NSPoint(x: tabX + tabW, y: tabY))
-            tabPath.line(to: NSPoint(x: tabX + tabW * 0.5, y: tabY + 26 * s))
-            tabPath.line(to: NSPoint(x: tabX, y: tabY))
-            tabPath.close()
-            color(0.820, 0.310, 0.270).setFill() // Theme.accent studyLight
-            tabPath.fill()
+            // Inner upper shadow inside slit
+            NSGraphicsContext.saveGraphicsState()
+            slitPath.addClip()
+            color(0.10, 0.12, 0.14, 0.36).setFill()
+            NSRect(x: slitRect.minX, y: slitRect.midY, width: slitRect.width, height: slitRect.height * 0.6).fill()
+            NSGraphicsContext.restoreGraphicsState()
+
+            // Crisp bottom lip highlight below pocket slit
+            color(1.0, 1.0, 1.0, 0.85).setFill()
+            NSRect(x: slitRect.minX + slitH * 0.4, y: slitRect.minY - max(1.0, 2.5 * s), width: slitRect.width - slitH * 0.8, height: max(1.0, 2.5 * s)).fill()
         }
 
-        // 6. Typography / Prose / Capture Marks on the Folio Page
-        let contentLeft: CGFloat = marginX + (isTiny ? 62 * s : 52 * s)
-        let contentRight: CGFloat = folioRect.maxX - (isTiny ? 62 * s : 64 * s)
-        let maxLineW: CGFloat = contentRight - contentLeft
+        // Tucked Obsidian Slip rising out of the pocket slit (clipped cleanly at slit midline)
+        let slipRect = NSRect(x: coverCenterX - slipW * 0.5, y: slitY, width: slipW, height: slipH)
+        let slipR: CGFloat = 24.0 * s
+        let foldSize: CGFloat = isTiny ? slipH * 0.58 : (isSmall ? slipH * 0.54 : slipH * 0.53)
 
-        if isTiny {
-            // 16x16 simplified optical master: 2 bold ink bars + coral capture spark
-            let barH: CGFloat = 76 * s
-            let r: CGFloat = barH / 2.0
-            // Heading bar (Obsidian headingInk #16171B)
-            color(0.085, 0.092, 0.108).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 230 * s, width: maxLineW * 0.82, height: barH), xRadius: r, yRadius: r).fill()
-
-            // Second prose bar (Midnight ink #242B37)
-            color(0.140, 0.168, 0.215, 0.88).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 385 * s, width: maxLineW * 0.58, height: barH), xRadius: r, yRadius: r).fill()
-
-            // Sage / Neo-Acid capture pill at bottom right
-            color(0.235, 0.525, 0.455).setFill() // Theme.sage
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 540 * s, width: maxLineW * 0.72, height: barH), xRadius: r, yRadius: r).fill()
-        } else if isSmall {
-            // 32x32 optical master: crisp heading + 2 prose lines + sage checklist badge
-            let hBarH: CGFloat = 54 * s
-            let pBarH: CGFloat = 40 * s
-
-            // Heading bar
-            color(0.085, 0.092, 0.108).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 205 * s, width: maxLineW * 0.68, height: hBarH), xRadius: hBarH / 2, yRadius: hBarH / 2).fill()
-
-            // Prose line 1
-            color(0.165, 0.175, 0.195, 0.88).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 315 * s, width: maxLineW * 0.90, height: pBarH), xRadius: pBarH / 2, yRadius: pBarH / 2).fill()
-
-            // Prose line 2 + live coral caret
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 405 * s, width: maxLineW * 0.56, height: pBarH), xRadius: pBarH / 2, yRadius: pBarH / 2).fill()
-
-            // Live spring caret right after prose line 2
-            let caretX = contentLeft + maxLineW * 0.56 + 22 * s
-            let caretW = max(2.0, 22 * s)
-            color(0.820, 0.310, 0.270).setFill()
-            NSBezierPath(roundedRect: NSRect(x: caretX, y: folioRect.maxY - 412 * s, width: caretW, height: pBarH + 14 * s), xRadius: caretW / 2, yRadius: caretW / 2).fill()
-
-            // Bottom Sage attachment/OCR companion pill
-            let pillY = folioRect.minY + 78 * s
-            let pillH = 68 * s
-            color(0.235, 0.525, 0.455, 0.18).setFill()
-            let pillRect = NSRect(x: contentLeft, y: pillY, width: maxLineW * 0.78, height: pillH)
-            let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: 20 * s, yRadius: 20 * s)
-            pillPath.fill()
-            color(0.235, 0.525, 0.455, 0.85).setStroke()
-            pillPath.lineWidth = max(1.2, 8 * s)
-            pillPath.stroke()
-
-            // Sage dot inside pill
-            let dotD = 30 * s
-            color(0.235, 0.525, 0.455).setFill()
-            NSBezierPath(ovalIn: NSRect(x: contentLeft + 22 * s, y: pillY + (pillH - dotD) / 2, width: dotD, height: dotD)).fill()
-        } else {
-            // 64px, 128px, 256px, 512px, 1024px rich commonplace folio
-            // Monospace dateline stamp at top (whisper-quiet subtle ink)
-            let stampH: CGFloat = 18 * s
-            color(0.420, 0.430, 0.455, 0.65).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 88 * s, width: maxLineW * 0.34, height: stampH), xRadius: stampH / 2, yRadius: stampH / 2).fill()
-
-            // Left-gutter H1 badge (in left margin)
-            if !isMedium {
-                let badgeW: CGFloat = 58 * s
-                let badgeH: CGFloat = 34 * s
-                let badgeX: CGFloat = marginX - badgeW - 22 * s
-                let badgeY: CGFloat = folioRect.maxY - 178 * s
-                color(0.820, 0.310, 0.270, 0.16).setFill()
-                NSBezierPath(roundedRect: NSRect(x: badgeX, y: badgeY, width: badgeW, height: badgeH), xRadius: 10 * s, yRadius: 10 * s).fill()
-                // Small bar inside H1 badge
-                color(0.820, 0.310, 0.270, 0.90).setFill()
-                NSBezierPath(roundedRect: NSRect(x: badgeX + 14 * s, y: badgeY + 11 * s, width: 30 * s, height: 12 * s), xRadius: 6 * s, yRadius: 6 * s).fill()
-            }
-
-            // Luminous Heading 1 bar (Theme.headingInk #16171B)
-            let h1H: CGFloat = 44 * s
-            let h1Y: CGFloat = folioRect.maxY - 183 * s
-            color(0.085, 0.092, 0.108).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: h1Y, width: maxLineW * 0.66, height: h1H), xRadius: h1H / 2, yRadius: h1H / 2).fill()
-
-            // Body prose lines (Theme.ink #2A2D32)
-            let pH: CGFloat = 28 * s
-            color(0.165, 0.175, 0.195, 0.86).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 262 * s, width: maxLineW * 0.92, height: pH), xRadius: pH / 2, yRadius: pH / 2).fill()
-
-            NSBezierPath(roundedRect: NSRect(x: contentLeft, y: folioRect.maxY - 318 * s, width: maxLineW * 0.84, height: pH), xRadius: pH / 2, yRadius: pH / 2).fill()
-
-            // Active writing line + inline `code` capsule + Bike-style coral caret
-            let activeY: CGFloat = folioRect.maxY - 374 * s
-            // Inline code pill in Midnight Periwinkle / Coral tint
-            let codeW: CGFloat = maxLineW * 0.26
-            let codeRect = NSRect(x: contentLeft, y: activeY - 4 * s, width: codeW, height: pH + 8 * s)
-            color(0.915, 0.938, 0.978).setFill() // botanical inlineCodeFill
-            let codePath = NSBezierPath(roundedRect: codeRect, xRadius: 10 * s, yRadius: 10 * s)
-            codePath.fill()
-            color(0.245, 0.420, 0.825, 0.55).setStroke()
-            codePath.lineWidth = max(1.0, 4 * s)
-            codePath.stroke()
-
-            color(0.180, 0.380, 0.780).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft + 14 * s, y: activeY + 3 * s, width: codeW - 28 * s, height: pH - 6 * s), xRadius: (pH - 6 * s) / 2, yRadius: (pH - 6 * s) / 2).fill()
-
-            // Continuing prose segment on active line
-            let segX = contentLeft + codeW + 18 * s
-            let segW = maxLineW * 0.32
-            color(0.165, 0.175, 0.195, 0.86).setFill()
-            NSBezierPath(roundedRect: NSRect(x: segX, y: activeY, width: segW, height: pH), xRadius: pH / 2, yRadius: pH / 2).fill()
-
-            // Live Coral-Rose Caret right after active prose segment
-            let caretX = segX + segW + 16 * s
-            let caretW = max(2.0, 14 * s)
-            let caretH = 46 * s
-            color(0.820, 0.310, 0.270).setFill()
-            NSBezierPath(roundedRect: NSRect(x: caretX, y: activeY - 9 * s, width: caretW, height: caretH), xRadius: caretW / 2, yRadius: caretW / 2).fill()
-
-            // Checked checklist item (Sage green celadon seal)
-            let checkY: CGFloat = folioRect.maxY - 456 * s
-            let boxSize: CGFloat = 38 * s
-            let boxRect = NSRect(x: contentLeft, y: checkY - 5 * s, width: boxSize, height: boxSize)
-            color(0.235, 0.525, 0.455).setFill() // Theme.sage
-            NSBezierPath(roundedRect: boxRect, xRadius: 10 * s, yRadius: 10 * s).fill()
-
-            // Crisp checkmark inside checkbox
-            let checkPath = NSBezierPath()
-            checkPath.move(to: NSPoint(x: boxRect.minX + 9 * s, y: boxRect.minY + 19 * s))
-            checkPath.line(to: NSPoint(x: boxRect.minX + 17 * s, y: boxRect.minY + 10 * s))
-            checkPath.line(to: NSPoint(x: boxRect.minX + 30 * s, y: boxRect.minY + 27 * s))
-            checkPath.lineWidth = max(1.5, 6.5 * s)
-            checkPath.lineCapStyle = .round
-            checkPath.lineJoinStyle = .round
-            color(0.988, 0.985, 0.976).setStroke()
-            checkPath.stroke()
-
-            // Checklist text bar
-            color(0.420, 0.430, 0.455, 0.72).setFill()
-            NSBezierPath(roundedRect: NSRect(x: contentLeft + boxSize + 20 * s, y: checkY, width: maxLineW * 0.58, height: pH), xRadius: pH / 2, yRadius: pH / 2).fill()
-
-            // Bottom Recessed Attachment / OCR Companion Pill (dump-first screenshot/PDF card)
-            let cardH: CGFloat = 86 * s
-            let cardY: CGFloat = folioRect.minY + 46 * s
-            let cardRect = NSRect(x: contentLeft, y: cardY, width: maxLineW, height: cardH)
-            let cardPath = NSBezierPath(roundedRect: cardRect, xRadius: 22 * s, yRadius: 22 * s)
-            color(0.932, 0.928, 0.915).setFill() // Theme.codeBackground studyLight
-            cardPath.fill()
-            color(0.825, 0.818, 0.800).setStroke() // Theme.codeBorder studyLight
-            cardPath.lineWidth = max(1.0, 4 * s)
-            cardPath.stroke()
-
-            // Mini Neo-Acid / Sage OCR spark badge inside attachment pill
-            let iconBoxSize: CGFloat = 52 * s
-            let iconBoxRect = NSRect(x: cardRect.minX + 18 * s, y: cardY + (cardH - iconBoxSize) / 2, width: iconBoxSize, height: iconBoxSize)
-            color(0.075, 0.078, 0.090).setFill() // Obsidian pill badge
-            NSBezierPath(roundedRect: iconBoxRect, xRadius: 14 * s, yRadius: 14 * s).fill()
-
-            // Neo-Acid Lime spark dot/bars inside badge (#C5F82A -> 0.773, 0.973, 0.165)
-            color(0.773, 0.973, 0.165).setFill()
-            let miniW = iconBoxSize * 0.52
-            let miniH = 8 * s
-            NSBezierPath(roundedRect: NSRect(x: iconBoxRect.minX + 12 * s, y: iconBoxRect.midY + 4 * s, width: miniW, height: miniH), xRadius: miniH / 2, yRadius: miniH / 2).fill()
-            color(0.455, 0.635, 0.965).setFill() // Midnight periwinkle second scan line
-            NSBezierPath(roundedRect: NSRect(x: iconBoxRect.minX + 12 * s, y: iconBoxRect.midY - 12 * s, width: miniW * 0.72, height: miniH), xRadius: miniH / 2, yRadius: miniH / 2).fill()
-
-            // Attachment title & OCR subtitle bars
-            let textLeft = iconBoxRect.maxX + 18 * s
-            color(0.165, 0.175, 0.195, 0.88).setFill()
-            NSBezierPath(roundedRect: NSRect(x: textLeft, y: cardY + 48 * s, width: maxLineW * 0.48, height: 18 * s), xRadius: 9 * s, yRadius: 9 * s).fill()
-            color(0.235, 0.525, 0.455, 0.90).setFill()
-            NSBezierPath(roundedRect: NSRect(x: textLeft, y: cardY + 22 * s, width: maxLineW * 0.30, height: 14 * s), xRadius: 7 * s, yRadius: 7 * s).fill()
+        func makeSlipBodyPath() -> NSBezierPath {
+            let p = NSBezierPath()
+            p.move(to: NSPoint(x: slipRect.minX, y: slipRect.minY))
+            p.line(to: NSPoint(x: slipRect.minX, y: slipRect.maxY - slipR))
+            p.appendArc(
+                withCenter: NSPoint(x: slipRect.minX + slipR, y: slipRect.maxY - slipR),
+                radius: slipR,
+                startAngle: 180,
+                endAngle: 90,
+                clockwise: true
+            )
+            p.line(to: NSPoint(x: slipRect.maxX - foldSize, y: slipRect.maxY))
+            p.line(to: NSPoint(x: slipRect.maxX, y: slipRect.maxY - foldSize))
+            p.line(to: NSPoint(x: slipRect.maxX, y: slipRect.minY))
+            p.close()
+            return p
         }
 
-        // Top catch-light along the folio edge
-        color(1.0, 1.0, 1.0, 0.85).setFill()
-        NSRect(x: folioRect.minX + 36 * s, y: folioRect.maxY - max(1.0, 4 * s), width: folioRect.width - 72 * s, height: max(1.0, 4 * s)).fill()
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: NSRect(x: coverClipRect.minX, y: slitY, width: coverClipRect.width, height: coverClipRect.maxY - slitY)).addClip()
 
-        NSGraphicsContext.restoreGraphicsState() // end folio clip
+        let slipBodyPath = makeSlipBodyPath()
 
-        // Crisp folio border
-        color(0.855, 0.850, 0.835, 0.95).setStroke()
-        folioPath.lineWidth = max(1.0, 4.0 * s)
-        folioPath.stroke()
+        // Slip soft ambient shadow onto plaster cover
+        if !isTiny {
+            NSGraphicsContext.saveGraphicsState()
+            let slipShadow = NSShadow()
+            slipShadow.shadowColor = color(0.05, 0.06, 0.08, 0.22)
+            slipShadow.shadowOffset = NSSize(width: 0, height: -8 * s)
+            slipShadow.shadowBlurRadius = 16 * s
+            slipShadow.set()
+            obsidianMid.setFill()
+            slipBodyPath.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
 
-        // Inner top catch-light of the Obsidian Desk Squircle
-        color(0.28, 0.31, 0.37, 0.55).setStroke()
-        let innerDeskRect = deskRect.insetBy(dx: max(0.5, 2.0 * s), dy: max(0.5, 2.0 * s))
-        let innerDeskPath = NSBezierPath(roundedRect: innerDeskRect, xRadius: deskRadius, yRadius: deskRadius)
-        innerDeskPath.lineWidth = max(1.0, 4.0 * s)
-        innerDeskPath.stroke()
+        // Fill obsidian slip with subtle top-to-bottom matte gradient
+        NSGraphicsContext.saveGraphicsState()
+        slipBodyPath.addClip()
+        let slipGrad = NSGradient(colors: [
+            color(0.175, 0.190, 0.215),
+            color(0.105, 0.118, 0.138),
+            color(0.075, 0.085, 0.100)
+        ], atLocations: [0.0, 0.62, 1.0], colorSpace: .sRGB)!
+        slipGrad.draw(in: slipRect, angle: -90)
 
-        NSGraphicsContext.restoreGraphicsState() // end desk clip
+        // Subtle inner darkening at pocket mouth where the slip enters the slot
+        if !isTiny {
+            let mouthShadow = NSGradient(colors: [
+                color(0.0, 0.0, 0.0, 0.40),
+                color(0.0, 0.0, 0.0, 0.0)
+            ])!
+            mouthShadow.draw(in: NSRect(x: slipRect.minX, y: slipRect.minY, width: slipRect.width, height: 20 * s), angle: 90)
+        }
         NSGraphicsContext.restoreGraphicsState()
 
+        // Folded Neo-Acid Lime Dog-Ear Corner Flap on top-right of slip
+        let flapR: CGFloat = isTiny ? 10.0 * s : 16.0 * s
+        let fx0 = slipRect.maxX - foldSize
+        let fy0 = slipRect.maxY - foldSize
+        let flapPath = NSBezierPath()
+        flapPath.move(to: NSPoint(x: fx0, y: slipRect.maxY))
+        flapPath.line(to: NSPoint(x: fx0, y: fy0 + flapR))
+        flapPath.appendArc(
+            withCenter: NSPoint(x: fx0 + flapR, y: fy0 + flapR),
+            radius: flapR,
+            startAngle: 180,
+            endAngle: 270,
+            clockwise: false
+        )
+        flapPath.line(to: NSPoint(x: slipRect.maxX, y: fy0))
+        flapPath.close()
+
+        // Crisp fold shadow cast by the acid flap onto the obsidian slip
+        if !isTiny {
+            NSGraphicsContext.saveGraphicsState()
+            slipBodyPath.addClip()
+            let flapShadow = NSShadow()
+            flapShadow.shadowColor = color(0.0, 0.0, 0.0, 0.55)
+            flapShadow.shadowOffset = NSSize(width: -5 * s, height: -6 * s)
+            flapShadow.shadowBlurRadius = 11 * s
+            flapShadow.set()
+            acidMain.setFill()
+            flapPath.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        flapPath.addClip()
+        let flapGrad = NSGradient(colors: [
+            acidBright,
+            acidMain,
+            acidDeep
+        ], atLocations: [0.0, 0.55, 1.0], colorSpace: .sRGB)!
+        flapGrad.draw(in: NSRect(x: fx0, y: fy0, width: foldSize, height: foldSize), angle: -135)
+
+        // Crisp specular crease highlight along the diagonal paper fold
+        if !isTiny {
+            let crease = NSBezierPath()
+            crease.move(to: NSPoint(x: fx0, y: slipRect.maxY))
+            crease.line(to: NSPoint(x: slipRect.maxX, y: fy0))
+            color(1.0, 1.0, 1.0, 0.45).setStroke()
+            crease.lineWidth = max(1.0, 3.0 * s)
+            crease.stroke()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSGraphicsContext.restoreGraphicsState() // end slip above-slit clip
+
+        NSGraphicsContext.restoreGraphicsState() // end plaster cover clip
+
+        // Subtle inner rim catch-light along the top edge of the outer obsidian board
+        if !isTiny {
+            color(1.0, 1.0, 1.0, 0.18).setStroke()
+            let innerRimPath = squirclePath(in: boardRect.insetBy(dx: 2.0 * s, dy: 2.0 * s), exponent: 4.55)
+            innerRimPath.lineWidth = max(1.0, 3.0 * s)
+            innerRimPath.stroke()
+        }
+
+        NSGraphicsContext.restoreGraphicsState() // end outer board clip
+
+        // 5. Sculptural Neo-Acid Bookmark Ribbon draping over the top-right edge of the book
+        let ribW: CGFloat = isTiny ? 154.0 * s : (isSmall ? 142.0 * s : 126.0 * s)
+        let ribTopOverhang: CGFloat = isTiny ? 0.0 : (isSmall ? 8.0 * s : 13.0 * s)
+        let ribH: CGFloat = isTiny ? 316.0 * s : (isSmall ? 304.0 * s : 288.0 * s)
+        let ribRightMargin: CGFloat = isTiny ? 132.0 * s : (isSmall ? 146.0 * s : 162.0 * s)
+        let ribX: CGFloat = boardRect.maxX - ribRightMargin - ribW
+        let ribTopY: CGFloat = boardRect.maxY + ribTopOverhang
+        let ribBotY: CGFloat = ribTopY - ribH
+        let notchDepth: CGFloat = isTiny ? 56.0 * s : 48.0 * s
+        let ribTopR: CGFloat = isTiny ? 14.0 * s : 14.0 * s
+
+        let ribbonPath = NSBezierPath()
+        ribbonPath.move(to: NSPoint(x: ribX, y: ribBotY))
+        ribbonPath.line(to: NSPoint(x: ribX, y: ribTopY - ribTopR))
+        ribbonPath.appendArc(
+            withCenter: NSPoint(x: ribX + ribTopR, y: ribTopY - ribTopR),
+            radius: ribTopR,
+            startAngle: 180,
+            endAngle: 90,
+            clockwise: true
+        )
+        ribbonPath.line(to: NSPoint(x: ribX + ribW - ribTopR, y: ribTopY))
+        ribbonPath.appendArc(
+            withCenter: NSPoint(x: ribX + ribW - ribTopR, y: ribTopY - ribTopR),
+            radius: ribTopR,
+            startAngle: 90,
+            endAngle: 0,
+            clockwise: true
+        )
+        ribbonPath.line(to: NSPoint(x: ribX + ribW, y: ribBotY))
+        ribbonPath.line(to: NSPoint(x: ribX + ribW * 0.5, y: ribBotY + notchDepth))
+        ribbonPath.close()
+
+        // Cast realistic ribbon shadow ONLY onto the book cover (clipped to boardPath)
+        if !isTiny {
+            NSGraphicsContext.saveGraphicsState()
+            boardPath.addClip()
+            let ribShadow = NSShadow()
+            ribShadow.shadowColor = color(0.05, 0.07, 0.04, 0.28)
+            ribShadow.shadowOffset = NSSize(width: 4 * s, height: -16 * s)
+            ribShadow.shadowBlurRadius = 24 * s
+            ribShadow.set()
+            acidMain.setFill()
+            ribbonPath.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        // Fill Neo-Acid ribbon with woven top-wrap highlight and rich chartreuse gradient
+        NSGraphicsContext.saveGraphicsState()
+        ribbonPath.addClip()
+
+        let ribRect = NSRect(x: ribX, y: ribBotY, width: ribW, height: ribH)
+        let ribGrad = NSGradient(colors: [
+            acidBright,
+            acidMain,
+            acidMain,
+            acidDeep
+        ], atLocations: [0.0, 0.15, 0.72, 1.0], colorSpace: .sRGB)!
+        ribGrad.draw(in: ribRect, angle: -90)
+
+        // Subtle rounded top-fold specular sheen where the ribbon wraps over the book's top edge
+        if !isTiny {
+            let foldSheen = NSGradient(colors: [
+                color(1.0, 1.0, 1.0, 0.44),
+                color(1.0, 1.0, 1.0, 0.0)
+            ])!
+            foldSheen.draw(in: NSRect(x: ribX, y: ribTopY - 36 * s, width: ribW, height: 36 * s), angle: -90)
+
+            // Soft edge shading for tactile grosgrain thickness
+            color(0.56, 0.78, 0.05, 0.24).setFill()
+            NSRect(x: ribX, y: ribBotY, width: max(1.0, 3.0 * s), height: ribH).fill()
+            NSRect(x: ribX + ribW - max(1.0, 3.0 * s), y: ribBotY, width: max(1.0, 3.0 * s), height: ribH).fill()
+        }
+
+        NSGraphicsContext.restoreGraphicsState()
+
+        // Delicate luminous chartreuse border so the ribbon reads crisply against pale plaster without looking outlined
+        color(0.54, 0.76, 0.04, isTiny ? 0.45 : 0.26).setStroke()
+        ribbonPath.lineWidth = max(0.8, 2.0 * s)
+        ribbonPath.stroke()
+
+        NSGraphicsContext.restoreGraphicsState()
         return rep
     }
 
