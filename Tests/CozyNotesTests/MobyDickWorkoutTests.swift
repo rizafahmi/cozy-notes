@@ -1973,7 +1973,10 @@ struct MobyDickWorkoutSuite {
         Theme.atmosphere = .study
         Theme.voice = .humanist
         let workspace = WorkspaceController(vault: vault)
-        defer { workspace.close() }
+        defer {
+            workspace.shutdown()
+            workspace.window?.orderOut(nil)
+        }
 
         workspace.cycleAtmosphere()
         #expect(Theme.atmosphere == .botanical)
@@ -2000,6 +2003,9 @@ struct MobyDickWorkoutSuite {
         #expect(h2Font.fontName == neoH2.fontName && abs(h2Font.pointSize - neoH2.pointSize) < 0.01)
         #expect(h3Font.fontName == neoH3.fontName && abs(h3Font.pointSize - neoH3.pointSize) < 0.01)
         #expect(proseFont.fontName == baselineBody.fontName)
+
+        workspace.shutdown()
+        workspace.window?.orderOut(nil)
 
         // Verify Neo-Acid atmosphere + Unbounded H1-H3 headings meet Moby-Dick layout, resize, typing, and memory budgets
         let report = try MobyDickWorkout.run(repeatCycles: 1, typingSample: "Whale")
