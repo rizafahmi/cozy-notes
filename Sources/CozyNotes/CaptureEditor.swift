@@ -8940,7 +8940,14 @@ import CozySearch
                     let ch = ns.character(at: p)
                     if ch == 0x20 || ch == 0x09 { p += 1 } else { break }
                 }
-                guard p < contentEnd else { continue }
+                guard p < contentEnd else {
+                    // TextKit 1 / CoreText collapses glyph locations on whitespace-only lines when .kern is non-zero,
+                    // causing the caret to snap back to column 0 after multiple spaces.
+                    if tracking != 0 {
+                        storage.addAttribute(.kern, value: CGFloat(0.0), range: NSRange(location: lineRange.location, length: contentLen))
+                    }
+                    continue
+                }
                 let mc = ns.character(at: p)
                 guard mc == 0x2D || mc == 0x2A || mc == 0x2B || (mc >= 0x30 && mc <= 0x39) else { continue }
                 let contentRange = NSRange(location: lineRange.location, length: contentLen)
