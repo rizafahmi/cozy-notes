@@ -401,9 +401,24 @@ import CozySearch
         let totalLength = storage.length
         guard totalLength > 0 else { return }
         let origin = textContainerOrigin
-        let queryRect = rect.offsetBy(dx: -origin.x, dy: -origin.y).insetBy(dx: 0, dy: -96)
+        let baseRect = rect.offsetBy(dx: -origin.x, dy: -origin.y)
+        let queryRect = baseRect.insetBy(dx: 0, dy: -96)
         if queryRect.width > 0 && queryRect.height > 0 {
-            layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
+            if totalLength > 65_536 {
+                let probeGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: baseRect, in: textContainer)
+                if probeGlyphs.length > 0 {
+                    let probeChars = layoutManager.characterRange(forGlyphRange: probeGlyphs, actualGlyphRange: nil)
+                    let ns = storage.mutableString
+                    let padStart = max(0, probeChars.location - 1200)
+                    let padEnd = min(totalLength, NSMaxRange(probeChars) + 2400)
+                    let padRange = ns.lineRange(for: NSRange(location: padStart, length: padEnd - padStart))
+                    layoutManager.ensureLayout(forCharacterRange: padRange)
+                } else {
+                    layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
+                }
+            } else {
+                layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
+            }
         }
         guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !tagItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !horizontalRuleRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         let columnWidth = max(0, bounds.width - 2 * origin.x)
@@ -5327,8 +5342,8 @@ import CozySearch
             }
             if let anchorChar, let lm = textView.layoutManager, let storage = textView.textStorage, storage.length > 0 {
                 let ns = storage.mutableString as NSString
-                let start = max(0, anchorChar - 600)
-                let end = min(ns.length, anchorChar + 2400)
+                let start = max(0, anchorChar - 2400)
+                let end = min(ns.length, anchorChar + 4200)
                 let windowRange = ns.lineRange(for: NSRange(location: start, length: end - start))
                 lm.ensureLayout(forCharacterRange: windowRange)
                 let glyphIdx = lm.glyphIndexForCharacter(at: min(anchorChar, ns.length - 1))

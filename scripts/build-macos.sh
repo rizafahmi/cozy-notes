@@ -65,7 +65,7 @@ done
 swift build -c "$configuration"
 bin="$(swift build -c "$configuration" --show-bin-path)"
 
-if [[ ! -f packaging/AppIcon.icns ]]; then
+if [[ ! -f packaging/AppIcon.icns || packaging/generate-icon.swift -nt packaging/AppIcon.icns ]]; then
     swift packaging/generate-icon.swift
 fi
 
@@ -131,6 +131,11 @@ if [[ ${#running_pids[@]} -gt 0 ]]; then
     done
 fi
 
+icon_changed=0
+if [[ -f "$dest_app/Contents/Resources/AppIcon.icns" ]] && ! cmp -s "$app/Contents/Resources/AppIcon.icns" "$dest_app/Contents/Resources/AppIcon.icns"; then
+    icon_changed=1
+fi
+
 install_staging="$install_dir/.Cozy Notes.app.staging.$$"
 rm -rf -- "$install_staging"
 ditto "$app" "$install_staging"
@@ -138,7 +143,11 @@ codesign --verify --deep --strict "$install_staging"
 rm -rf -- "$dest_app"
 mv "$install_staging" "$dest_app"
 install_staging=""
+touch "$dest_app" "$dest_app/Contents/Info.plist" "$dest_app/Contents/Resources/AppIcon.icns"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dest_app" >/dev/null 2>&1 || true
+if [[ "$icon_changed" -eq 1 ]]; then
+    killall Dock >/dev/null 2>&1 || true
+fi
 
 printf 'Installed App: %s\n' "$dest_app"
 

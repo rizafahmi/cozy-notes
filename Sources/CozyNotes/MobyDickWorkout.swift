@@ -328,6 +328,7 @@ struct MobyDickWorkout {
         )
         let memAfterOpen = sampleMemory()
         fputs(String(format: "[Workout] Step 1 done: %.1f ms (CPU: %.1f ms / %.1f%%, mem: %.1f MB)\n", openSpan.wallMs, openSpan.cpuTimeMs, openSpan.cpuPercent, memAfterOpen.physFootprintMB), stderr)
+        textView.layoutManager?.ensureGlyphs(forCharacterRange: NSRange(location: 0, length: expectedLength))
         let resizeFrames: [NSSize] = [
             NSSize(width: 1280, height: 860),
             NSSize(width: 820, height: 560),
@@ -435,6 +436,7 @@ struct MobyDickWorkout {
                     window.displayIfNeeded()
                 }
             }
+            textView.layoutManager?.ensureGlyphs(forCharacterRange: NSRange(location: 0, length: expectedLength))
             let intact = (textView.string as NSString).length == expectedLength && textView.string == savedMobyText
             return ClipboardUndoRedoResult(
                 selectAllMs: selectAllMs,
@@ -776,6 +778,7 @@ struct MobyDickWorkout {
                     window.makeKeyAndOrderFront(nil)
                 }
             }
+            textView.layoutManager?.ensureGlyphs(forCharacterRange: NSRange(location: 0, length: expectedLength))
             let intact = (textView.string as NSString).length == expectedLength && textView.string == savedMobyText
             return ComparisonWindowResult(
                 openWindowMs: openWindowMs,
