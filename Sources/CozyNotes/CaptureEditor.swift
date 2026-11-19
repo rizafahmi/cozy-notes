@@ -405,16 +405,28 @@ import CozySearch
         let queryRect = baseRect.insetBy(dx: 0, dy: -96)
         if queryRect.width > 0 && queryRect.height > 0 {
             if totalLength > 65_536 {
-                let probeGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: baseRect, in: textContainer)
+                var probeGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: baseRect, in: textContainer)
+                if probeGlyphs.length == 0 {
+                    let visBase = visibleRect.offsetBy(dx: -origin.x, dy: -origin.y)
+                    probeGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: visBase, in: textContainer)
+                }
+                let ns = storage.mutableString
                 if probeGlyphs.length > 0 {
                     let probeChars = layoutManager.characterRange(forGlyphRange: probeGlyphs, actualGlyphRange: nil)
-                    let ns = storage.mutableString
                     let padStart = max(0, probeChars.location - 1200)
                     let padEnd = min(totalLength, NSMaxRange(probeChars) + 2400)
                     let padRange = ns.lineRange(for: NSRange(location: padStart, length: padEnd - padStart))
                     layoutManager.ensureLayout(forCharacterRange: padRange)
+                } else if queryRect.minY <= 1200 {
+                    let headRange = ns.lineRange(for: NSRange(location: 0, length: min(totalLength, 4800)))
+                    layoutManager.ensureLayout(forCharacterRange: headRange)
                 } else {
-                    layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
+                    let ratio = min(1.0, max(0.0, queryRect.minY / max(1.0, bounds.height)))
+                    let estChar = min(totalLength - 1, Int(Double(totalLength) * ratio))
+                    let padStart = max(0, estChar - 2400)
+                    let padEnd = ratio > 0.92 ? totalLength : min(totalLength, estChar + 4200)
+                    let padRange = ns.lineRange(for: NSRange(location: padStart, length: padEnd - padStart))
+                    layoutManager.ensureLayout(forCharacterRange: padRange)
                 }
             } else {
                 layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
@@ -5348,7 +5360,11 @@ import CozySearch
                 lm.ensureLayout(forCharacterRange: windowRange)
                 let glyphIdx = lm.glyphIndexForCharacter(at: min(anchorChar, ns.length - 1))
                 let rect = lm.boundingRect(forGlyphRange: NSRange(location: glyphIdx, length: 0), in: container)
-                let targetY = max(0, rect.minY + textView.textContainerOrigin.y)
+                let rawTargetY = max(0, rect.minY + textView.textContainerOrigin.y)
+                let docHeight = textView.bounds.height
+                let targetY = docHeight > clipView.bounds.height
+                    ? min(rawTargetY, max(0, docHeight - clipView.bounds.height))
+                    : rawTargetY
                 clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
                 scroll.reflectScrolledClipView(clipView)
             }
@@ -8940,7 +8956,14 @@ import CozySearch
                     let ch = ns.character(at: p)
                     if ch == 0x20 || ch == 0x09 { p += 1 } else { break }
                 }
-                guard p < contentEnd else { continue }
+                guard p < contentEnd else {
+                    // TextKit 1 / CoreText collapses glyph locations on whitespace-only lines when .kern is non-zero,
+                    // causing the caret to snap back to column 0 after multiple spaces.
+                    if tracking != 0 {
+                        storage.addAttribute(.kern, value: CGFloat(0.0), range: NSRange(location: lineRange.location, length: contentLen))
+                    }
+                    continue
+                }
                 let mc = ns.character(at: p)
                 guard mc == 0x2D || mc == 0x2A || mc == 0x2B || (mc >= 0x30 && mc <= 0x39) else { continue }
                 let contentRange = NSRange(location: lineRange.location, length: contentLen)
