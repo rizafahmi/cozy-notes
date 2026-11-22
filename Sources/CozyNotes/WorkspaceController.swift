@@ -117,6 +117,123 @@ import CozySearch
     @objc private func keepCopyTapped() { onKeepCopy?() }
 }
 
+struct OutlineWindowStretchState: Equatable {
+    private(set) var appliedWidthDelta: CGFloat = 0
+    private(set) var appliedOriginXDelta: CGFloat = 0
+    private(set) var stretchedOriginX: CGFloat = 0
+
+    mutating func frameForVisibilityChange(
+        visible: Bool,
+        currentFrame: NSRect,
+        minWidth: CGFloat,
+        visibleScreenFrame: NSRect?,
+        isFullScreen: Bool,
+        railWidth: CGFloat = CaptureEditor.outlineTotalWidth
+    ) -> NSRect? {
+        if visible {
+            guard !isFullScreen, railWidth > 0 else {
+                reset()
+                return nil
+            }
+            if let screen = visibleScreenFrame {
+                let maxWidth = screen.width
+                guard currentFrame.width < maxWidth - 0.5 else {
+                    reset()
+                    return nil
+                }
+                let targetWidth = min(currentFrame.width + railWidth, maxWidth)
+                let widthDelta = targetWidth - currentFrame.width
+                guard widthDelta > 0.5 else {
+                    reset()
+                    return nil
+                }
+                let targetOriginX: CGFloat = if currentFrame.minX + targetWidth > screen.maxX {
+                    max(screen.minX, screen.maxX - targetWidth)
+                } else {
+                    currentFrame.minX
+                }
+                appliedWidthDelta = widthDelta
+                appliedOriginXDelta = targetOriginX - currentFrame.minX
+                stretchedOriginX = targetOriginX
+                return NSRect(
+                    x: targetOriginX,
+                    y: currentFrame.origin.y,
+                    width: targetWidth,
+                    height: currentFrame.height
+                )
+            } else {
+                let targetWidth = currentFrame.width + railWidth
+                appliedWidthDelta = railWidth
+                appliedOriginXDelta = 0
+                stretchedOriginX = currentFrame.minX
+                return NSRect(
+                    x: currentFrame.minX,
+                    y: currentFrame.origin.y,
+                    width: targetWidth,
+                    height: currentFrame.height
+                )
+            }
+        } else {
+            let widthDelta = appliedWidthDelta
+            let originXDelta = appliedOriginXDelta
+            let recordedStretchedOriginX = stretchedOriginX
+            reset()
+            guard !isFullScreen, widthDelta > 0.5 else {
+                return nil
+            }
+            let effectiveMinWidth = max(1, minWidth)
+            let targetWidth = max(effectiveMinWidth, currentFrame.width - widthDelta)
+            guard abs(targetWidth - currentFrame.width) > 0.5 else {
+                return nil
+            }
+            var targetOriginX = currentFrame.minX
+            if abs(originXDelta) > 0.5, abs(currentFrame.minX - recordedStretchedOriginX) < 1.0 {
+                targetOriginX = currentFrame.minX - originXDelta
+                if let screen = visibleScreenFrame {
+                    targetOriginX = min(max(screen.minX, targetOriginX), max(screen.minX, screen.maxX - targetWidth))
+                }
+            }
+            return NSRect(
+                x: targetOriginX,
+                y: currentFrame.origin.y,
+                width: targetWidth,
+                height: currentFrame.height
+            )
+        }
+    }
+
+    @MainActor
+    mutating func applyVisibilityChange(_ visible: Bool, to window: NSWindow?) {
+        guard let window else {
+            if !visible { reset() }
+            return
+        }
+        let screenFrame = (window.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+        let isFullScreen = window.styleMask.contains(.fullScreen)
+        if let nextFrame = frameForVisibilityChange(
+            visible: visible,
+            currentFrame: window.frame,
+            minWidth: window.minSize.width,
+            visibleScreenFrame: screenFrame,
+            isFullScreen: isFullScreen
+        ) {
+            window.setFrame(nextFrame, display: window.isVisible)
+            window.contentView?.layoutSubtreeIfNeeded()
+        }
+    }
+
+    mutating func clearOriginShift() {
+        appliedOriginXDelta = 0
+        stretchedOriginX = 0
+    }
+
+    mutating func reset() {
+        appliedWidthDelta = 0
+        appliedOriginXDelta = 0
+        stretchedOriginX = 0
+    }
+}
+
 @MainActor final class WorkspaceController: NSWindowController, NSWindowDelegate {
     let vault: Vault
     let editor = CaptureEditor(frame: .zero)
@@ -150,6 +267,7 @@ import CozySearch
     private var bannerTrailingConstraint: NSLayoutConstraint?
     private var bannerTopConstraint: NSLayoutConstraint?
     private var bannerHeightConstraint: NSLayoutConstraint?
+    private var outlineStretchState = OutlineWindowStretchState()
     private(set) var isSidebarCollapsed = false
     private(set) var noteURL: URL? {
         didSet {
@@ -416,7 +534,11 @@ import CozySearch
         editor.onOpenCurrentNoteInNewWindow = { [weak self] in self?.openCurrentNoteInNewWindow() }
         editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
         editor.onQuickSwitcher = { [weak self] in self?.toggleQuickSwitcher() }
-        editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
+        editor.onOutlineVisibilityChange = { [weak self] visible in
+            guard let self else { return }
+            self.outlineStretchState.applyVisibilityChange(visible, to: self.window)
+            self.updateEditorChrome()
+        }
         editor.onSemanticVisibilityChange = { [weak self] _ in
             guard let self else { return }
             self.updateEditorChrome()
@@ -493,6 +615,20 @@ import CozySearch
     @objc func toggleOutline() {
         editor.toggleOutline()
         updateEditorChrome()
+    }
+
+    func baseWindowFrameForReplacement() -> NSRect? {
+        guard let window else { return nil }
+        guard editor.isOutlineVisible else { return window.frame }
+        var state = outlineStretchState
+        let screenFrame = (window.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+        return state.frameForVisibilityChange(
+            visible: false,
+            currentFrame: window.frame,
+            minWidth: window.minSize.width,
+            visibleScreenFrame: screenFrame,
+            isFullScreen: window.styleMask.contains(.fullScreen)
+        ) ?? window.frame
     }
 
     @objc func toggleAppearance() {
@@ -1846,6 +1982,7 @@ import CozySearch
     private var noteAvailable = true
     private var autosave: Timer?
     private var isClosingAfterDeletion = false
+    private var outlineStretchState = OutlineWindowStretchState()
 
     var onDidSaveNote: ((URL, String) -> Void)?
     var onOpenInMainWorkspace: ((URL) -> Void)?
@@ -2008,7 +2145,11 @@ import CozySearch
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
         editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
         editor.onQuickSwitcher = { [weak self] in self?.onQuickSwitcher?() }
-        editor.onOutlineVisibilityChange = { [weak self] _ in self?.updateEditorChrome() }
+        editor.onOutlineVisibilityChange = { [weak self] visible in
+            guard let self else { return }
+            self.outlineStretchState.applyVisibilityChange(visible, to: self.window)
+            self.updateEditorChrome()
+        }
         editor.onSemanticVisibilityChange = { [weak self] _ in
             self?.updateEditorChrome()
             self?.onSemanticVisibilityDidChange?()

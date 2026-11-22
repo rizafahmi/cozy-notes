@@ -82,7 +82,7 @@ import CozyCore
         wireWorkspace(nextWorkspace)
         let replaced = targetWorkspace ?? workspaces.first
         if let replaced, let idx = workspaces.firstIndex(where: { $0 === replaced }) {
-            if let oldFrame = replaced.window?.frame {
+            if let oldFrame = replaced.baseWindowFrameForReplacement() {
                 nextWorkspace.window?.setFrame(oldFrame, display: false)
             }
             replaced.shutdown()
@@ -280,7 +280,9 @@ import CozyCore
     @objc private func showWorkspace() { workspace?.showAndFocus() }
     @objc private func toggleSidebar() { workspace?.toggleSidebar(); workspace?.showWindow(nil) }
     @objc private func toggleOutline() {
-        if let noteWin = workspace?.activeNoteWindowController {
+        if NSApp.keyWindow === quickCapture?.window {
+            quickCapture?.editor.toggleOutline()
+        } else if let noteWin = workspace?.activeNoteWindowController {
             noteWin.toggleOutline()
         } else {
             workspace?.toggleOutline()

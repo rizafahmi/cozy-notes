@@ -7,6 +7,7 @@ import CozyCore
     var onCapture: (() -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
     private var previousApp: NSRunningApplication?
+    private var outlineStretchState = OutlineWindowStretchState()
 
     init(vault: Vault) {
         self.vault = vault
@@ -30,6 +31,10 @@ import CozyCore
         panel.delegate = self
         editor.noteRecordsProvider = { [weak self] in (try? self?.vault.notes()) ?? [] }
         editor.onOpenWikiLink = { [weak self] link in self?.onOpenWikiLink?(link) }
+        editor.onOutlineVisibilityChange = { [weak self] visible in
+            guard let self else { return }
+            self.outlineStretchState.applyVisibilityChange(visible, to: self.window)
+        }
 
         let headerLabel = Theme.label("Quick capture", size: 11.5, color: Theme.muted)
         let header = NSView()
@@ -66,6 +71,7 @@ import CozyCore
         let frontmost = NSWorkspace.shared.frontmostApplication
         previousApp = frontmost?.processIdentifier != ProcessInfo.processInfo.processIdentifier ? frontmost : nil
         window?.center()
+        outlineStretchState.clearOriginShift()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         editor.focus()

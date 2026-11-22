@@ -4998,8 +4998,8 @@ import CozySearch
         let hiddenLineCount: Int
     }
 
-    static let railWidth: CGFloat = 228
-    static let rowHeight: CGFloat = 30
+    nonisolated static let railWidth: CGFloat = 228
+    nonisolated static let rowHeight: CGFloat = 30
 
     var items: [Item] = [] {
         didSet {
@@ -5046,7 +5046,7 @@ import CozySearch
         foldButton.toolTip = "Cycle section folding (Overview / Headings / All)"
 
         closeButton = QuietButton(symbol: "xmark", target: self, action: #selector(closeTapped))
-        closeButton.toolTip = "Hide Outline (⇧⌘O)"
+        closeButton.toolTip = "Hide Outline (⌥⌘\\)"
         closeButton.setAccessibilityLabel("Hide Outline")
 
         let spacer = NSView()
@@ -5122,7 +5122,7 @@ import CozySearch
         canvas.needsDisplay = true
     }
 
-    private func scrollActiveRowIntoView() {
+    func scrollActiveRowIntoView() {
         guard items.indices.contains(activeIndex) else { return }
         let rowRect = canvas.rectForRow(activeIndex).insetBy(dx: 0, dy: -8)
         canvas.scrollToVisible(rowRect)
@@ -5372,6 +5372,7 @@ import CozySearch
     private var activeLinkPreferredPoint: NSPoint?
     private var linkActionGeneration: UInt64 = 0
     let inNoteFindBar = InNoteFindBar(frame: .zero)
+    nonisolated static let outlineTotalWidth: CGFloat = DocumentOutlineView.railWidth + 1
     let outlineView = DocumentOutlineView(frame: .zero)
     private let outlineDivider = HairlineView()
     private var scrollTrailingToEditorConstraint: NSLayoutConstraint?
@@ -6403,9 +6404,12 @@ import CozySearch
         if visible {
             refreshOutline()
         }
+        onOutlineVisibilityChange?(visible)
         needsLayout = true
         layoutSubtreeIfNeeded()
-        onOutlineVisibilityChange?(visible)
+        if visible {
+            outlineView.scrollActiveRowIntoView()
+        }
     }
 
     @objc func toggleSemanticConnections() {
