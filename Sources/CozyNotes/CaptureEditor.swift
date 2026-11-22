@@ -314,6 +314,7 @@ import CozySearch
     }
     var pendingEdit: EditRecord?
     var isEditingText = false
+    var baseTypingAttributes: [NSAttributedString.Key: Any] = [:]
     var cachedFullText: String = ""
     var cachedFullTextLength: Int = 0
     var cachedFullTextSig: Int = 0
@@ -3634,8 +3635,11 @@ import CozySearch
                 }
                 storage.beginEditing()
                 storage.replaceCharacters(in: safeRange, with: replacement)
-                if wasEmpty && repLen > 0 && !self.typingAttributes.isEmpty {
-                    storage.setAttributes(self.typingAttributes, range: NSRange(location: 0, length: repLen))
+                if wasEmpty && repLen > 0 {
+                    let seedAttrs = self.baseTypingAttributes.isEmpty ? self.typingAttributes : self.baseTypingAttributes
+                    if !seedAttrs.isEmpty {
+                        storage.setAttributes(seedAttrs, range: NSRange(location: 0, length: repLen))
+                    }
                 }
                 storage.endEditing()
                 self.viewportPreservationDepth -= 1
@@ -3720,6 +3724,14 @@ import CozySearch
 
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting stillSelectingFlag: Bool) {
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelectingFlag)
+        if !baseTypingAttributes.isEmpty {
+            let fg = typingAttributes[.foregroundColor] as? NSColor
+            let pt = (typingAttributes[.font] as? NSFont)?.pointSize ?? Theme.baseProseSize
+            let spacing = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)?.paragraphSpacing ?? 11.5
+            if fg == nil || fg == .clear || pt < 2 || spacing > 24 {
+                typingAttributes = baseTypingAttributes
+            }
+        }
         guard !suppressCaretUpdates && !isEditingText else { return }
         updateCaret()
     }
@@ -4105,8 +4117,8 @@ import CozySearch
             }
         }
 
-        let fallbackFont = (typingAttributes[.font] as? NSFont) ?? font ?? Theme.bodyFont()
-        let fallbackPara = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)
+        let fallbackFont = (baseTypingAttributes[.font] as? NSFont) ?? (typingAttributes[.font] as? NSFont) ?? font ?? Theme.bodyFont()
+        let fallbackPara = (baseTypingAttributes[.paragraphStyle] as? NSParagraphStyle) ?? (typingAttributes[.paragraphStyle] as? NSParagraphStyle)
         let sampleFont: NSFont
         let samplePara: NSParagraphStyle?
         var activeLineContentEnd = 0
@@ -5902,13 +5914,57 @@ import CozySearch
                     shouldFullFormat = true
                 }
             }
+            let prevCursorLine = lastCursorLine
             if let edit, !shouldFullFormat {
-                didTouchAttributes = formatIncrementalEdit(edit)
+                let formattedRange = formatIncrementalEdit(edit)
+                didTouchAttributes = formattedRange != nil
+                if let storage = textView.textStorage {
+                    let ns = storage.mutableString as NSString
+                    let currentCursorLine = ns.length > 0
+                        ? ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, ns.length), length: 0))
+                        : NSRange(location: 0, length: 0)
+                    let shiftedPrevLine: NSRange?
+                    if prevCursorLine.location != NSNotFound, prevCursorLine.length > 0 {
+                        if NSMaxRange(prevCursorLine) <= edit.affectedRange.location, NSMaxRange(prevCursorLine) <= ns.length {
+                            shiftedPrevLine = prevCursorLine
+                        } else if prevCursorLine.location >= NSMaxRange(edit.affectedRange) {
+                            let shiftedLoc = prevCursorLine.location + edit.delta
+                            if shiftedLoc >= 0, shiftedLoc + prevCursorLine.length <= ns.length {
+                                shiftedPrevLine = NSRange(location: shiftedLoc, length: prevCursorLine.length)
+                            } else {
+                                shiftedPrevLine = nil
+                            }
+                        } else {
+                            shiftedPrevLine = nil
+                        }
+                    } else {
+                        shiftedPrevLine = nil
+                    }
+                    if let shiftedPrevLine, shiftedPrevLine != currentCursorLine {
+                        let prevAlreadyFormatted = formattedRange.map {
+                            $0.location <= shiftedPrevLine.location && NSMaxRange($0) >= NSMaxRange(shiftedPrevLine)
+                        } ?? false
+                        let currAlreadyFormatted = formattedRange.map {
+                            $0.location <= currentCursorLine.location && NSMaxRange($0) >= NSMaxRange(currentCursorLine)
+                        } ?? false
+                        let oldToRefresh = prevAlreadyFormatted ? NSRange(location: NSNotFound, length: 0) : shiftedPrevLine
+                        let newToRefresh = currAlreadyFormatted ? NSRange(location: NSNotFound, length: 0) : currentCursorLine
+                        if oldToRefresh.location != NSNotFound || newToRefresh.location != NSNotFound {
+                            refreshCursorDependentLines(oldLine: oldToRefresh, newLine: newToRefresh)
+                        }
+                    }
+                }
             } else {
                 if let edit, edit.delta != 0 {
                     textView.shiftFoldedSections(from: NSMaxRange(edit.affectedRange), by: edit.delta)
                 }
                 formatMarkdown()
+                if let storage = textView.textStorage {
+                    let ns = storage.mutableString as NSString
+                    lastCursorLine = ns.length > 0
+                        ? ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, ns.length), length: 0))
+                        : NSRange(location: 0, length: 0)
+                }
                 didTouchAttributes = true
             }
             if didTouchAttributes, textView.hasMarkedText(), let storage = textView.textStorage {
@@ -7684,9 +7740,39 @@ import CozySearch
         return false
     }
 
+    private static func hasNonProseBaseAttributes(
+        in storage: NSTextStorage,
+        at index: Int,
+        expectedFont: NSFont?
+    ) -> Bool {
+        let attrs = storage.attributes(at: index, effectiveRange: nil)
+        guard let fg = attrs[.foregroundColor] as? NSColor, fg === Theme.ink || fg == Theme.ink else {
+            return true
+        }
+        if let expectedFont {
+            guard let font = attrs[.font] as? NSFont, font == expectedFont else {
+                return true
+            }
+        } else if let font = attrs[.font] as? NSFont, abs(font.pointSize - Theme.baseProseSize) > 0.05 {
+            return true
+        }
+        guard let para = attrs[.paragraphStyle] as? NSParagraphStyle,
+              abs(para.paragraphSpacing - 11.5) < 0.05,
+              abs(para.lineSpacing - 8.0) < 0.05,
+              para.paragraphSpacingBefore == 0,
+              para.firstLineHeadIndent == 0,
+              para.headIndent == 0 else {
+            return true
+        }
+        if (attrs[.underlineStyle] as? Int ?? 0) != 0 || (attrs[.strikethroughStyle] as? Int ?? 0) != 0 {
+            return true
+        }
+        return false
+    }
+
     @discardableResult
-    private func formatIncrementalEdit(_ edit: MarkdownTextView.EditRecord) -> Bool {
-        guard !isFormatting, let storage = textView.textStorage else { return false }
+    private func formatIncrementalEdit(_ edit: MarkdownTextView.EditRecord) -> NSRange? {
+        guard !isFormatting, let storage = textView.textStorage else { return nil }
         isFormatting = true
         defer { isFormatting = false }
         let ns = storage.mutableString as NSString
@@ -7710,8 +7796,13 @@ import CozySearch
             || textView.bulletItems.contains { NSIntersectionRange($0.lineRange, oldLineRange).length > 0 || $0.lineRange.location == oldLineRange.location }
 
         let newHasSyntax = lineHasMarkdownSyntax(ns, lineRange: newLineRange)
-        let missingBaseAttrs = newLineRange.length > 0
-            && storage.attribute(.foregroundColor, at: newLineRange.location, effectiveRange: nil) == nil
+        let expectedFont = (textView.baseTypingAttributes[.font] as? NSFont) ?? (textView.typingAttributes[.font] as? NSFont)
+        let missingBaseAttrs = (newLineRange.length > 0
+            && Self.hasNonProseBaseAttributes(in: storage, at: newLineRange.location, expectedFont: expectedFont))
+            || (edit.replacementLength > 0 && editLoc < newLen && editLoc != newLineRange.location
+                && Self.hasNonProseBaseAttributes(in: storage, at: editLoc, expectedFont: expectedFont))
+            || (edit.replacementLength > 0 && editEnd < newLen && editEnd != newLineRange.location && editEnd != editLoc
+                && Self.hasNonProseBaseAttributes(in: storage, at: editEnd, expectedFont: expectedFont))
 
         if edit.affectedRange.length == 0 && !hadItemsInOldLine && !newHasSyntax && !missingBaseAttrs {
             // Fast path for plain prose editing: shift subsequent decoration ranges without touching NSTextStorage attributes
@@ -7768,7 +7859,7 @@ import CozySearch
                 textView.shiftFoldedSections(from: shiftStart, by: delta)
             }
             lastCursorLine = ns.lineRange(for: NSRange(location: min(textView.selectedRange().location, newLen), length: 0))
-            return false
+            return nil
         }
 
         var newQuotes: [NSRange] = []
@@ -7957,7 +8048,7 @@ import CozySearch
         applyEditorChromeAttributes()
 
         lastCursorLine = ns.lineRange(for: NSRange(location: min(cursor.location, newLen), length: 0))
-        return true
+        return newLineRange
     }
 
     private static func shiftRange(_ range: NSRange, by delta: Int) -> NSRange {
@@ -8009,6 +8100,7 @@ import CozySearch
         ]
         textView.insertionPointColor = Theme.accent
         textView.refreshCaretAppearance()
+        textView.baseTypingAttributes = baseAttrs
         textView.typingAttributes = baseAttrs
     }
 

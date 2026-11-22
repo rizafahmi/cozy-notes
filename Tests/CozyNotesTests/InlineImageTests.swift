@@ -442,6 +442,251 @@ private func verifyGeometryFoldingResizeContextMenuAndCompanionWindow() throws {
     }
 }
 
+@MainActor
+private func dispatchKey(
+    _ chars: String,
+    modifiers: NSEvent.ModifierFlags = [],
+    keyCode: UInt16 = 0,
+    ignoringModifiers: String? = nil,
+    to window: NSWindow
+) {
+    guard let event = NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: modifiers,
+        timestamp: ProcessInfo.processInfo.systemUptime,
+        windowNumber: window.windowNumber,
+        context: nil,
+        characters: chars,
+        charactersIgnoringModifiers: ignoringModifiers ?? chars,
+        isARepeat: false,
+        keyCode: keyCode
+    ) else { return }
+    window.sendEvent(event)
+}
+
+@MainActor
+private func assertCleanProseAttributesAndGeometry(
+    phrase: String,
+    in editor: CaptureEditor,
+    codeBase: Int
+) throws -> NSRect {
+    let textView = editor.textView
+    guard let storage = textView.textStorage,
+          let lm = textView.layoutManager,
+          let tc = textView.textContainer else {
+        throw NSError(domain: "InlineImageTests", code: codeBase, userInfo: [NSLocalizedDescriptionKey: "Missing text system"])
+    }
+    let range = editor.nsText.range(of: phrase)
+    guard range.location != NSNotFound, range.length > 0 else {
+        throw NSError(domain: "InlineImageTests", code: codeBase + 1, userInfo: [NSLocalizedDescriptionKey: "Missing phrase '\(phrase)' in:\n\(editor.text)"])
+    }
+    let expectedFont = Theme.bodyFont(Theme.baseProseSize)
+    for idx in range.location..<NSMaxRange(range) {
+        let color = storage.attribute(.foregroundColor, at: idx, effectiveRange: nil) as? NSColor
+        guard color == Theme.ink else {
+            throw NSError(
+                domain: "InlineImageTests",
+                code: codeBase + 2,
+                userInfo: [NSLocalizedDescriptionKey: "Expected Theme.ink for '\(phrase)' at \(idx), got \(String(describing: color))"]
+            )
+        }
+        let font = storage.attribute(.font, at: idx, effectiveRange: nil) as? NSFont
+        guard font == expectedFont else {
+            throw NSError(
+                domain: "InlineImageTests",
+                code: codeBase + 3,
+                userInfo: [NSLocalizedDescriptionKey: "Expected bodyFont for '\(phrase)' at \(idx), got \(String(describing: font))"]
+            )
+        }
+        let para = storage.attribute(.paragraphStyle, at: idx, effectiveRange: nil) as? NSParagraphStyle
+        guard let para, abs(para.paragraphSpacing - 11.5) < 0.1 else {
+            throw NSError(
+                domain: "InlineImageTests",
+                code: codeBase + 4,
+                userInfo: [NSLocalizedDescriptionKey: "Expected prose paragraphSpacing 11.5 for '\(phrase)' at \(idx), got \(String(describing: para?.paragraphSpacing))"]
+            )
+        }
+    }
+    let glyphs = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+    lm.ensureLayout(forGlyphRange: glyphs)
+    let box = lm.boundingRect(forGlyphRange: glyphs, in: tc)
+        .offsetBy(dx: textView.textContainerOrigin.x, dy: textView.textContainerOrigin.y)
+    guard box.width > 60 else {
+        throw NSError(
+            domain: "InlineImageTests",
+            code: codeBase + 5,
+            userInfo: [NSLocalizedDescriptionKey: "Expected full-width prose glyph advances for '\(phrase)', got width=\(box.width)"]
+        )
+    }
+    let frag = lm.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
+    guard frag.height < 48 else {
+        throw NSError(
+            domain: "InlineImageTests",
+            code: codeBase + 6,
+            userInfo: [NSLocalizedDescriptionKey: "Expected single-line prose fragment height (<48pt) for '\(phrase)', got \(frag.height)"]
+        )
+    }
+    return box
+}
+
+@MainActor
+private func verifyInlineImageVimOpenLineAndAdjacentTyping() throws {
+    let savedVim = Theme.vimModeEnabled
+    defer { Theme.vimModeEnabled = savedVim }
+    Theme.vimModeEnabled = false
+
+    let (workspace, vault, window, directory) = try makeInlineImageTestWorkspace()
+    defer {
+        workspace.shutdown()
+        window.orderOut(nil)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let sourceDir = directory.appendingPathComponent("AttachmentsInput", isDirectory: true)
+    try FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+    let firstPNG = sourceDir.appendingPathComponent("ml-lifecycle.png")
+    let secondPNG = sourceDir.appendingPathComponent("software-to-agents.png")
+    _ = try writeSyntheticPNG(to: firstPNG, pixelWidth: 800, pixelHeight: 360)
+    _ = try writeSyntheticPNG(to: secondPNG, pixelWidth: 800, pixelHeight: 360)
+
+    let editor = workspace.editor
+    let textView = editor.textView
+
+    // 1. Minimal Issue #23 repro: Insert inline image -> Enter Vim mode -> Shift-O -> check spacing -> type prose
+    let record1 = try vault.capture(text: "")
+    workspace.openNote(record1.url)
+    window.contentView?.layoutSubtreeIfNeeded()
+    guard window.makeFirstResponder(textView) else {
+        throw NSError(domain: "InlineImageTests", code: 60, userInfo: [NSLocalizedDescriptionKey: "Could not focus editor for minimal repro"])
+    }
+
+    editor.addAttachments([firstPNG], at: NSRange(location: 0, length: 0), animated: false)
+    window.contentView?.layoutSubtreeIfNeeded()
+    guard textView.inlineImageItems.count == 1 else {
+        throw NSError(domain: "InlineImageTests", code: 61, userInfo: [NSLocalizedDescriptionKey: "Expected 1 inline image after attach"])
+    }
+
+    Theme.vimModeEnabled = true
+    workspace.syncVimModePreference()
+    dispatchKey("\u{1B}", keyCode: 53, to: window) // Escape -> Normal mode
+    dispatchKey("O", modifiers: [.shift], keyCode: 31, ignoringModifiers: "O", to: window) // Shift-O
+    window.contentView?.layoutSubtreeIfNeeded()
+
+    let caretLocAfterShiftO = textView.selectedRange().location
+    guard let storage = textView.textStorage,
+          let lm = textView.layoutManager,
+          caretLocAfterShiftO < storage.length else {
+        throw NSError(domain: "InlineImageTests", code: 62, userInfo: [NSLocalizedDescriptionKey: "Expected inserted newline at caret after Shift-O"])
+    }
+    let openLinePara = storage.attribute(.paragraphStyle, at: caretLocAfterShiftO, effectiveRange: nil) as? NSParagraphStyle
+    guard let openLinePara, abs(openLinePara.paragraphSpacing - 11.5) < 0.1 else {
+        throw NSError(
+            domain: "InlineImageTests",
+            code: 63,
+            userInfo: [NSLocalizedDescriptionKey: "Expected normal 11.5pt paragraphSpacing right after Shift-O, got \(String(describing: openLinePara?.paragraphSpacing))"]
+        )
+    }
+    let openGlyph = lm.glyphIndexForCharacter(at: caretLocAfterShiftO)
+    lm.ensureLayout(forGlyphRange: NSRange(location: openGlyph, length: 1))
+    let openFrag = lm.lineFragmentRect(forGlyphAt: openGlyph, effectiveRange: nil)
+    guard openFrag.height < 48 else {
+        throw NSError(
+            domain: "InlineImageTests",
+            code: 64,
+            userInfo: [NSLocalizedDescriptionKey: "Expected normal single-line height after Shift-O (<48pt), got \(openFrag.height)"]
+        )
+    }
+
+    for ch in "Inductive notes" {
+        dispatchKey(String(ch), to: window)
+    }
+    window.contentView?.layoutSubtreeIfNeeded()
+    _ = try assertCleanProseAttributesAndGeometry(phrase: "Inductive notes", in: editor, codeBase: 70)
+
+    // 2. Back-to-back inline images (Screenshot 1 -> Screenshot 2 repro): Shift-O on second image + typing between two cards
+    let recordTwoImages = try vault.capture(text: "Seed")
+    let copied = try vault.copyAttachments([firstPNG, secondPNG], for: recordTwoImages.url)
+    guard copied.count == 2 else {
+        throw NSError(domain: "InlineImageTests", code: 80, userInfo: [NSLocalizedDescriptionKey: "Expected 2 copied attachments"])
+    }
+    let twoImageNote = """
+    ML Lifecycle is inductive
+
+    \(copied[0].markdown)
+    \(copied[1].markdown)
+
+    Reference
+    """
+    try vault.save(twoImageNote, to: recordTwoImages.url, expectedContent: try vault.read(recordTwoImages.url))
+    workspace.openNote(recordTwoImages.url)
+    window.contentView?.layoutSubtreeIfNeeded()
+    _ = window.makeFirstResponder(textView)
+
+    dispatchKey("\u{1B}", keyCode: 53, to: window)
+    let secondImageLoc = editor.nsText.range(of: "![software-to-agents").location
+    guard secondImageLoc != NSNotFound else {
+        throw NSError(domain: "InlineImageTests", code: 81, userInfo: [NSLocalizedDescriptionKey: "Missing second inline image in note"])
+    }
+    textView.setSelectedRange(NSRange(location: secondImageLoc, length: 0))
+    window.contentView?.layoutSubtreeIfNeeded()
+
+    dispatchKey("O", modifiers: [.shift], keyCode: 31, ignoringModifiers: "O", to: window)
+    for ch in "Bridge sentence" {
+        dispatchKey(String(ch), to: window)
+    }
+    dispatchKey("\u{1B}", keyCode: 53, to: window)
+    window.contentView?.layoutSubtreeIfNeeded()
+
+    let bridgeRect = try assertCleanProseAttributesAndGeometry(phrase: "Bridge sentence", in: editor, codeBase: 90)
+    guard textView.inlineImageItems.count == 2,
+          let firstCard = textView.inlineImageCardRect(for: textView.inlineImageItems[0]),
+          let secondCard = textView.inlineImageCardRect(for: textView.inlineImageItems[1]) else {
+        throw NSError(domain: "InlineImageTests", code: 98, userInfo: [NSLocalizedDescriptionKey: "Expected both inline image cards to render around bridge text"])
+    }
+    let gapAboveSecondCard = secondCard.minY - bridgeRect.maxY
+    guard bridgeRect.minY >= firstCard.maxY - 1.0, gapAboveSecondCard >= 0, gapAboveSecondCard < 56 else {
+        throw NSError(
+            domain: "InlineImageTests",
+            code: 99,
+            userInfo: [NSLocalizedDescriptionKey: "Unexpected vertical spacing between bridge text and image cards: firstMaxY=\(firstCard.maxY) bridge=\(bridgeRect) secondMinY=\(secondCard.minY) gap=\(gapAboveSecondCard)"]
+        )
+    }
+
+    // 3. Lowercase 'o' while cursor is directly on an active inline image line collapses departed raw syntax and formats new line cleanly
+    let firstImageLoc = editor.nsText.range(of: "![ml-lifecycle").location
+    textView.setSelectedRange(NSRange(location: firstImageLoc + 2, length: 0))
+    window.contentView?.layoutSubtreeIfNeeded()
+    let revealedBeforeO = storage.attribute(.foregroundColor, at: firstImageLoc + 2, effectiveRange: nil) as? NSColor
+    guard revealedBeforeO != .clear else {
+        throw NSError(domain: "InlineImageTests", code: 100, userInfo: [NSLocalizedDescriptionKey: "Expected raw image syntax visible before lowercase o"])
+    }
+    dispatchKey("o", keyCode: 31, ignoringModifiers: "o", to: window)
+    for ch in "Caption below" {
+        dispatchKey(String(ch), to: window)
+    }
+    window.contentView?.layoutSubtreeIfNeeded()
+    let collapsedAfterO = storage.attribute(.foregroundColor, at: firstImageLoc + 2, effectiveRange: nil) as? NSColor
+    guard collapsedAfterO == .clear else {
+        throw NSError(domain: "InlineImageTests", code: 101, userInfo: [NSLocalizedDescriptionKey: "Expected departed inline image syntax to collapse to .clear after lowercase o, got \(String(describing: collapsedAfterO))"])
+    }
+    _ = try assertCleanProseAttributesAndGeometry(phrase: "Caption below", in: editor, codeBase: 110)
+
+    // 4. Non-Vim direct typing right after attaching an inline image
+    Theme.vimModeEnabled = false
+    workspace.syncVimModePreference()
+    let record2 = try vault.capture(text: "")
+    workspace.openNote(record2.url)
+    window.contentView?.layoutSubtreeIfNeeded()
+    _ = window.makeFirstResponder(textView)
+    editor.addAttachments([secondPNG], at: NSRange(location: 0, length: 0), animated: false)
+    for ch in "Plain follow-up" {
+        textView.insertText(String(ch), replacementRange: textView.selectedRange())
+    }
+    window.contentView?.layoutSubtreeIfNeeded()
+    _ = try assertCleanProseAttributesAndGeometry(phrase: "Plain follow-up", in: editor, codeBase: 120)
+}
+
 #if canImport(XCTest)
 @MainActor
 final class InlineImageXCTests: XCTestCase {
@@ -456,26 +701,37 @@ final class InlineImageXCTests: XCTestCase {
     func testGeometryFoldingResizeContextMenuAndCompanionWindow() throws {
         try verifyGeometryFoldingResizeContextMenuAndCompanionWindow()
     }
+
+    func testInlineImageVimOpenLineAndAdjacentTyping() throws {
+        try verifyInlineImageVimOpenLineAndAdjacentTyping()
+    }
 }
 #endif
 
 #if canImport(Testing)
-@Suite("Inline Images", .serialized)
-@MainActor
-struct InlineImageSwiftTests {
-    @Test("Dropping or attaching an image inserts inline Markdown at the target position with undo/redo and no duplicate top chip")
-    func midDocumentAttachUndoAndChipFiltering() throws {
-        try verifyMidDocumentAttachUndoAndChipFiltering()
-    }
+extension MobyDickWorkoutSuite {
+    @Suite("Inline Images", .serialized)
+    @MainActor
+    struct InlineImageSwiftTests {
+        @Test("Dropping or attaching an image inserts inline Markdown at the target position with undo/redo and no duplicate top chip")
+        func midDocumentAttachUndoAndChipFiltering() throws {
+            try verifyMidDocumentAttachUndoAndChipFiltering()
+        }
 
-    @Test("Pasting a screenshot into an unsaved draft captures and renders inline at the caret")
-    func unsavedDraftPasteScreenshotInsertsInlineAtCaret() throws {
-        try verifyUnsavedDraftPasteScreenshotInsertsInlineAtCaret()
-    }
+        @Test("Pasting a screenshot into an unsaved draft captures and renders inline at the caret")
+        func unsavedDraftPasteScreenshotInsertsInlineAtCaret() throws {
+            try verifyUnsavedDraftPasteScreenshotInsertsInlineAtCaret()
+        }
 
-    @Test("Inline image geometry, caret height, syntax reveal, folding, responsive resize, context menu, and companion window")
-    func geometryFoldingResizeContextMenuAndCompanionWindow() throws {
-        try verifyGeometryFoldingResizeContextMenuAndCompanionWindow()
+        @Test("Inline image geometry, caret height, syntax reveal, folding, responsive resize, context menu, and companion window")
+        func geometryFoldingResizeContextMenuAndCompanionWindow() throws {
+            try verifyGeometryFoldingResizeContextMenuAndCompanionWindow()
+        }
+
+        @Test("Vim Shift-O, lowercase o, and adjacent typing next to inline images preserve prose spacing, font, and ink")
+        func inlineImageVimOpenLineAndAdjacentTyping() throws {
+            try verifyInlineImageVimOpenLineAndAdjacentTyping()
+        }
     }
 }
 #endif
