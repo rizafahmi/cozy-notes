@@ -387,7 +387,9 @@ import CozySearch
 
     private func wireCallbacks() {
         editor.onChange = { [weak self] in self?.editorDidChange() }
-        editor.onAttachFiles = { [weak self] urls in self?.attachFilesToCurrentNote(urls) }
+        editor.onAttachFiles = { [weak self] urls, insertionRange in
+            self?.attachFilesToCurrentNote(urls, at: insertionRange)
+        }
         editor.onRemoveLinkedAttachment = { [weak self] item in self?.removeLinkedAttachment(item) }
         editor.onHorizontalInsetChange = { [weak self] inset in self?.syncFolioMargins(inset) }
         editor.noteRecordsProvider = { [weak self] in
@@ -395,6 +397,7 @@ import CozySearch
             return self.searchPanel.cachedNoteRecords() ?? (try? self.vault.notes()) ?? []
         }
         editor.currentNoteURLProvider = { [weak self] in self?.noteURL }
+        editor.vaultRootURLProvider = { [weak self] in self?.vault.root }
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in _ = self?.openWikiLinkInNewWindow(link) }
         editor.onClickTag = { [weak self] tag in
@@ -699,25 +702,37 @@ import CozySearch
         }
     }
 
-    private func attachFilesToCurrentNote(_ urls: [URL]) {
+    private func attachFilesToCurrentNote(_ urls: [URL], at insertionRange: NSRange? = nil) {
         autosave?.invalidate()
-        guard !noteConflicted else {
+        guard !noteConflicted, !hasExternalDiskChange else {
             editor.status.stringValue = "Keep conflicted edits as a new note before attaching files."
             return
         }
         do {
             if let existingURL = noteURL {
-                let updated = try vault.attach(urls, to: existingURL, text: editor.text, expectedContent: noteBaseline)
-                noteBaseline = updated
-                noteDirty = false
+                guard let diskText = try? vault.read(existingURL), diskText == noteBaseline else {
+                    throw VaultError.conflict(existingURL.path)
+                }
+                let copied = try vault.copyAttachments(urls, for: existingURL)
+                guard !copied.isEmpty else { return }
+                let plan = Vault.insertAttachmentSnippets(
+                    copied.map(\.markdown),
+                    into: editor.text,
+                    at: insertionRange,
+                    fallbackHeadingName: copied.first?.url.lastPathComponent
+                )
+                let afterLoc = plan.effectiveRange.location + (plan.insertedString as NSString).length
+                editor.textView.applyUndoableReplacement(
+                    in: plan.effectiveRange,
+                    with: plan.insertedString,
+                    selectedRangeAfter: NSRange(location: afterLoc, length: 0)
+                )
+                noteDirty = true
                 noteAvailable = true
-                cachedNoteStamp = nil
-                editor.text = updated
-                editor.linkedAttachments = vault.linkedAttachments(in: updated, relativeTo: existingURL)
-                editor.status.stringValue = "Saved"
-                syncSavedNoteToCompanions(existingURL, content: updated)
+                _ = persistCurrent()
             } else {
-                let record = try vault.capture(text: editor.text, attachments: urls)
+                let preText = editor.text
+                let record = try vault.capture(text: preText, attachments: urls, insertionRange: insertionRange)
                 let saved = try vault.read(record.url)
                 noteURL = record.url
                 noteBaseline = saved
@@ -726,7 +741,16 @@ import CozySearch
                 noteAvailable = true
                 editor.clearPendingAttachments()
                 editor.text = saved
-                editor.linkedAttachments = vault.linkedAttachments(in: saved, relativeTo: record.url)
+                let linked = vault.linkedAttachments(in: saved, relativeTo: record.url)
+                editor.linkedAttachments = linked
+                if insertionRange != nil, let lastLinked = linked.last {
+                    let savedNS = saved as NSString
+                    var afterLoc = NSMaxRange(lastLinked.markdownRange)
+                    if afterLoc < savedNS.length && savedNS.character(at: afterLoc) == 0x0A {
+                        afterLoc += 1
+                    }
+                    editor.textView.setSelectedRange(NSRange(location: min(afterLoc, savedNS.length), length: 0))
+                }
                 editor.status.stringValue = "Saved"
                 searchPanel.selectNote(record.url)
             }
@@ -805,6 +829,8 @@ import CozySearch
                 editor.clearPendingAttachments()
                 if !pending.isEmpty {
                     editor.text = saved
+                } else if editor.nsText.range(of: "![", options: .literal).location != NSNotFound {
+                    editor.refreshInlineImages()
                 }
                 editor.linkedAttachments = vault.linkedAttachments(in: saved, relativeTo: record.url)
                 editor.status.stringValue = "Saved"
@@ -1970,11 +1996,14 @@ import CozySearch
 
     private func wireCallbacks() {
         editor.onChange = { [weak self] in self?.editorDidChange() }
-        editor.onAttachFiles = { [weak self] urls in self?.attachFilesToCurrentNote(urls) }
+        editor.onAttachFiles = { [weak self] urls, insertionRange in
+            self?.attachFilesToCurrentNote(urls, at: insertionRange)
+        }
         editor.onRemoveLinkedAttachment = { [weak self] item in self?.removeLinkedAttachment(item) }
         editor.onHorizontalInsetChange = { [weak self] inset in self?.syncFolioMargins(inset) }
         editor.noteRecordsProvider = { [weak self] in (try? self?.vault.notes()) ?? [] }
         editor.currentNoteURLProvider = { [weak self] in self?.noteURL }
+        editor.vaultRootURLProvider = { [weak self] in self?.vault.root }
         editor.onOpenWikiLink = { [weak self] link in self?.openWikiLink(link) }
         editor.onOpenWikiLinkInNewWindow = { [weak self] link in self?.onOpenWikiLinkInNewWindow?(link) }
         editor.onTogglePinCurrentNote = { [weak self] in self?.togglePinCurrentNote() }
@@ -2256,23 +2285,34 @@ import CozySearch
         }
     }
 
-    private func attachFilesToCurrentNote(_ urls: [URL]) {
+    private func attachFilesToCurrentNote(_ urls: [URL], at insertionRange: NSRange? = nil) {
         autosave?.invalidate()
-        guard !noteConflicted, let existingURL = noteURL else {
+        guard !noteConflicted, !hasExternalDiskChange, let existingURL = noteURL else {
             editor.status.stringValue = "Keep conflicted edits as a new note before attaching files."
             return
         }
         do {
-            let updated = try vault.attach(urls, to: existingURL, text: editor.text, expectedContent: noteBaseline)
-            noteBaseline = updated
-            noteDirty = false
+            guard let diskText = try? vault.read(existingURL), diskText == noteBaseline else {
+                throw VaultError.conflict(existingURL.path)
+            }
+            let copied = try vault.copyAttachments(urls, for: existingURL)
+            guard !copied.isEmpty else { return }
+            let plan = Vault.insertAttachmentSnippets(
+                copied.map(\.markdown),
+                into: editor.text,
+                at: insertionRange,
+                fallbackHeadingName: copied.first?.url.lastPathComponent
+            )
+            let afterLoc = plan.effectiveRange.location + (plan.insertedString as NSString).length
+            editor.textView.applyUndoableReplacement(
+                in: plan.effectiveRange,
+                with: plan.insertedString,
+                selectedRangeAfter: NSRange(location: afterLoc, length: 0)
+            )
+            noteDirty = true
             noteAvailable = true
-            cachedNoteStamp = nil
-            editor.text = updated
-            editor.linkedAttachments = vault.linkedAttachments(in: updated, relativeTo: existingURL)
-            editor.status.stringValue = "Saved"
+            _ = persistCurrent()
             updateEditorChrome()
-            onDidSaveNote?(existingURL, updated)
             editor.focus()
         } catch {
             if case VaultError.conflict = error {
