@@ -72,6 +72,95 @@ import CozySearch
     }
 }
 
+@MainActor private final class InlineImageCache {
+    static let shared = InlineImageCache()
+
+    struct Metrics: Equatable {
+        let naturalPointSize: NSSize
+    }
+
+    private final class Box<T> {
+        let value: T
+        init(_ value: T) { self.value = value }
+    }
+
+    private let metricsCache = NSCache<NSString, Box<Metrics>>()
+    private let thumbnailCache = NSCache<NSString, NSImage>()
+
+    private init() {
+        metricsCache.countLimit = 256
+        thumbnailCache.countLimit = 96
+    }
+
+    private func fileStamp(for url: URL) -> String? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber else {
+            return nil
+        }
+        let mod = (attrs[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
+        return "\(url.path)|\(size.int64Value)|\(Int64(mod * 1000))"
+    }
+
+    func imageMetrics(for url: URL) -> Metrics? {
+        guard let stamp = fileStamp(for: url) else { return nil }
+        let cacheKey = stamp as NSString
+        if let cached = metricsCache.object(forKey: cacheKey) {
+            return cached.value
+        }
+        if let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let rawW = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+           let rawH = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+           rawW > 0, rawH > 0 {
+            let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+            let swapsAxes = (5...8).contains(orientation)
+            let pixelW = CGFloat(swapsAxes ? rawH : rawW)
+            let pixelH = CGFloat(swapsAxes ? rawW : rawH)
+            let dpiX = (props[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue ?? 72.0
+            let dpiScale: CGFloat = dpiX >= 140.0 ? CGFloat(dpiX / 72.0) : 1.0
+            let pointSize = NSSize(
+                width: max(1, round(pixelW / dpiScale)),
+                height: max(1, round(pixelH / dpiScale))
+            )
+            let result = Metrics(naturalPointSize: pointSize)
+            metricsCache.setObject(Box(result), forKey: cacheKey)
+            return result
+        }
+        if let fallback = NSImage(contentsOf: url), fallback.size.width > 0, fallback.size.height > 0 {
+            let result = Metrics(naturalPointSize: fallback.size)
+            metricsCache.setObject(Box(result), forKey: cacheKey)
+            return result
+        }
+        return nil
+    }
+
+    func thumbnail(for url: URL, targetPointSize: NSSize, backingScale: CGFloat) -> NSImage? {
+        guard let stamp = fileStamp(for: url) else { return nil }
+        let rawMaxPx = Int(ceil(max(targetPointSize.width, targetPointSize.height) * max(1.0, backingScale)))
+        let bucketPx = max(64, ((rawMaxPx + 63) / 64) * 64)
+        let cacheKey = "\(stamp)|\(bucketPx)" as NSString
+        if let cached = thumbnailCache.object(forKey: cacheKey) {
+            return cached
+        }
+        if let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+           let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+               kCGImageSourceCreateThumbnailFromImageAlways: true,
+               kCGImageSourceCreateThumbnailWithTransform: true,
+               kCGImageSourceShouldCacheImmediately: true,
+               kCGImageSourceThumbnailMaxPixelSize: min(2560, bucketPx)
+           ] as CFDictionary) {
+            let img = NSImage(cgImage: cgImage, size: targetPointSize)
+            thumbnailCache.setObject(img, forKey: cacheKey)
+            return img
+        }
+        if let fallback = NSImage(contentsOf: url), fallback.size.width > 0, fallback.size.height > 0 {
+            thumbnailCache.setObject(fallback, forKey: cacheKey)
+            return fallback
+        }
+        return nil
+    }
+}
+
 @MainActor final class MarkdownTextView: NSTextView {
     static let defaultUndoLevels = 128
     private let editorUndoManager: CozyUndoManager = {
@@ -81,8 +170,8 @@ import CozySearch
     }()
     override var undoManager: UndoManager? { editorUndoManager }
     let vim = VimEngine()
-    var onFiles: (([URL], Bool) -> Void)?
-    var onClipboardImage: ((Data, Bool) -> Void)?
+    var onFiles: (([URL], NSRange?, Bool) -> Void)?
+    var onClipboardImage: ((Data, NSRange?, Bool) -> Void)?
     var onFocusChange: (() -> Void)?
     var onFoldStatusChange: ((String) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
@@ -91,6 +180,9 @@ import CozySearch
     var onOpenMarkdownLink: ((MarkdownLink) -> Void)?
     var onClickMarkdownLink: ((MarkdownLink, NSPoint) -> Void)?
     var onCopyMarkdownLink: ((MarkdownLink) -> Void)?
+    var onOpenInlineImage: ((InlineImageItem) -> Void)?
+    var onRevealInlineImage: ((InlineImageItem) -> Void)?
+    var onCopyInlineImage: ((InlineImageItem) -> Void)?
     var onDismissLinkActionBar: (() -> Void)?
     var onCancelLinkActionBar: (() -> Bool)?
     var onScrollBoundsChange: (() -> Void)?
@@ -110,6 +202,21 @@ import CozySearch
         let labelRange: NSRange
         let rawDestination: String
         let resolvedURL: URL
+    }
+    struct InlineImageItem: Equatable {
+        let fullRange: NSRange
+        let lineRange: NSRange
+        let fullLineRange: NSRange
+        let altText: String
+        let caption: String?
+        let rawDestination: String
+        let resolvedURL: URL
+        let naturalPointSize: NSSize?
+        let displaySize: NSSize
+        let itemSlotHeight: CGFloat
+        let offsetFromParagraphBottom: CGFloat
+        let isStandaloneLine: Bool
+        let isReadableImage: Bool
     }
     struct FencedBlock {
         let fullRange: NSRange
@@ -178,6 +285,7 @@ import CozySearch
     var wikiLinkItems: [WikiLink] = []
     var tagItems: [NoteTag] = []
     var markdownLinkItems: [MarkdownLink] = []
+    var inlineImageItems: [InlineImageItem] = []
     var inNoteFindRanges: [NSRange] = []
     var activeInNoteFindIndex: Int = -1
     var headingGutterItems: [HeadingGutter] = []
@@ -190,6 +298,7 @@ import CozySearch
     var customMouseSelectionTracker: ((MarkdownTextView, NSEvent) -> Void)?
     private var isShowingLinkPointerCursor = false
     private var contextMenuMarkdownLink: MarkdownLink?
+    private var contextMenuInlineImage: InlineImageItem?
     struct EditRecord {
         let affectedRange: NSRange
         let replacementLength: Int
@@ -432,7 +541,7 @@ import CozySearch
                 layoutManager.ensureLayout(forBoundingRect: queryRect, in: textContainer)
             }
         }
-        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !tagItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !horizontalRuleRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
+        guard !fencedBlocks.isEmpty || !tableBlocks.isEmpty || !inlineCodeRanges.isEmpty || !wikiLinkItems.isEmpty || !tagItems.isEmpty || !inlineImageItems.isEmpty || !inNoteFindRanges.isEmpty || !blockquoteRanges.isEmpty || !horizontalRuleRanges.isEmpty || !headingGutterItems.isEmpty || !bulletItems.isEmpty || !externalChangeRanges.isEmpty else { return }
         let columnWidth = max(0, bounds.width - 2 * origin.x)
 
         let visibleGlyphs = layoutManager.glyphRange(forBoundingRectWithoutAdditionalLayout: queryRect, in: textContainer)
@@ -908,6 +1017,119 @@ import CozySearch
                 }
             }
         }
+
+        if !inlineImageItems.isEmpty {
+            let backingScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+            let sel = selectedRange()
+            let isFocused = window?.firstResponder === self
+            let captionParagraph = NSMutableParagraphStyle()
+            captionParagraph.lineBreakMode = .byTruncatingTail
+            let captionAttrs: [NSAttributedString.Key: Any] = [
+                .font: Theme.bodyFont(12.0),
+                .foregroundColor: Theme.muted,
+                .paragraphStyle: captionParagraph
+            ]
+            let missingAttrs: [NSAttributedString.Key: Any] = [
+                .font: Theme.monoFont(11.5, weight: .medium),
+                .foregroundColor: Theme.muted,
+                .paragraphStyle: captionParagraph
+            ]
+            for item in inlineImageItems {
+                if item.fullLineRange.location > visEnd { break }
+                guard NSMaxRange(item.fullLineRange) >= visStart,
+                      NSMaxRange(item.fullLineRange) <= totalLength,
+                      let cardRect = inlineImageCardRect(for: item),
+                      cardRect.insetBy(dx: -4, dy: -28).intersects(rect) else { continue }
+
+                let cardPath = NSBezierPath(roundedRect: cardRect, xRadius: 8, yRadius: 8)
+                Theme.elevated.setFill()
+                cardPath.fill()
+
+                if item.isReadableImage,
+                   let thumb = InlineImageCache.shared.thumbnail(
+                       for: item.resolvedURL,
+                       targetPointSize: cardRect.size,
+                       backingScale: backingScale
+                   ) {
+                    let drawRect: NSRect
+                    if let natural = item.naturalPointSize, natural.width > 0, natural.height > 0 {
+                        let fit = min(1.0, min(cardRect.width / natural.width, cardRect.height / natural.height))
+                        let w = min(cardRect.width, max(1, round(natural.width * fit)))
+                        let h = min(cardRect.height, max(1, round(natural.height * fit)))
+                        drawRect = NSRect(
+                            x: round(cardRect.midX - w / 2),
+                            y: round(cardRect.midY - h / 2),
+                            width: w,
+                            height: h
+                        )
+                    } else {
+                        drawRect = cardRect
+                    }
+                    NSGraphicsContext.saveGraphicsState()
+                    cardPath.addClip()
+                    thumb.draw(
+                        in: drawRect,
+                        from: .zero,
+                        operation: .sourceOver,
+                        fraction: 1.0,
+                        respectFlipped: true,
+                        hints: [.interpolation: NSImageInterpolation.high]
+                    )
+                    NSGraphicsContext.restoreGraphicsState()
+                } else {
+                    let label = "Missing image · \(item.resolvedURL.lastPathComponent)" as NSString
+                    let labelSize = label.size(withAttributes: missingAttrs)
+                    let labelRect = NSRect(
+                        x: cardRect.minX + 14,
+                        y: round(cardRect.midY - labelSize.height / 2),
+                        width: max(0, cardRect.width - 28),
+                        height: ceil(labelSize.height)
+                    )
+                    label.draw(in: labelRect, withAttributes: missingAttrs)
+                }
+
+                let cursorOnItemLine = isFocused && (
+                    (sel.length == 0 && sel.location >= item.lineRange.location && sel.location <= NSMaxRange(item.lineRange))
+                    || NSIntersectionRange(sel, item.lineRange).length > 0
+                )
+                (cursorOnItemLine ? Theme.accent.withAlphaComponent(0.55) : Theme.border).setStroke()
+                cardPath.lineWidth = 1.0
+                cardPath.stroke()
+
+                if let caption = item.caption, !caption.isEmpty {
+                    let capNS = caption as NSString
+                    let capRect = NSRect(
+                        x: cardRect.minX + 2,
+                        y: cardRect.maxY + 5,
+                        width: max(120, columnWidth - 4),
+                        height: 18
+                    )
+                    capNS.draw(in: capRect, withAttributes: captionAttrs)
+                }
+            }
+        }
+    }
+
+    func inlineImageCardRect(for item: InlineImageItem) -> NSRect? {
+        guard !isCharacterFolded(item.lineRange.location),
+              let layoutManager = layoutManager,
+              let storage = textStorage,
+              NSMaxRange(item.fullLineRange) <= storage.length else { return nil }
+        let glyphRange = layoutManager.glyphRange(forCharacterRange: item.fullLineRange, actualCharacterRange: nil)
+        guard glyphRange.length > 0 else { return nil }
+        layoutManager.ensureLayout(forGlyphRange: glyphRange)
+        let lastGlyph = NSMaxRange(glyphRange) - 1
+        guard lastGlyph < layoutManager.numberOfGlyphs else { return nil }
+        let lastFrag = layoutManager.lineFragmentRect(forGlyphAt: lastGlyph, effectiveRange: nil)
+        guard lastFrag.height >= item.itemSlotHeight - 2 else { return nil }
+        let origin = textContainerOrigin
+        let slotTopY = round(origin.y + lastFrag.maxY - item.offsetFromParagraphBottom)
+        return NSRect(
+            x: round(origin.x),
+            y: slotTopY + 8,
+            width: item.displaySize.width,
+            height: item.displaySize.height
+        )
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1024,11 +1246,12 @@ import CozySearch
     func resolvedEditorCursor(at windowPoint: NSPoint, modifierFlags: NSEvent.ModifierFlags) -> NSCursor {
         let pt = convert(windowPoint, from: nil)
         guard bounds.contains(pt) else { return .arrow }
-        if !wikiLinkItems.isEmpty || !tagItems.isEmpty || !markdownLinkItems.isEmpty || !bulletItems.isEmpty {
+        if !wikiLinkItems.isEmpty || !tagItems.isEmpty || !markdownLinkItems.isEmpty || !inlineImageItems.isEmpty || !bulletItems.isEmpty {
             let overTaskCheckbox = isEditable && taskCheckbox(atPoint: pt) != nil
+            let overImageCard = inlineImage(atPoint: pt) != nil
             let cmdHeld = modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
             let overLink = (cmdHeld || !isEditable) && (markdownLink(atPoint: pt) != nil || wikiLink(atPoint: pt) != nil || noteTag(atPoint: pt) != nil)
-            if overTaskCheckbox || overLink {
+            if overTaskCheckbox || overImageCard || overLink {
                 return .pointingHand
             }
         }
@@ -1046,7 +1269,7 @@ import CozySearch
     }
 
     private func refreshLinkHoverCursor(at windowPoint: NSPoint?, modifierFlags: NSEvent.ModifierFlags) {
-        if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
+        if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && inlineImageItems.isEmpty && bulletItems.isEmpty {
             if isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = false
                 if let windowPoint, !isOccludedBySiblingOverlay(at: windowPoint) {
@@ -1075,9 +1298,10 @@ import CozySearch
             return
         }
         let overTaskCheckbox = isEditable && taskCheckbox(atPoint: pt) != nil
+        let overImageCard = inlineImage(atPoint: pt) != nil
         let cmdHeld = modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
         let overLink = (cmdHeld || !isEditable) && (markdownLink(atPoint: pt) != nil || wikiLink(atPoint: pt) != nil || noteTag(atPoint: pt) != nil)
-        if overTaskCheckbox || overLink {
+        if overTaskCheckbox || overImageCard || overLink {
             if !isShowingLinkPointerCursor {
                 isShowingLinkPointerCursor = true
             }
@@ -1093,7 +1317,7 @@ import CozySearch
             isShowingLinkPointerCursor = false
             return
         }
-        if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && bulletItems.isEmpty {
+        if wikiLinkItems.isEmpty && tagItems.isEmpty && markdownLinkItems.isEmpty && inlineImageItems.isEmpty && bulletItems.isEmpty {
             super.mouseMoved(with: event)
             return
         }
@@ -1730,6 +1954,18 @@ import CozySearch
                 return
             }
         }
+        if !flags.contains(.control), let img = inlineImage(atPoint: pt) {
+            onDismissLinkActionBar?()
+            if flags.contains(.command) || event.clickCount >= 2 || !isEditable {
+                onOpenInlineImage?(img)
+                return
+            }
+            window?.makeFirstResponder(self)
+            let totalLen = textStorage?.length ?? 0
+            setSelectedRange(NSRange(location: min(NSMaxRange(img.fullRange), totalLen), length: 0))
+            vim.handleMouseSelectionCompleted()
+            return
+        }
         if flags.contains(.command) {
             if let link = wikiLink(atPoint: pt) {
                 onDismissLinkActionBar?()
@@ -1772,6 +2008,36 @@ import CozySearch
     override func menu(for event: NSEvent) -> NSMenu? {
         let baseMenu = super.menu(for: event)
         let pt = convert(event.locationInWindow, from: nil)
+        if let img = inlineImage(atPoint: pt) {
+            onDismissLinkActionBar?()
+            contextMenuMarkdownLink = nil
+            contextMenuInlineImage = img
+            let menu = baseMenu ?? NSMenu()
+            var insertIdx = 0
+            let openItem = NSMenuItem(title: "Open Image", action: #selector(openContextMenuInlineImage(_:)), keyEquivalent: "")
+            openItem.target = self
+            menu.insertItem(openItem, at: insertIdx)
+            insertIdx += 1
+            let revealItem = NSMenuItem(title: "Reveal in Finder", action: #selector(revealContextMenuInlineImage(_:)), keyEquivalent: "")
+            revealItem.target = self
+            menu.insertItem(revealItem, at: insertIdx)
+            insertIdx += 1
+            if img.isReadableImage {
+                let copyImgItem = NSMenuItem(title: "Copy Image", action: #selector(copyContextMenuInlineImage(_:)), keyEquivalent: "")
+                copyImgItem.target = self
+                menu.insertItem(copyImgItem, at: insertIdx)
+                insertIdx += 1
+            }
+            if isEditable {
+                let removeItem = NSMenuItem(title: "Remove Image", action: #selector(removeContextMenuInlineImage(_:)), keyEquivalent: "")
+                removeItem.target = self
+                menu.insertItem(removeItem, at: insertIdx)
+                insertIdx += 1
+            }
+            menu.insertItem(.separator(), at: insertIdx)
+            return menu
+        }
+        contextMenuInlineImage = nil
         guard let mdLink = markdownLink(atPoint: pt) else {
             contextMenuMarkdownLink = nil
             return baseMenu
@@ -1789,6 +2055,36 @@ import CozySearch
         return menu
     }
 
+    @objc private func openContextMenuInlineImage(_ sender: Any?) {
+        guard let img = contextMenuInlineImage else { return }
+        contextMenuInlineImage = nil
+        onOpenInlineImage?(img)
+    }
+
+    @objc private func revealContextMenuInlineImage(_ sender: Any?) {
+        guard let img = contextMenuInlineImage else { return }
+        contextMenuInlineImage = nil
+        onRevealInlineImage?(img)
+    }
+
+    @objc private func copyContextMenuInlineImage(_ sender: Any?) {
+        guard let img = contextMenuInlineImage else { return }
+        contextMenuInlineImage = nil
+        onCopyInlineImage?(img)
+    }
+
+    @objc private func removeContextMenuInlineImage(_ sender: Any?) {
+        guard isEditable, let img = contextMenuInlineImage, let storage = textStorage else { return }
+        contextMenuInlineImage = nil
+        let targetRange = img.isStandaloneLine ? img.fullLineRange : img.fullRange
+        guard NSMaxRange(targetRange) <= storage.length else { return }
+        applyUndoableReplacement(
+            in: targetRange,
+            with: "",
+            selectedRangeAfter: NSRange(location: targetRange.location, length: 0)
+        )
+    }
+
     @objc private func openContextMenuLink(_ sender: Any?) {
         guard let link = contextMenuMarkdownLink else { return }
         contextMenuMarkdownLink = nil
@@ -1799,6 +2095,17 @@ import CozySearch
         guard let link = contextMenuMarkdownLink else { return }
         contextMenuMarkdownLink = nil
         onCopyMarkdownLink?(link)
+    }
+
+    func inlineImage(atPoint pt: NSPoint) -> InlineImageItem? {
+        guard !inlineImageItems.isEmpty else { return nil }
+        for item in inlineImageItems {
+            guard let cardRect = inlineImageCardRect(for: item) else { continue }
+            if cardRect.contains(pt) {
+                return item
+            }
+        }
+        return nil
     }
 
     func taskCheckbox(atPoint pt: NSPoint) -> BulletItem? {
@@ -3828,10 +4135,14 @@ import CozySearch
 
         let fontLineHeight = ceil(sampleFont.ascender - sampleFont.descender + max(0, sampleFont.leading))
         let lineSpacing = samplePara?.lineSpacing ?? 0
+        let paraSpacing = samplePara?.paragraphSpacing ?? 0
 
         let glyphIdx = lm.glyphIndexForCharacter(at: charIdx)
         let raw = lm.boundingRect(forGlyphRange: NSRange(location: glyphIdx, length: 0), in: tc)
-        let rawHeight = raw.height > 0 ? raw.height : fontLineHeight
+        var rawHeight = raw.height > 0 ? raw.height : fontLineHeight
+        if paraSpacing > 16, rawHeight - paraSpacing >= fontLineHeight - 2 {
+            rawHeight -= paraSpacing
+        }
         let trimmedHeight = (lineSpacing > 0 && rawHeight - lineSpacing >= fontLineHeight - 1)
             ? (rawHeight - lineSpacing)
             : rawHeight
@@ -3986,13 +4297,14 @@ import CozySearch
     override func paste(_ sender: Any?) {
         autoreleasepool {
             let pb = self.pasteboard
+            let targetRange = selectedRange()
             if pb.types?.contains(.fileURL) == true,
                let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-                onFiles?(urls, CaptureEditor.isPointerAction)
+                onFiles?(urls, targetRange, CaptureEditor.isPointerAction)
             } else if pb.availableType(from: [.string]) == nil,
                       let image = NSImage(pasteboard: pb), let tiff = image.tiffRepresentation,
                       let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) {
-                onClipboardImage?(png, CaptureEditor.isPointerAction)
+                onClipboardImage?(png, targetRange, CaptureEditor.isPointerAction)
             } else {
                 let str: String?
                 if pb.changeCount == lastClipboardChangeCount && lastClipboardLength >= 0 {
@@ -4001,7 +4313,7 @@ import CozySearch
                     str = pb.string(forType: .string)
                 }
                 if let str {
-                    applyUndoableReplacement(in: selectedRange(), with: str)
+                    applyUndoableReplacement(in: targetRange, with: str)
                 } else {
                     pasteAsPlainText(sender)
                 }
@@ -4009,14 +4321,46 @@ import CozySearch
         }
     }
 
+    func dropInsertionRange(atViewPoint viewPt: NSPoint) -> NSRange {
+        let totalLen = textStorage?.length ?? 0
+        guard totalLen > 0 else { return NSRange(location: 0, length: 0) }
+        for item in inlineImageItems {
+            if let cardRect = inlineImageCardRect(for: item), cardRect.contains(viewPt) {
+                let loc = viewPt.y < cardRect.midY ? item.lineRange.location : NSMaxRange(item.fullLineRange)
+                return NSRange(location: min(max(0, loc), totalLen), length: 0)
+            }
+        }
+        var charIdx = min(max(0, characterIndexForInsertion(at: viewPt)), totalLen)
+        if let fold = foldedSections.first(where: { NSLocationInRange(charIdx, $0.foldedCharRange) }) {
+            charIdx = min(totalLen, NSMaxRange(fold.foldedCharRange))
+        }
+        return NSRange(location: charIdx, length: 0)
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        if sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) { return .copy }
+        let pb = sender.draggingPasteboard
+        if pb.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) {
+            return .copy
+        }
+        if pb.availableType(from: [.string]) == nil,
+           pb.availableType(from: [.png, .tiff]) != nil {
+            return .copy
+        }
         return super.draggingEntered(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        if let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            onFiles?(urls, true)
+        let pb = sender.draggingPasteboard
+        let viewPt = convert(sender.draggingLocation, from: nil)
+        let targetRange = dropInsertionRange(atViewPoint: viewPt)
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            onFiles?(urls, targetRange, true)
+            return true
+        }
+        if pb.availableType(from: [.string]) == nil,
+           let image = NSImage(pasteboard: pb), let tiff = image.tiffRepresentation,
+           let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) {
+            onClipboardImage?(png, targetRange, true)
             return true
         }
         return super.performDragOperation(sender)
@@ -4967,7 +5311,7 @@ import CozySearch
     private var isVimSearchingPrompt = false
     private var vimSearchOriginLocation: Int = 0
     var onChange: (() -> Void)?
-    var onAttachFiles: (([URL]) -> Void)?
+    var onAttachFiles: (([URL], NSRange?) -> Void)?
     var onRemoveLinkedAttachment: ((LinkedAttachment) -> Void)?
     var onHorizontalInsetChange: ((CGFloat) -> Void)?
     var onOpenWikiLink: ((WikiLink) -> Void)?
@@ -4984,6 +5328,7 @@ import CozySearch
     var onSemanticVisibilityChange: ((Bool) -> Void)?
     var noteRecordsProvider: (() -> [NoteRecord])?
     var currentNoteURLProvider: (() -> URL?)?
+    var vaultRootURLProvider: (() -> URL?)?
     var compactLayout = false { didSet { needsLayout = true } }
     var attachments: [URL] = [] {
         didSet {
@@ -5105,9 +5450,13 @@ import CozySearch
         let typesetter = FoldTypesetter()
         typesetter.textView = textView
         textView.layoutManager?.typesetter = typesetter
-        textView.registerForDraggedTypes([.fileURL])
-        textView.onFiles = { [weak self] urls, animated in self?.addAttachments(urls, animated: animated) }
-        textView.onClipboardImage = { [weak self] data, animated in self?.addClipboardImage(data, animated: animated) }
+        textView.registerForDraggedTypes(textView.acceptableDragTypes + [.fileURL, .png, .tiff])
+        textView.onFiles = { [weak self] urls, insertionRange, animated in
+            self?.addAttachments(urls, at: insertionRange, animated: animated)
+        }
+        textView.onClipboardImage = { [weak self] data, insertionRange, animated in
+            self?.addClipboardImage(data, at: insertionRange, animated: animated)
+        }
         textView.onFocusChange = { [weak self] in self?.handleFocusChange() }
         textView.onFoldStatusChange = { [weak self] msg in
             self?.hideLinkActionBar(animated: false)
@@ -5120,6 +5469,29 @@ import CozySearch
         textView.onOpenMarkdownLink = { [weak self] link in self?.openMarkdownLink(link) }
         textView.onClickMarkdownLink = { [weak self] link, pt in self?.showLinkActionBar(for: link, preferredPoint: pt) }
         textView.onCopyMarkdownLink = { [weak self] link in self?.copyMarkdownLink(link, fromActionBar: false) }
+        textView.onOpenInlineImage = { [weak self] img in
+            guard let self else { return }
+            if FileManager.default.fileExists(atPath: img.resolvedURL.path) {
+                _ = self.urlOpener(img.resolvedURL)
+            } else {
+                self.status.stringValue = "Image file not found: \(img.resolvedURL.lastPathComponent)"
+            }
+        }
+        textView.onRevealInlineImage = { [weak self] img in
+            guard let self else { return }
+            if FileManager.default.fileExists(atPath: img.resolvedURL.path) {
+                NSWorkspace.shared.activateFileViewerSelecting([img.resolvedURL])
+            } else {
+                self.status.stringValue = "Image file not found: \(img.resolvedURL.lastPathComponent)"
+            }
+        }
+        textView.onCopyInlineImage = { [weak self] img in
+            guard let self, let nsImg = NSImage(contentsOf: img.resolvedURL) else { return }
+            let pb = self.pasteboard
+            pb.clearContents()
+            pb.writeObjects([nsImg])
+            self.status.stringValue = "Copied image to clipboard"
+        }
         textView.onDismissLinkActionBar = { [weak self] in self?.hideLinkActionBar(animated: true) }
         textView.onCancelLinkActionBar = { [weak self] in
             guard let self, self.isLinkActionBarVisible else { return false }
@@ -5349,7 +5721,7 @@ import CozySearch
                 }
             }
             container.containerSize = NSSize(width: columnWidth, height: CGFloat.greatestFiniteMagnitude)
-            if !textView.tableBlocks.isEmpty {
+            if !textView.tableBlocks.isEmpty || !textView.inlineImageItems.isEmpty {
                 formatMarkdown()
             }
             if let anchorChar, let lm = textView.layoutManager, let storage = textView.textStorage, storage.length > 0 {
@@ -5604,7 +5976,7 @@ import CozySearch
         lastCursorLine = line
         refreshCursorDependentLines(oldLine: prevLine, newLine: line)
     }
-    func addAttachments(_ urls: [URL], animated: Bool = false) {
+    func addAttachments(_ urls: [URL], at insertionRange: NSRange? = nil, animated: Bool = false) {
         guard allowsAttachments else {
             status.stringValue = "Start a new note to add attachments."
             return
@@ -5619,7 +5991,7 @@ import CozySearch
         guard !valid.isEmpty else { return }
         performAttachmentChange(animated: animated) {
             if let onAttachFiles {
-                onAttachFiles(valid)
+                onAttachFiles(valid, insertionRange)
             } else {
                 for url in valid where !attachments.contains(url) {
                     attachments.append(url)
@@ -5638,11 +6010,12 @@ import CozySearch
         panel.allowsMultipleSelection = true
         guard let window else { return }
         let animated = Self.isPointerAction
+        let targetRange = textView.selectedRange()
         panel.beginSheetModal(for: window) { [weak self] result in
-            if result == .OK { self?.addAttachments(panel.urls, animated: animated) }
+            if result == .OK { self?.addAttachments(panel.urls, at: targetRange, animated: animated) }
         }
     }
-    private func addClipboardImage(_ data: Data, animated: Bool) {
+    private func addClipboardImage(_ data: Data, at insertionRange: NSRange? = nil, animated: Bool) {
         guard allowsAttachments else {
             status.stringValue = "Start a new note to paste a screenshot."
             return
@@ -5651,8 +6024,13 @@ import CozySearch
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("Screenshot-\(UUID().uuidString).png")
             try data.write(to: url, options: .atomic)
             temporaryFiles.append(url)
-            addAttachments([url], animated: animated)
+            addAttachments([url], at: insertionRange, animated: animated)
         } catch { showError(error, in: window) }
+    }
+    func refreshInlineImages() {
+        formatMarkdown()
+        textView.updateCaret()
+        textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
     private struct ChipItem {
@@ -5713,7 +6091,9 @@ import CozySearch
             needsAttachmentUpdate = true
             return
         }
-        var items: [ChipItem] = linkedAttachments.map { ChipItem(url: $0.url, linked: $0, pendingIndex: nil) }
+        var items: [ChipItem] = linkedAttachments
+            .filter { !$0.isImage }
+            .map { ChipItem(url: $0.url, linked: $0, pendingIndex: nil) }
         for (idx, url) in attachments.enumerated() {
             items.append(ChipItem(url: url, linked: nil, pendingIndex: idx))
         }
@@ -7208,6 +7588,7 @@ import CozySearch
                 return true
             }
         }
+        if ns.range(of: "![", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "`", options: .literal, range: lineRange).location != NSNotFound { return true }
         if ns.range(of: "|", options: .literal, range: lineRange).location != NSNotFound { return true }
         return false
@@ -7223,6 +7604,7 @@ import CozySearch
             || (newNeeds && textView.rangeTouchesFenceOrTable(newLine))
         if touchesBlock {
             formatMarkdown()
+            textView.updateCaret()
             textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
             return
         }
@@ -7240,8 +7622,9 @@ import CozySearch
                 var w: [WikiLink] = []
                 var t: [NoteTag] = []
                 var m: [MarkdownTextView.MarkdownLink] = []
+                var img: [MarkdownTextView.InlineImageItem] = []
                 var b: [MarkdownTextView.BulletItem] = []
-                formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
+                formatLineRange(oldLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, inlineImages: &img, bullets: &b)
             }
             if newNeeds, newLine != oldLine, NSMaxRange(newLine) <= ns.length {
                 var q: [NSRange] = []
@@ -7251,13 +7634,15 @@ import CozySearch
                 var w: [WikiLink] = []
                 var t: [NoteTag] = []
                 var m: [MarkdownTextView.MarkdownLink] = []
+                var img: [MarkdownTextView.InlineImageItem] = []
                 var b: [MarkdownTextView.BulletItem] = []
-                formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, bullets: &b)
+                formatLineRange(newLine, in: storage, ns: ns, cursor: cursor, quotes: &q, horizontalRules: &hr, headings: &h, codes: &c, wikiLinks: &w, tags: &t, markdownLinks: &m, inlineImages: &img, bullets: &b)
             }
             storage.endEditing()
             textView.undoManager?.enableUndoRegistration()
             applyEditorChromeAttributes()
         }
+        textView.updateCaret()
         textView.setNeedsDisplay(textView.bounds, avoidAdditionalLayout: true)
     }
 
@@ -7317,6 +7702,7 @@ import CozySearch
             || textView.wikiLinkItems.contains { NSIntersectionRange($0.fullRange, oldLineRange).length > 0 || $0.fullRange.location == oldLineRange.location }
             || textView.tagItems.contains { NSIntersectionRange($0.fullRange, oldLineRange).length > 0 || $0.fullRange.location == oldLineRange.location }
             || textView.markdownLinkItems.contains { NSIntersectionRange($0.fullRange, oldLineRange).length > 0 || $0.fullRange.location == oldLineRange.location }
+            || textView.inlineImageItems.contains { NSIntersectionRange($0.fullLineRange, oldLineRange).length > 0 || $0.fullLineRange.location == oldLineRange.location }
             || textView.bulletItems.contains { NSIntersectionRange($0.lineRange, oldLineRange).length > 0 || $0.lineRange.location == oldLineRange.location }
 
         let newHasSyntax = lineHasMarkdownSyntax(ns, lineRange: newLineRange)
@@ -7357,6 +7743,9 @@ import CozySearch
                 for i in textView.markdownLinkItems.indices where textView.markdownLinkItems[i].fullRange.location >= shiftStart {
                     textView.markdownLinkItems[i] = Self.shiftMarkdownLink(textView.markdownLinkItems[i], by: delta)
                 }
+                for i in textView.inlineImageItems.indices where textView.inlineImageItems[i].fullLineRange.location >= shiftStart {
+                    textView.inlineImageItems[i] = Self.shiftInlineImage(textView.inlineImageItems[i], by: delta)
+                }
                 for i in textView.bulletItems.indices where textView.bulletItems[i].lineRange.location >= shiftStart {
                     let item = textView.bulletItems[i]
                     textView.bulletItems[i] = MarkdownTextView.BulletItem(
@@ -7385,13 +7774,14 @@ import CozySearch
         var newWikiLinks: [WikiLink] = []
         var newTags: [NoteTag] = []
         var newMarkdownLinks: [MarkdownTextView.MarkdownLink] = []
+        var newInlineImages: [MarkdownTextView.InlineImageItem] = []
         var newBullets: [MarkdownTextView.BulletItem] = []
         let cursor = textView.selectedRange()
 
         textView.preservingViewport {
             textView.undoManager?.disableUndoRegistration()
             storage.beginEditing()
-            formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, horizontalRules: &newHorizontalRules, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, tags: &newTags, markdownLinks: &newMarkdownLinks, bullets: &newBullets)
+            formatLineRange(newLineRange, in: storage, ns: ns, cursor: cursor, quotes: &newQuotes, horizontalRules: &newHorizontalRules, headings: &newHeadings, codes: &newCodes, wikiLinks: &newWikiLinks, tags: &newTags, markdownLinks: &newMarkdownLinks, inlineImages: &newInlineImages, bullets: &newBullets)
             storage.endEditing()
             textView.undoManager?.enableUndoRegistration()
         }
@@ -7514,6 +7904,22 @@ import CozySearch
         }
         if !insertedMarkdownLinks { updatedMarkdownLinks.append(contentsOf: newMarkdownLinks) }
         textView.markdownLinkItems = updatedMarkdownLinks
+
+        var updatedInlineImages: [MarkdownTextView.InlineImageItem] = []
+        var insertedInlineImages = false
+        for item in textView.inlineImageItems {
+            if NSMaxRange(item.fullLineRange) <= oldLineRange.location && item.fullLineRange.location < oldLineRange.location {
+                updatedInlineImages.append(item)
+            } else if item.fullLineRange.location >= oldEnd {
+                if !insertedInlineImages {
+                    updatedInlineImages.append(contentsOf: newInlineImages)
+                    insertedInlineImages = true
+                }
+                updatedInlineImages.append(Self.shiftInlineImage(item, by: delta))
+            }
+        }
+        if !insertedInlineImages { updatedInlineImages.append(contentsOf: newInlineImages) }
+        textView.inlineImageItems = updatedInlineImages
 
         var updatedBullets: [MarkdownTextView.BulletItem] = []
         var insertedBullets = false
@@ -7644,6 +8050,7 @@ import CozySearch
             textView.wikiLinkItems = []
             textView.tagItems = []
             textView.markdownLinkItems = []
+            textView.inlineImageItems = []
             textView.fencedBlocks = []
             textView.tableBlocks = []
             textView.bulletItems = []
@@ -7662,10 +8069,11 @@ import CozySearch
         var wikiLinks: [WikiLink] = []
         var tags: [NoteTag] = []
         var markdownLinks: [MarkdownTextView.MarkdownLink] = []
+        var inlineImages: [MarkdownTextView.InlineImageItem] = []
         var bullets: [MarkdownTextView.BulletItem] = []
         var parsedFences: [MarkdownTextView.FencedBlock] = []
 
-        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, horizontalRules: &horizontalRules, headings: &headings, codes: &inlinePills, wikiLinks: &wikiLinks, tags: &tags, markdownLinks: &markdownLinks, bullets: &bullets)
+        formatLineRange(range, in: storage, ns: ns, cursor: cursor, scan: scan, quotes: &quotes, horizontalRules: &horizontalRules, headings: &headings, codes: &inlinePills, wikiLinks: &wikiLinks, tags: &tags, markdownLinks: &markdownLinks, inlineImages: &inlineImages, bullets: &bullets)
         if scan.hasTripleBacktick && ns.range(of: "```", options: .literal, range: range).location != NSNotFound {
             let codeBodyParagraph = NSMutableParagraphStyle()
             codeBodyParagraph.lineSpacing = 4.5
@@ -7767,6 +8175,9 @@ import CozySearch
             markdownLinks.removeAll { link in
                 parsedFences.contains { NSIntersectionRange($0.fullRange, link.fullRange).length > 0 }
             }
+            inlineImages.removeAll { img in
+                parsedFences.contains { NSIntersectionRange($0.fullRange, img.fullRange).length > 0 }
+            }
         }
         var parsedTables: [MarkdownTextView.TableBlock] = []
         if scan.hasPipe {
@@ -7790,6 +8201,9 @@ import CozySearch
                 headings.removeAll { item in
                     parsedTables.contains { NSIntersectionRange($0.fullRange, item.range).length > 0 }
                 }
+                inlineImages.removeAll { img in
+                    parsedTables.contains { NSIntersectionRange($0.fullRange, img.fullRange).length > 0 }
+                }
             }
         }
 
@@ -7800,6 +8214,7 @@ import CozySearch
         textView.wikiLinkItems = wikiLinks
         textView.tagItems = tags
         textView.markdownLinkItems = markdownLinks
+        textView.inlineImageItems = inlineImages
         textView.fencedBlocks = parsedFences
         textView.tableBlocks = parsedTables
         textView.bulletItems = bullets
@@ -8270,6 +8685,94 @@ import CozySearch
         )
     }
 
+    private static func shiftInlineImage(_ item: MarkdownTextView.InlineImageItem, by delta: Int) -> MarkdownTextView.InlineImageItem {
+        MarkdownTextView.InlineImageItem(
+            fullRange: shiftRange(item.fullRange, by: delta),
+            lineRange: shiftRange(item.lineRange, by: delta),
+            fullLineRange: shiftRange(item.fullLineRange, by: delta),
+            altText: item.altText,
+            caption: item.caption,
+            rawDestination: item.rawDestination,
+            resolvedURL: item.resolvedURL,
+            naturalPointSize: item.naturalPointSize,
+            displaySize: item.displaySize,
+            itemSlotHeight: item.itemSlotHeight,
+            offsetFromParagraphBottom: item.offsetFromParagraphBottom,
+            isStandaloneLine: item.isStandaloneLine,
+            isReadableImage: item.isReadableImage
+        )
+    }
+
+    private func resolveLocalImageDestination(_ rawDestination: String) -> URL? {
+        let trimmed = rawDestination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.hasPrefix("/"),
+              !trimmed.hasPrefix("#"),
+              !trimmed.contains("://") else { return nil }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("mailto:") || lower.hasPrefix("data:") || lower.hasPrefix("javascript:") {
+            return nil
+        }
+        let pathPart = trimmed.split(whereSeparator: { $0 == "?" || $0 == "#" }).first.map(String.init) ?? trimmed
+        let decoded = pathPart.removingPercentEncoding ?? pathPart
+        guard !decoded.isEmpty, !decoded.contains("\0"), Vault.isImageFilename(decoded) else {
+            return nil
+        }
+        let fm = FileManager.default
+        let vaultRoot = vaultRootURLProvider?()?.standardizedFileURL.resolvingSymlinksInPath()
+
+        func validated(_ rawCandidate: URL) -> URL? {
+            let std = rawCandidate.standardizedFileURL
+            if let attrs = try? fm.attributesOfItem(atPath: std.path),
+               attrs[.type] as? FileAttributeType == .typeSymbolicLink {
+                return nil
+            }
+            let resolved = std.resolvingSymlinksInPath()
+            if let vaultRoot {
+                let prefix = vaultRoot.path == "/" ? "/" : vaultRoot.path + "/"
+                guard resolved.path == vaultRoot.path || resolved.path.hasPrefix(prefix) else {
+                    return nil
+                }
+            }
+            return resolved
+        }
+
+        if let noteURL = currentNoteURLProvider?() {
+            let noteDir = noteURL.deletingLastPathComponent()
+            guard let primary = validated(noteDir.appendingPathComponent(decoded)) else {
+                return nil
+            }
+            if fm.fileExists(atPath: primary.path) {
+                return primary
+            }
+            if let vaultRoot,
+               let fallback = validated(vaultRoot.appendingPathComponent(decoded)),
+               fm.fileExists(atPath: fallback.path) {
+                return fallback
+            }
+            return primary
+        }
+        if let vaultRoot {
+            return validated(vaultRoot.appendingPathComponent(decoded))
+        }
+        return nil
+    }
+
+    private static func inlineImageCaption(altText: String, resolvedURL: URL) -> String? {
+        let trimmed = altText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let filename = resolvedURL.lastPathComponent
+        if trimmed.caseInsensitiveCompare(filename) == .orderedSame {
+            return nil
+        }
+        let stem = resolvedURL.deletingPathExtension().lastPathComponent
+        if trimmed.caseInsensitiveCompare(stem) == .orderedSame,
+           trimmed.hasPrefix("Screenshot-") || !trimmed.contains(" ") {
+            return nil
+        }
+        return trimmed
+    }
+
     private struct ParsedInlineLink {
         let fullRange: NSRange
         let bracketRange: NSRange
@@ -8631,6 +9134,7 @@ import CozySearch
         wikiLinks: inout [WikiLink],
         tags: inout [NoteTag],
         markdownLinks: inout [MarkdownTextView.MarkdownLink],
+        inlineImages: inout [MarkdownTextView.InlineImageItem],
         bullets: inout [MarkdownTextView.BulletItem]
     ) {
         let totalLen = ns.length
@@ -9093,13 +9597,38 @@ import CozySearch
 
         var inlineLinkSpans: [NSRange] = []
         if hasInlineLinkMarker {
-            let linkURLAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(12)]
-            let bracketSyntaxAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: Theme.subtle, .font: Theme.monoFont(12, weight: .medium)]
+            struct PendingLineImage {
+                let parsed: ParsedInlineLink
+                let altText: String
+                let caption: String?
+                let resolvedURL: URL
+                let naturalPointSize: NSSize?
+                let displaySize: NSSize
+                let itemSlotHeight: CGFloat
+                let isReadable: Bool
+            }
+            let linkURLAttrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: Theme.subtle,
+                .font: Theme.monoFont(12),
+                .underlineStyle: 0,
+                .strikethroughStyle: 0
+            ]
+            let bracketSyntaxAttrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: Theme.subtle,
+                .font: Theme.monoFont(12, weight: .medium),
+                .underlineStyle: 0,
+                .strikethroughStyle: 0
+            ]
+            let containerWidth = textView.textContainer?.containerSize.width ?? 640
+            let maxCardWidth = max(160, min(containerWidth, 680))
+            let maxCardHeight: CGFloat = 420
             var searchStart = targetRange.location
             while searchStart < targetEnd {
                 let hit = ns.range(of: "](", options: .literal, range: NSRange(location: searchStart, length: targetEnd - searchStart))
                 guard hit.location != NSNotFound else { break }
-                let lineRange = NSIntersectionRange(ns.lineRange(for: hit), targetRange)
+                let fullLineRange = ns.lineRange(for: hit)
+                let lineRange = NSIntersectionRange(fullLineRange, targetRange)
+                var pendingImages: [PendingLineImage] = []
                 for parsed in Self.parseInlineMarkdownLinks(in: ns, lineRange: lineRange) {
                     if codes.contains(where: { NSIntersectionRange($0, parsed.fullRange).length > 0 })
                         || wikiLinks.contains(where: { NSIntersectionRange($0.fullRange, parsed.fullRange).length > 0 }) {
@@ -9108,6 +9637,49 @@ import CozySearch
                     inlineLinkSpans.append(parsed.fullRange)
                     let headingMatch = headings.first { NSIntersectionRange($0.range, parsed.fullRange).length > 0 }
                     let linkFont = headingMatch.map { Theme.headingFont(level: $0.level) } ?? Theme.bodyFont(proseSize, weight: .medium)
+                    if parsed.isImage, let resolvedLocal = resolveLocalImageDestination(parsed.rawDestination) {
+                        storage.addAttributes(bracketSyntaxAttrs, range: parsed.bracketRange)
+                        if parsed.labelInnerRange.length > 0 {
+                            storage.addAttributes([
+                                .foregroundColor: Theme.accent,
+                                .font: linkFont,
+                                .underlineStyle: 0,
+                                .strikethroughStyle: 0
+                            ], range: parsed.labelInnerRange)
+                        }
+                        storage.addAttributes(linkURLAttrs, range: parsed.parenRange)
+                        let altText = parsed.labelInnerRange.length > 0
+                            ? ns.substring(with: parsed.labelInnerRange)
+                            : ""
+                        let caption = Self.inlineImageCaption(altText: altText, resolvedURL: resolvedLocal)
+                        let metrics = InlineImageCache.shared.imageMetrics(for: resolvedLocal)
+                        let naturalSize = metrics?.naturalPointSize
+                        let displaySize: NSSize
+                        let isReadable: Bool
+                        if let nat = naturalSize, nat.width > 0, nat.height > 0 {
+                            let fit = min(1.0, min(maxCardWidth / nat.width, maxCardHeight / nat.height))
+                            displaySize = NSSize(
+                                width: max(48, round(nat.width * fit)),
+                                height: max(36, round(nat.height * fit))
+                            )
+                            isReadable = true
+                        } else {
+                            displaySize = NSSize(width: min(maxCardWidth, 320), height: 56)
+                            isReadable = false
+                        }
+                        let slotHeight = 8 + displaySize.height + (caption == nil ? 0 : 20) + 14
+                        pendingImages.append(PendingLineImage(
+                            parsed: parsed,
+                            altText: altText,
+                            caption: caption,
+                            resolvedURL: resolvedLocal,
+                            naturalPointSize: naturalSize,
+                            displaySize: displaySize,
+                            itemSlotHeight: slotHeight,
+                            isReadable: isReadable
+                        ))
+                        continue
+                    }
                     if let resolved = Self.resolveExternalLinkDestination(parsed.rawDestination, allowSchemelessDomain: !parsed.isImage) {
                         storage.addAttributes(bracketSyntaxAttrs, range: parsed.bracketRange)
                         let clickableAttrs: [NSAttributedString.Key: Any] = [
@@ -9128,6 +9700,75 @@ import CozySearch
                     } else {
                         storage.addAttributes([.foregroundColor: Theme.accent, .font: linkFont], range: parsed.bracketRange)
                         storage.addAttributes(linkURLAttrs, range: parsed.parenRange)
+                    }
+                }
+                if !pendingImages.isEmpty, NSMaxRange(fullLineRange) <= totalLen {
+                    var contentEnd = NSMaxRange(fullLineRange)
+                    while contentEnd > fullLineRange.location {
+                        let ch = ns.character(at: contentEnd - 1)
+                        if ch == 10 || ch == 13 { contentEnd -= 1 } else { break }
+                    }
+                    let lineContentRange = NSRange(location: fullLineRange.location, length: contentEnd - fullLineRange.location)
+                    var trimStart = lineContentRange.location
+                    var trimEnd = contentEnd
+                    while trimStart < trimEnd && (ns.character(at: trimStart) == 0x20 || ns.character(at: trimStart) == 0x09) {
+                        trimStart += 1
+                    }
+                    while trimEnd > trimStart && (ns.character(at: trimEnd - 1) == 0x20 || ns.character(at: trimEnd - 1) == 0x09) {
+                        trimEnd -= 1
+                    }
+                    let trimmedRange = NSRange(location: trimStart, length: trimEnd - trimStart)
+                    let isStandalone = pendingImages.count == 1
+                        && pendingImages[0].parsed.fullRange == trimmedRange
+                        && !headings.contains(where: { NSIntersectionRange($0.range, fullLineRange).length > 0 })
+                        && !quotes.contains(where: { NSIntersectionRange($0, fullLineRange).length > 0 })
+                        && !bullets.contains(where: { NSIntersectionRange($0.lineRange, fullLineRange).length > 0 })
+                    let cursorOnLine = isFocused && (
+                        (cursor.length == 0 && cursor.location >= lineContentRange.location && cursor.location <= NSMaxRange(lineContentRange))
+                        || NSIntersectionRange(cursor, lineContentRange).length > 0
+                    )
+                    let showRawSyntax = !isStandalone || cursorOnLine || compactLayout
+                    let totalSlotHeight = pendingImages.reduce(CGFloat(0)) { $0 + $1.itemSlotHeight }
+                    if showRawSyntax {
+                        let basePara = (lineContentRange.length > 0
+                            ? (storage.attribute(.paragraphStyle, at: lineContentRange.location, effectiveRange: nil) as? NSParagraphStyle)
+                            : nil)
+                        let imgPara = (basePara?.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
+                        if basePara == nil {
+                            imgPara.lineSpacing = 8.0
+                        }
+                        imgPara.paragraphSpacing = totalSlotHeight
+                        storage.addAttribute(.paragraphStyle, value: imgPara, range: fullLineRange)
+                    } else {
+                        let imgPara = NSMutableParagraphStyle()
+                        imgPara.lineSpacing = 0.0
+                        imgPara.paragraphSpacing = totalSlotHeight
+                        storage.setAttributes([
+                            .font: NSFont.systemFont(ofSize: 1.0),
+                            .foregroundColor: NSColor.clear,
+                            .paragraphStyle: imgPara,
+                            .kern: 0.0
+                        ], range: fullLineRange)
+                    }
+                    var consumedSlot: CGFloat = 0
+                    for pending in pendingImages {
+                        let offsetFromBottom = totalSlotHeight - consumedSlot
+                        consumedSlot += pending.itemSlotHeight
+                        inlineImages.append(MarkdownTextView.InlineImageItem(
+                            fullRange: pending.parsed.fullRange,
+                            lineRange: lineContentRange,
+                            fullLineRange: fullLineRange,
+                            altText: pending.altText,
+                            caption: pending.caption,
+                            rawDestination: pending.parsed.rawDestination,
+                            resolvedURL: pending.resolvedURL,
+                            naturalPointSize: pending.naturalPointSize,
+                            displaySize: pending.displaySize,
+                            itemSlotHeight: pending.itemSlotHeight,
+                            offsetFromParagraphBottom: offsetFromBottom,
+                            isStandaloneLine: isStandalone,
+                            isReadableImage: pending.isReadable
+                        ))
                     }
                 }
                 searchStart = NSMaxRange(lineRange)
